@@ -1,0 +1,40 @@
+{
+  "manifest_version": 2,
+  "id": "arcdent.maimai-courier-plugin",
+  "version": "0.1.0",
+  "name": "麦麦搬运喵",
+  "description": "麦麦在群聊间分享消息的独立插件：源群出现合并转发后由源群麦麦自主决定是否分享，并可通过 forward_message 工具把本群指定消息转发到允许的目标群、可选附带一条延迟 0.5 秒的评论。默认关闭、白名单为空。",
+  "author": {
+    "name": "arcdent",
+    "url": "https://github.com/arcdent"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/arcdent/maimai-courier-plugin"
+  },
+  "host_application": {
+    "min_version": "1.2.5",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.8.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "message.get_by_id",
+    "chat.get_all_streams",
+    "chat.open_session",
+    "send.text",
+    "send.image",
+    "send.hybrid",
+    "send.forward",
+    "maisaka.proactive.trigger"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}

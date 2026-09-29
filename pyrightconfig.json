@@ -1,0 +1,17 @@
+{
+  "include": [
+    "config.py",
+    "plugin.py",
+    "clock.py",
+    "source_binding.py",
+    "send_material.py",
+    "forward_precheck.py",
+    "delivery_ledger.py",
+    "forward_delivery.py",
+    "host_send.py",
+    "auto_entry.py"
+  ],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "standard",
+  "reportMissingImports": "none"
+}
