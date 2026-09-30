@@ -17,6 +17,13 @@
 
 本模块只产出材料与结构指纹，不发送、不落盘；拒绝原因只描述内容本身，
 「本次未发送任何消息」定尾由工具入口的 `Rejected.not_sent` 统一补齐。
+
+个人与全体成员提及是「普通消息保持原形态」的唯一例外（ADR 0002、design D1）：
+已核实形态的 `at` 段（`{"type": "at", "data": {"target_user_id",
+"target_user_nickname", "target_user_cardname"}}`，入站载荷、存储回读与转发节点
+三处同形）转换成不触发提醒的普通文本，并与紧邻的文字段归并（不跨越源消息本来就
+相邻的文本分段），不新增换行；对象标识不可确认（缺失、空串、非字典结构）时整条
+拒绝，不猜测、也不把空标识当成全体成员。
 """
 
 from __future__ import annotations
@@ -39,6 +46,19 @@ EMPTY_FORWARD_NODE_PLACEHOLDER = "[empty forward node]"
 
 _SAFE_SEGMENT_LABEL = re.compile(r"[a-z0-9_]{1,16}\Z")
 """可安全回显的段类型词法：短小、纯 ASCII 小写；其余一律显示为「未知」。"""
+
+_AT_SEGMENT_TYPE = "at"
+"""宿主提及段的类型名（`message_utils.py:134-142` 的唯一序列化出口）。"""
+
+_ALL_MENTION_IDENTIFIER = "all"
+"""全体成员提及的对象标识：网关字面量（第 1 组 1.1 核实，宿主不特判、原样透传）。
+
+命中判据是**精确等于**该字面量；缺失或空的标识不是全体成员（见
+`_mention_display_text`），换适配器／网关时需要重新核实。
+"""
+
+_ALL_MENTION_TEXT = "［提及：全体成员］"
+"""全体成员提及的普通文本呈现：只表达「全体成员」含义，不形成提醒全群的段。"""
 
 SendKind = Literal["text", "image", "mixed", "forward"]
 """发送材料种类：纯文本、纯图片、混合，或合并转发卡片。"""
@@ -81,6 +101,28 @@ class _BuiltCard:
 
     segment: dict[str, Any]
     contents: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TextPiece:
+    """待归并的文本片段：原文文本段或提及转换出的普通文本。
+
+    `mention` 标记该片段是否由提及转换而来（决定相邻文本片段是否归并）；
+    `segment` 是片段对应的独立文本段副本，归并时以其中「原文文本段」为基底，
+    保留宿主可能附带的其它字段。
+    """
+
+    text: str
+    mention: bool
+    segment: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _SegmentPiece:
+    """不参与文本归并的已校验段（图片或合并转发卡片）与其结构指纹。"""
+
+    segment: dict[str, Any]
+    shape: Any
 
 
 def is_forward_card(segment: Any) -> bool:
@@ -141,10 +183,13 @@ def _build_segments(
     `depth` 是当前段序列所在的卡片层数（顶层消息为 0）：节点内容里的转发段按
     层数继续递归，超过 `MAX_FORWARD_DEPTH` 即整条拒绝；`depth > 0` 同时表示
     「这段文本位于转发节点内」，宿主空节点占位文本只可能出现在这里。
+
+    逐段校验（含占位文本检查）全部在归并之前完成：先按原文逐段判定，再把含提及的
+    相邻文本片段归并成普通文本段（`_assemble_segments`），任何异常都不会因归并
+    被洗掉。
     """
 
-    segments: list[dict[str, Any]] = []
-    shapes: list[Any] = []
+    pieces: list[_TextPiece | _SegmentPiece] = []
     for index, item in enumerate(raw_segments, start=1):
         segment_location = f"{location}第 {index} 段"
         if not isinstance(item, dict):
@@ -152,23 +197,34 @@ def _build_segments(
 
         segment_type = str(item.get("type") or "").strip()
         if segment_type == "text":
-            if not isinstance(item.get("data"), str):
+            text = item.get("data")
+            if not isinstance(text, str):
                 return UnsupportedContent(f"{segment_location}文本内容无效，无法完整转发")
-            if depth > 0 and item["data"] == EMPTY_FORWARD_NODE_PLACEHOLDER:
+            if depth > 0 and text == EMPTY_FORWARD_NODE_PLACEHOLDER:
                 return UnsupportedContent(
                     f"{segment_location}是宿主对空节点的占位文本"
                     f"（{EMPTY_FORWARD_NODE_PLACEHOLDER}），原文无法恢复"
                 )
-            segments.append(deepcopy(item))
-            shapes.append("text")
+            pieces.append(_TextPiece(text=text, mention=False, segment=deepcopy(item)))
+            continue
+        if segment_type == _AT_SEGMENT_TYPE:
+            mention_text = _mention_display_text(item, segment_location)
+            if isinstance(mention_text, UnsupportedContent):
+                return mention_text
+            pieces.append(
+                _TextPiece(
+                    text=mention_text,
+                    mention=True,
+                    segment={"type": "text", "data": mention_text},
+                )
+            )
             continue
         if segment_type == "image":
             if not _has_image_material(item):
                 return UnsupportedContent(
                     f"{segment_location}图片缺少可恢复的媒体数据（描述文本不能代替原图）"
                 )
-            segments.append(deepcopy(item))
-            shapes.append("image")
+            pieces.append(_SegmentPiece(deepcopy(item), "image"))
             continue
         if segment_type == "forward":
             if depth + 1 > MAX_FORWARD_DEPTH:
@@ -178,14 +234,110 @@ def _build_segments(
             card = _build_card(item, location=segment_location, depth=depth + 1)
             if isinstance(card, UnsupportedContent):
                 return card
-            segments.append(card.segment)
-            shapes.append({"forward": list(card.contents)})
+            pieces.append(_SegmentPiece(card.segment, {"forward": list(card.contents)}))
             continue
         if _is_unexpanded_forward(item):
             return UnsupportedContent(f"{segment_location}是未展开的合并转发（宿主未能恢复节点）")
 
         return UnsupportedContent(f"{segment_location}类型 {_segment_label(item)} 无法完整发送")
+    return _assemble_segments(pieces)
+
+
+def _assemble_segments(pieces: list[_TextPiece | _SegmentPiece]) -> _BuiltSegments:
+    """把已校验片段组装成材料段序列：含提及的相邻文本片段归并为一个文本段。
+
+    归并范围只覆盖「紧邻提及的文本」：提及左侧只并入紧邻的那一个原文文本段、右侧
+    只并入紧邻的那一个，两个原文文本段之间的既有分段（发送通路按换行拼接的排版）
+    不因转换被跨过，也不顺带改写其它消息的排版。归并直接拼接片段内容、不插入分隔
+    符，因此提及转换不会新增换行，原文里的换行原样保留；片段顺序不变，结构指纹
+    描述归并后的实际材料形态。
+    """
+
+    segments: list[dict[str, Any]] = []
+    shapes: list[Any] = []
+    index = 0
+    while index < len(pieces):
+        piece = pieces[index]
+        if isinstance(piece, _SegmentPiece):
+            segments.append(piece.segment)
+            shapes.append(piece.shape)
+            index += 1
+            continue
+
+        # 归并范围只延伸到紧邻提及的文本段：两个原文文本段相邻即是源消息本来的
+        # 分段边界，就此断开；边界另一侧的文本段保持独立分段。
+        run = [piece]
+        cursor = index + 1
+        while cursor < len(pieces):
+            following = pieces[cursor]
+            if not isinstance(following, _TextPiece):
+                break
+            if not following.mention and not run[-1].mention:
+                break
+            run.append(following)
+            cursor += 1
+        index = cursor
+
+        # run 长度 ≥2 时必然含提及（归并循环只在相邻片段之一为提及时才继续延伸）；
+        # 长度 1 时没有可归并的邻居，直接追加该片段即可。
+        if len(run) == 1:
+            segments.append(piece.segment)
+            shapes.append("text")
+            continue
+
+        # 以原文文本段为基底（保留宿主可能附带的其它字段），内容直接拼接。
+        base = next((item.segment for item in run if not item.mention), run[0].segment)
+        merged = dict(base)
+        merged["data"] = "".join(item.text for item in run)
+        segments.append(merged)
+        shapes.append("text")
     return _BuiltSegments(tuple(segments), tuple(shapes))
+
+
+def _mention_display_text(item: dict[str, Any], location: str) -> str | UnsupportedContent:
+    """把已核实形态的提及段转成不触发提醒的普通文本（对象不可确认时整条拒绝）。
+
+    对象标识必须可确认（非空字符串，且按显示口径压平后仍非空）：缺失、空串、非字符串、
+    压平后为空、非字典结构都直接拒绝，绝不猜测，也不把空标识当成全体成员。对象标识
+    恰为网关字面量 `all` 时按全体成员呈现（名称字段不参与）；其余标识按个人提及呈现，
+    显示名只取自源材料里宿主已补写的字段（群名片优先、其次昵称）。对象标识与显示名走
+    同一压平口径（`_flatten_mention_name`：不可打印字符转空格、折叠多余空白），因此
+    标识里的换行／控制字符不会原样进入发送文本；没有可用名称时只呈现对象标识。
+    """
+
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return UnsupportedContent(f"{location}的提及结构无效，无法确认提及对象")
+    identifier = _flatten_mention_name(data.get("target_user_id"))
+    if not identifier:
+        return UnsupportedContent(f"{location}的提及缺少可确认的对象标识，无法完整转发")
+    if identifier == _ALL_MENTION_IDENTIFIER:
+        return _ALL_MENTION_TEXT
+
+    name = _flatten_mention_name(data.get("target_user_cardname")) or _flatten_mention_name(
+        data.get("target_user_nickname")
+    )
+    if name:
+        return f"［提及：{name}（{identifier}）］"
+    return f"［提及：{identifier}］"
+
+
+def _flatten_mention_name(raw: Any) -> str:
+    """把提及显示文本（显示名或对象标识）压平成单行：不可打印字符转空格、折叠空白。
+
+    文本来自源群、属不可信内容：这里只做压平，不做模板或命令求值，也不查询成员
+    信息。压平后可能是空串（原本只由控制字符／空白组成），空串的处置由调用方决定：
+    显示名回退到对象标识，对象标识整条拒绝。
+
+    本策略与 `auto_entry.display_name` 是平行实现（`send_material` 不能反向 import
+    `auto_entry`）：两者都压平不可打印字符与多余空白，后者额外做群名限长与尖括号
+    转写，属路由／显示安全的另一层。
+    """
+
+    if not isinstance(raw, str) or not raw:
+        return ""
+    printable = "".join(" " if not character.isprintable() else character for character in raw)
+    return " ".join(printable.split())
 
 
 def _build_card(forward_segment: dict[str, Any], *, location: str, depth: int) -> _BuiltCard | UnsupportedContent:

@@ -38,13 +38,17 @@ from tests.support import (
     enabled_config,
     forward_node,
     forward_segment,
+    intent_criteria_region,
     issue_source_call,
     ledger_key,
     make_plugin,
     merged_forward_message,
     open_test_ledger,
     prepare_source,
+    received_message,
     run_bound_forward,
+    source_stream,
+    text_segment,
     wait_until,
 )
 
@@ -583,6 +587,492 @@ def test_评论等待中撤销目标权限时不发送评论并保留源成功�
     assert "未发送" in str(result["reason"]), result
     assert len(ctx.send.calls) == 1, ("撤销目标权限后不得发送评论", ctx.send.calls)
     record = open_test_ledger(tmp_path).get(ledger_key())
+    assert record is not None
+    assert (record.status, record.target_message_id) == (STATUS_SENT, "m-target-src"), record
+    assert record.comment_status == STATUS_FAILED, record
+
+
+# -------------- 本变更第 5 组：自动判断的热更新与卸载边界（5.4–5.7）
+# 共用 seam：注册的 `chat.receive.after_process` 观察 Hook、`CourierPlugin.on_config_update()`
+# 与 `on_unload()`，必要时串接可信来源绑定 Hook → `forward_message()`。热更新统一由
+# `apply_config_update` 按宿主顺序驱动（先注入配置，再调用生命周期）；异步悬停只施加在
+# `ctx.message.get_by_id`、`ctx.chat.get_all_streams`、`ctx.maisaka.proactive.trigger`
+# 与发送能力替身上，不替换生产协作者。
+
+
+def test_等待期间移除一类候选只取消该类判断(tmp_path: Path) -> None:
+    """5.4：并存的不同类型候选中，移除一类只让该类不再提交，其他合法候选继续。"""
+
+    clock = FakeClock()
+    plugin, ctx = make_plugin(
+        tmp_path,
+        clock=clock,
+        config=enabled_config(message_types=("text", "forward")),
+    )
+    text_id, forward_id = "m-wait-text", "m-wait-forward"
+    prepare_source(ctx, message_id=forward_id, raw_message=[forward_segment(forward_node())])
+    ctx.message.sequences = {forward_id: [None]}  # 卡片先未就绪一次，等待期间发生热更新
+    text_payload = received_message(message_id=text_id, raw_message=[text_segment("普通正文")])
+    forward_payload = received_message(
+        message_id=forward_id,
+        raw_message=[forward_segment(forward_node())],
+    )
+
+    async def scenario() -> None:
+        await plugin.observe_received_message(**text_payload)
+        await plugin.observe_received_message(**forward_payload)
+        await wait_until(lambda: len(clock.sleeps) == 2)
+        assert len(ctx.message.calls) == 2, "两条候选各做一次可读性确认后进入有界等待"
+
+        await apply_config_update(plugin, enabled_config(message_types=("forward",)))
+
+        clock.advance(0.5)
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    submitted = [call["metadata"]["source_message_id"] for call in ctx.maisaka.proactive.calls]
+    assert submitted == [forward_id], "移除文字类型只让文字候选不再提交，卡片候选照常继续"
+    queries = [call["message_id"] for call in ctx.message.calls]
+    assert queries.count(text_id) == 1, "失效的文字候选被取消后不得继续轮询宿主"
+    assert queries.count(forward_id) == 2, "仍合法的卡片候选继续等待并提交"
+
+
+_WAIT_REVOCATIONS: dict[str, dict[str, Any]] = {
+    "空候选列表": enabled_config(message_types=()),
+    "关闭自动入口": {**enabled_config(), "auto": {"enabled": False}},
+    "撤销来源白名单": enabled_config(source_groups=()),
+    "撤销目标白名单": enabled_config(target_groups=()),
+}
+
+
+def test_等待期间撤销开关白名单或清空候选时不再提交(tmp_path: Path) -> None:
+    """5.4：空选择、关闭自动入口与撤销来源／目标权限都阻止相应判断。"""
+
+    for label, revoked in _WAIT_REVOCATIONS.items():
+        clock = FakeClock()
+        plugin, ctx = make_plugin(tmp_path / label, clock=clock, config=enabled_config())
+        message_id = "m-wait-revoked"
+        prepare_source(ctx, message_id=message_id)
+        ctx.message.store = {}
+        payload = merged_forward_message(
+            message_id=message_id,
+            session_id=SOURCE_SESSION_ID,
+            group_id=SOURCE_GROUP_ID,
+        )
+
+        async def scenario() -> None:
+            await plugin.observe_received_message(**payload)
+            await wait_until(lambda: bool(clock.sleeps))
+
+            await apply_config_update(plugin, revoked)
+
+            clock.advance(60.0)
+            for _ in range(50):
+                await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+
+        assert ctx.maisaka.proactive.calls == [], (label, "失效后不得提交判断")
+        assert len(ctx.message.calls) == 1, (label, "被取消的等待不得继续轮询宿主")
+
+
+def test_只改标准不取消合法候选且后续提交使用新标准(tmp_path: Path) -> None:
+    """5.4：只更新标准不取消仍合法的候选，等待结束后按最新标准提交。"""
+
+    clock = FakeClock()
+    plugin, ctx = make_plugin(
+        tmp_path,
+        clock=clock,
+        config=enabled_config(share_criteria="旧标准：只分享技术话题"),
+    )
+    message_id = "m-criteria-wait"
+    prepare_source(ctx, message_id=message_id)
+    ctx.message.sequences = {message_id: [None]}
+    payload = merged_forward_message(
+        message_id=message_id,
+        session_id=SOURCE_SESSION_ID,
+        group_id=SOURCE_GROUP_ID,
+    )
+
+    async def scenario() -> None:
+        await plugin.observe_received_message(**payload)
+        await wait_until(lambda: bool(clock.sleeps))
+
+        await apply_config_update(plugin, enabled_config(share_criteria="新标准：只分享宠物照片"))
+
+        clock.advance(0.5)
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(ctx.maisaka.proactive.calls) == 1, "只改标准不得取消仍合法的候选"
+    assert intent_criteria_region(ctx.maisaka.proactive.calls[0]["intent"]) == (
+        "新标准：只分享宠物照片"
+    ), "等待结束后的提交必须使用最新标准"
+
+
+def test_热更新不整体取消在途投递(tmp_path: Path) -> None:
+    """5.4：配置热更新只取消失效的自动判断，不整体取消已进入投递链的工作。"""
+
+    clock = FakeClock()
+    plugin, ctx = make_plugin(tmp_path, clock=clock, config=enabled_config())
+    prepare_source(ctx)
+    ctx.send.text_results = [
+        {"sent": True, "message_id": "m-target-src"},
+        {"sent": True, "message_id": "m-target-comment"},
+    ]
+    arguments = issue_source_call(plugin, message_id="m-source-1", comment="热更新不取消投递")
+
+    async def scenario() -> dict[str, Any]:
+        await plugin.on_load()
+        task = asyncio.create_task(plugin.forward_message(**arguments))
+        await wait_until(lambda: clock.sleeps == [0.5])
+
+        await apply_config_update(
+            plugin,
+            enabled_config(message_types=("text",), share_criteria="更新的自动分享标准"),
+        )
+
+        clock.advance(0.5)
+        return await task
+
+    result = asyncio.run(scenario())
+
+    assert result["status"] == STATUS_SENT, result
+    assert [call["capability"] for call in ctx.send.calls] == ["send.text", "send.text"], (
+        "热更新不得取消评论等待中的在途投递",
+        ctx.send.calls,
+    )
+    record = open_test_ledger(tmp_path).get(ledger_key())
+    assert record is not None and record.status == STATUS_SENT, record
+
+
+ADDED_TARGET_GROUP_ID = "30003"
+"""名称查询期间新加入白名单的目标群（没有可用名称，意图只列群号）。"""
+
+REMOVED_TARGET_GROUP_ID = "30004"
+"""名称查询期间被移出白名单的目标群（不得从名称快照混进意图）。"""
+
+
+def _hold_names_query(ctx: Any) -> tuple[asyncio.Event, asyncio.Event, list[Any]]:
+    """让目标名称查询悬停在途（只在 `ctx.chat.get_all_streams` 边界注入）。
+
+    返回（进入事件、放行事件、进入记录）：宿主请求已进入但尚未返回，供用例在查询
+    期间修改配置；`entries` 用于断言提交前只发生一次名称查询，没有为补齐名称再查。
+    """
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    entries: list[Any] = []
+    original = ctx.chat.get_all_streams
+
+    async def held_get_all_streams(*args: Any, **kwargs: Any) -> Any:
+        entries.append((args, kwargs))
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    ctx.chat.get_all_streams = held_get_all_streams
+    return entered, release, entries
+
+
+def test_名称查询期间修改标准后按最新标准与目标提交(tmp_path: Path) -> None:
+    """5.5：名称查询结束后重读最新配置：标准与目标都用最新值，查询只发生一次。"""
+
+    clock = FakeClock()
+    plugin, ctx = make_plugin(
+        tmp_path,
+        clock=clock,
+        config=enabled_config(share_criteria="旧标准：只分享技术话题"),
+    )
+    message_id = "m-name-hold"
+    prepare_source(ctx, message_id=message_id)
+    ctx.chat.streams = [
+        source_stream(),
+        source_stream(session_id="s-target-a", group_id=TARGET_GROUP_ID),
+    ]
+    ctx.chat.streams[1]["group_name"] = "目标群甲"
+    entered, release, entries = _hold_names_query(ctx)
+    payload = merged_forward_message(
+        message_id=message_id,
+        session_id=SOURCE_SESSION_ID,
+        group_id=SOURCE_GROUP_ID,
+    )
+
+    async def scenario() -> None:
+        await plugin.on_load()
+        await plugin.observe_received_message(**payload)
+        await entered.wait()
+
+        await apply_config_update(plugin, enabled_config(share_criteria="新标准：只分享宠物照片"))
+        release.set()
+        await wait_until(lambda: bool(ctx.maisaka.proactive.calls))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(entries) == 1, "提交前不得再发起第二次名称查询"
+    assert len(ctx.maisaka.proactive.calls) == 1
+    intent = ctx.maisaka.proactive.calls[0]["intent"]
+    assert intent_criteria_region(intent) == "新标准：只分享宠物照片", (
+        "提交必须使用名称查询期间更新的最新标准"
+    )
+    assert f"- 目标群号 {TARGET_GROUP_ID}（群名显示文本：「目标群甲」）" in intent
+
+
+def test_名称查询期间增删目标只提交最新合法目标(tmp_path: Path) -> None:
+    """5.5：新增目标无名称时只列群号；已移除目标不得从名称查询快照混入。"""
+
+    clock = FakeClock()
+    plugin, ctx = make_plugin(
+        tmp_path,
+        clock=clock,
+        config=enabled_config(target_groups=(TARGET_GROUP_ID, REMOVED_TARGET_GROUP_ID)),
+    )
+    message_id = "m-name-targets"
+    prepare_source(ctx, message_id=message_id)
+    ctx.chat.streams = [
+        source_stream(),
+        source_stream(session_id="s-target-a", group_id=TARGET_GROUP_ID),
+        source_stream(session_id="s-target-b", group_id=REMOVED_TARGET_GROUP_ID),
+    ]
+    ctx.chat.streams[1]["group_name"] = "保留的目标群"
+    ctx.chat.streams[2]["group_name"] = "将被移除的目标群"
+    entered, release, entries = _hold_names_query(ctx)
+    payload = merged_forward_message(
+        message_id=message_id,
+        session_id=SOURCE_SESSION_ID,
+        group_id=SOURCE_GROUP_ID,
+    )
+
+    async def scenario() -> None:
+        await plugin.on_load()
+        await plugin.observe_received_message(**payload)
+        await entered.wait()
+
+        await apply_config_update(
+            plugin,
+            enabled_config(target_groups=(TARGET_GROUP_ID, ADDED_TARGET_GROUP_ID)),
+        )
+        release.set()
+        await wait_until(lambda: bool(ctx.maisaka.proactive.calls))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(entries) == 1, "提交前不得再发起第二次名称查询"
+    intent = ctx.maisaka.proactive.calls[0]["intent"]
+    target_lines = [line for line in intent.split("\n") if line.startswith("- 目标群号")]
+    assert target_lines == [
+        f"- 目标群号 {TARGET_GROUP_ID}（群名显示文本：「保留的目标群」）",
+        f"- 目标群号 {ADDED_TARGET_GROUP_ID}",
+    ], "只提交最新白名单：新增目标无名称只列群号，移除目标不得从旧快照混入"
+    assert REMOVED_TARGET_GROUP_ID not in intent and "将被移除的目标群" not in intent
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    (
+        ("撤销候选类型", "revoke_type"),
+        ("关闭总开关", "disable"),
+        ("卸载", "unload"),
+    ),
+)
+def test_名称查询期间失效时零提交(tmp_path: Path, label: str, mutate: str) -> None:
+    """5.5：名称查询期间撤销类型、关闭开关或卸载后，候选零提交且不再查询。"""
+
+    clock = FakeClock()
+    plugin, ctx = make_plugin(tmp_path / label, clock=clock, config=enabled_config())
+    message_id = "m-name-invalid"
+    prepare_source(ctx, message_id=message_id)
+    entered, release, entries = _hold_names_query(ctx)
+    payload = merged_forward_message(
+        message_id=message_id,
+        session_id=SOURCE_SESSION_ID,
+        group_id=SOURCE_GROUP_ID,
+    )
+
+    async def scenario() -> None:
+        await plugin.on_load()
+        driver = asyncio.create_task(plugin.observe_received_message(**payload))
+        await entered.wait()
+
+        if mutate == "revoke_type":
+            await apply_config_update(plugin, enabled_config(message_types=("text",)))
+        elif mutate == "disable":
+            await apply_config_update(
+                plugin,
+                {**enabled_config(), "plugin": {"enabled": False}},
+            )
+        else:
+            await plugin.on_unload()
+
+        release.set()
+        await driver
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert ctx.maisaka.proactive.calls == [], (label, "失效后不得提交判断")
+    assert len(entries) == 1, (label, "名称查询只发起一次，失效恢复后不得再查询")
+
+
+def test_已提交判断不因配置更新被改写或补发(tmp_path: Path) -> None:
+    """5.6：宿主已收到请求后更新类型或标准：不重写已提交意图、不补发第二次请求。"""
+
+    clock = FakeClock()
+    plugin, ctx = make_plugin(
+        tmp_path,
+        clock=clock,
+        config=enabled_config(share_criteria="旧标准：只分享技术话题"),
+    )
+    message_id = "m-committed"
+    prepare_source(ctx, message_id=message_id)
+    payload = merged_forward_message(
+        message_id=message_id,
+        session_id=SOURCE_SESSION_ID,
+        group_id=SOURCE_GROUP_ID,
+    )
+
+    async def scenario() -> None:
+        await plugin.on_load()
+        original_trigger = ctx.maisaka.proactive.trigger
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def held_trigger(*args: Any, **kwargs: Any) -> Any:
+            """宿主已收到请求（`calls` 已记录）但回执尚未返回给插件。"""
+
+            response = await original_trigger(*args, **kwargs)
+            entered.set()
+            await release.wait()
+            return response
+
+        ctx.maisaka.proactive.trigger = held_trigger
+
+        await plugin.observe_received_message(**payload)
+        await entered.wait()
+        assert len(ctx.maisaka.proactive.calls) == 1, "宿主已收到一次判断请求"
+
+        await apply_config_update(
+            plugin,
+            enabled_config(message_types=("text",), share_criteria="新标准：只分享宠物照片"),
+        )
+        release.set()
+        for _ in range(100):
+            await asyncio.sleep(0)
+
+        await plugin.observe_received_message(**payload)
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(ctx.maisaka.proactive.calls) == 1, "不得为新配置补发判断请求，也不得重放已登记候选"
+    submitted_intent = ctx.maisaka.proactive.calls[0]["intent"]
+    assert intent_criteria_region(submitted_intent) == "旧标准：只分享技术话题", (
+        "已提交的意图保持提交时的标准原文，不被追溯改写"
+    )
+    logs = "\n".join(
+        [*ctx.logger.texts("debug"), *ctx.logger.texts("info"), *ctx.logger.texts("warning")]
+    )
+    assert "本地等待已取消" in logs, "取消的是本插件等待：必须如实记录，不得静默或伪装成功"
+    assert "撤回" not in logs and "撤销" not in logs, "不得宣称已撤回或撤销宿主侧的判断"
+
+
+def test_已提交判断后的工具调用在源发送前撤销权限时零发送(tmp_path: Path) -> None:
+    """5.7：从已提交判断继续发起工具调用；源发送前撤销权限即零发送并释放占位。"""
+
+    clock = FakeClock()
+    plugin, ctx = make_plugin(tmp_path, clock=clock, config=enabled_config())
+    message_id = "m-judgement-source"
+    raw_message = [forward_segment(forward_node())]
+    prepare_source(ctx, message_id=message_id, raw_message=raw_message)
+    ctx.send.forward_results = [{"sent": True, "message_id": "m-should-not-send"}]
+    arguments = issue_source_call(plugin, message_id=message_id)
+    payload = received_message(message_id=message_id, raw_message=raw_message)
+
+    async def scenario() -> dict[str, Any]:
+        await plugin.on_load()
+        await plugin.observe_received_message(**payload)
+        await wait_until(lambda: bool(ctx.maisaka.proactive.calls))
+        assert ctx.maisaka.proactive.calls[0]["metadata"]["source_message_id"] == message_id
+        assert ctx.send.calls == [], "已提交的判断本身不发送消息"
+
+        original_open_session = ctx.chat.open_session
+
+        async def revoking_open_session(*args: Any, **kwargs: Any) -> Any:
+            """预检期间（解析目标路由时）撤销目标白名单。"""
+
+            await apply_config_update(plugin, enabled_config(target_groups=()))
+            return await original_open_session(*args, **kwargs)
+
+        ctx.chat.open_session = revoking_open_session
+        result = await plugin.forward_message(**arguments)
+
+        await plugin.on_unload()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result["status"] == TOOL_STATUS_REJECTED, result
+    assert "本次未发送任何消息" in str(result["reason"]), result
+    assert ctx.send.calls == [], "源发送前撤销权限必须零发送"
+    record = open_test_ledger(tmp_path).get(ledger_key(message_id=message_id))
+    assert record is not None and record.status == STATUS_FAILED, (
+        "撤销发生在发送前：占位必须按「明确未发送」释放（可显式重试）",
+        record,
+    )
+    assert record.target_message_id == "" and record.comment_status == "", record
+    assert not any("未退出" in text for text in ctx.logger.texts("warning")), (
+        "卸载必须保持既有有界等待：本用例的任务都在上限内退出，不得留下孤立任务",
+        ctx.logger.records,
+    )
+    assert "已卸载" in "\n".join(ctx.logger.texts("info")), ctx.logger.records
+
+
+def test_已提交判断后的工具调用在评论等待期间撤销权限时保留源投递(tmp_path: Path) -> None:
+    """5.7：源投递成功后撤销目标权限：不发评论、保留源成功记录、结果为部分成功。"""
+
+    clock = FakeClock()
+    plugin, ctx = make_plugin(tmp_path, clock=clock, config=enabled_config())
+    message_id = "m-judgement-comment"
+    raw_message = [forward_segment(forward_node())]
+    prepare_source(ctx, message_id=message_id, raw_message=raw_message)
+    ctx.send.forward_results = [{"sent": True, "message_id": "m-target-src"}]
+    ctx.send.text_results = [{"sent": True, "message_id": "m-target-comment"}]
+    arguments = issue_source_call(plugin, message_id=message_id, comment="撤销后不得发送")
+    payload = received_message(message_id=message_id, raw_message=raw_message)
+
+    async def scenario() -> dict[str, Any]:
+        await plugin.on_load()
+        await plugin.observe_received_message(**payload)
+        await wait_until(lambda: bool(ctx.maisaka.proactive.calls))
+        assert ctx.send.calls == [], "已提交的判断本身不发送消息"
+
+        task = asyncio.create_task(plugin.forward_message(**arguments))
+        await wait_until(lambda: clock.sleeps == [0.5])
+        await apply_config_update(plugin, enabled_config(target_groups=()))
+        clock.advance(0.5)
+        return await task
+
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "partial", result
+    assert result["sent"] is True and result["target_message_id"] == "m-target-src", result
+    assert result["comment_status"] == STATUS_FAILED, result
+    assert [call["capability"] for call in ctx.send.calls] == ["send.forward"], (
+        "评论等待期间撤销目标权限：不得发送评论",
+        ctx.send.calls,
+    )
+    record = open_test_ledger(tmp_path).get(ledger_key(message_id=message_id))
     assert record is not None
     assert (record.status, record.target_message_id) == (STATUS_SENT, "m-target-src"), record
     assert record.comment_status == STATUS_FAILED, record

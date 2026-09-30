@@ -471,13 +471,39 @@ def enabled_config(
     *,
     source_groups: tuple[str, ...] = (SOURCE_GROUP_ID,),
     target_groups: tuple[str, ...] = (TARGET_GROUP_ID,),
+    message_types: tuple[str, ...] = ("forward",),
+    share_criteria: str | None = None,
 ) -> dict[str, Any]:
-    """构造「总开关开启 + 给定白名单」的插件配置覆盖值。"""
+    """构造「总开关开启 + 给定白名单」的插件配置覆盖值。
 
+    `message_types` 默认 `("forward",)`，与配置模型默认一致（默认行为不变）；
+    第 4 组起用例显式传入以选择普通文字／图片候选。`share_criteria` 为 `None` 时
+    不写该键（回落配置模型默认原文，模拟旧配置缺字段）；传入字符串则原样写入
+    （含空串与全空白，供第 5 组验证空白回退）。
+    """
+
+    auto: dict[str, Any] = {"message_types": list(message_types)}
+    if share_criteria is not None:
+        auto["share_criteria"] = share_criteria
     return {
         "plugin": {"enabled": True},
+        "auto": auto,
         "scope": {"source_groups": list(source_groups), "target_groups": list(target_groups)},
     }
+
+
+def intent_criteria_region(intent: str) -> str:
+    """取主动判断意图里「用户配置的自动分享标准」区域之后的标准原文。
+
+    标准是意图的最后一个区块（design D4），因此区域即从标注行之后到意图末尾的
+    全部文本；用例据此断言标准内容与换行逐字保留，或断言空白回退后的默认原文。
+    """
+
+    lines = intent.split("\n")
+    for index, line in enumerate(lines):
+        if "用户配置的自动分享标准" in line:
+            return "\n".join(lines[index + 1:])
+    raise AssertionError(f"意图缺少用户配置的自动分享标准区域: {intent!r}")
 
 
 def source_stream(
@@ -551,6 +577,31 @@ def image_segment(
     if binary_data_base64 is not None:
         segment["binary_data_base64"] = binary_data_base64
     return segment
+
+
+def at_segment(
+    target_user_id: Any = "30001",
+    *,
+    nickname: Any = None,
+    cardname: Any = None,
+) -> dict[str, Any]:
+    """提及段（宿主接收侧序列化形态，见本变更 tasks.md 第 1 组 1.1 核实记录）。
+
+    三个字段是宿主唯一的序列化出口（`message_utils.py:134-142`，入站载荷、存储回读
+    与转发节点同形）：`target_user_id` 是对象标识字符串（全体成员为网关字面量
+    `"all"`，解析不出对象时是空串），名称字段由宿主在 `message.process()` 期间原地
+    补写、可能为 `null`（显示偏好是群名片优先、其次昵称）。参数默认取「个人、没有
+    名称」的合法形态；异常载荷由用例显式传入（如空串、`None`、非字典）。
+    """
+
+    return {
+        "type": "at",
+        "data": {
+            "target_user_id": target_user_id,
+            "target_user_nickname": nickname,
+            "target_user_cardname": cardname,
+        },
+    }
 
 
 def forward_segment(*nodes: dict[str, Any]) -> dict[str, Any]:

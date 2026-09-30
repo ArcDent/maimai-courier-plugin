@@ -264,10 +264,11 @@ class CourierPlugin(MaiBotPlugin):
         本入口，因此这里按只读的 `self.config` 读到的就是新配置，不需要也无法自行
         改写配置属性。
 
-        热更新后立即取消**已失效**的待执行自动判断（总开关/自动入口关闭、来源群或
-        目标白名单不再允许）：待执行工作不得继续按开始时的旧快照走。投递工作不做
-        整体取消——在途发送已经可能产生副作用，正确做法是源发送前与评论发送前按最新
-        配置逐次复验（`_send_allowed`），未发送的一律不发送、已成功的如实保留。
+        热更新后立即取消**已失效**的待执行自动判断（总开关/自动入口关闭、候选类型
+        被移出自动候选类型、来源群或目标白名单不再允许）：待执行工作不得继续按开始
+        时的旧快照走，只更新标准不取消仍合法的候选。投递工作不做整体取消——在途发送
+        已经可能产生副作用，正确做法是源发送前与评论发送前按最新配置逐次复验
+        （`_send_allowed`），未发送的一律不发送、已成功的如实保留。
         """
 
         del scope, config_data, version
@@ -316,13 +317,20 @@ class CourierPlugin(MaiBotPlugin):
             )
 
     def _auto_entry_invalid(self, candidate: ForwardCandidate) -> bool:
-        """待执行自动判断是否已失效：已卸载，或最新配置不再允许对来源群唤起。
+        """待执行自动判断是否已失效：已卸载，或最新配置不再允许对该候选唤起。
 
-        判定复用 `auto_entry.auto_entry_invalid_reason`（与等待结束后的重验同一谓词）；
-        本方法只决定「现在要不要取消」，不负责取消时机之外的事情。
+        判定复用 `auto_entry.auto_entry_invalid_reason`（与等待结束后的重验同一谓词，
+        含候选类型：类型被移出自动候选类型同样失效）；本方法只决定「现在要不要取消」，
+        不负责取消时机之外的事情。
         """
 
-        return self._closed or bool(auto_entry_invalid_reason(self.config, candidate.group_id))
+        return self._closed or bool(
+            auto_entry_invalid_reason(
+                self.config,
+                candidate.group_id,
+                candidate.message_type,
+            )
+        )
 
     @Tool(
         FORWARD_TOOL_NAME,
@@ -497,7 +505,8 @@ class CourierPlugin(MaiBotPlugin):
             )
         except asyncio.CancelledError:
             self.ctx.logger.debug(
-                "自动判断已取消：源消息=%s，源群=%s",
+                "自动判断的本地等待已取消（只结束本插件等待，不代表宿主侧判断结果）："
+                "源消息=%s，源群=%s",
                 candidate.source_message_id,
                 candidate.group_id,
             )
