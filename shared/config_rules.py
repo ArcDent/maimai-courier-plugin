@@ -25,7 +25,7 @@ _ENV_VAR_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z_][A-Za-z0-9
 
 
 def valid_env_var_name(name: str) -> bool:
-    """凭证环境变量名是否合法（配置里只出现变量名，凭证值只从环境读取）。"""
+    """仅校验可选凭证环境变量名；不读取令牌或环境值。"""
 
     return bool(_ENV_VAR_NAME_PATTERN.match(str(name or "")))
 
@@ -77,11 +77,8 @@ def is_private_host(host: str) -> bool:
     # 与 `onebot_endpoint_rejection` 同一口径：映射地址显式按底层 IPv4 判定。
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         address = address.ipv4_mapped
-    # CPython 标准库的 IPv6Address 公开属性集不含 `is_unique_local`（目标下限 3.11
-    # 与本机实测 3.14 均无此属性；ULA 已由 `is_private` 覆盖）。保留 getattr 兼容
-    # 写法，只为在出现该属性的实现上不把它漏掉，不让它承担主判定。
-    unique_local = getattr(address, "is_unique_local", False)
-    return bool(address.is_private or address.is_link_local or unique_local)
+    # ULA 已包含在标准库 is_private 中，无需不存在的 is_unique_local 属性。
+    return bool(address.is_private or address.is_link_local)
 
 
 def onebot_endpoint_rejection(endpoint: object) -> str | None:

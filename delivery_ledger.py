@@ -512,31 +512,28 @@ class DeliveryLedger:
         """
 
         now = self._clock.now()
-        try:
-            with self._transaction() as cursor:
-                cursor.execute(
-                    f"""
-                    INSERT INTO {_TABLE} (
-                        account_id, source_group_id, source_message_id, target_group_id,
-                        status, target_message_id, comment_status, comment_message_id, reason,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, '', '', '', '', ?, ?)
-                    ON CONFLICT (account_id, source_group_id, source_message_id, target_group_id)
-                    DO UPDATE SET
-                        status = excluded.status,
-                        target_message_id = '',
-                        comment_status = '',
-                        comment_message_id = '',
-                        reason = '',
-                        updated_at = excluded.updated_at
-                    WHERE {_TABLE}.status = ?
-                    """,
-                    (*_key_values(key), STATUS_SENDING, now, now, STATUS_FAILED),
-                )
-                granted = _single_row_changed(cursor)
-                record = self._fetch(cursor, key)
-        except (sqlite3.Error, OSError) as error:
-            raise LedgerUnavailableError(_describe(error)) from None
+        with self._transaction() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {_TABLE} (
+                    account_id, source_group_id, source_message_id, target_group_id,
+                    status, target_message_id, comment_status, comment_message_id, reason,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, '', '', '', '', ?, ?)
+                ON CONFLICT (account_id, source_group_id, source_message_id, target_group_id)
+                DO UPDATE SET
+                    status = excluded.status,
+                    target_message_id = '',
+                    comment_status = '',
+                    comment_message_id = '',
+                    reason = '',
+                    updated_at = excluded.updated_at
+                WHERE {_TABLE}.status = ?
+                """,
+                (*_key_values(key), STATUS_SENDING, now, now, STATUS_FAILED),
+            )
+            granted = _single_row_changed(cursor)
+            record = self._fetch(cursor, key)
         if record is None:
             raise LedgerUnavailableError("投递占位登记后无法读回记录")
         return Reservation(granted=granted, record=record)
@@ -552,30 +549,27 @@ class DeliveryLedger:
         零条」必须可区分；失败时遗留 `sending` 仍会阻止重发，方向依旧安全。
         """
 
-        try:
-            with self._transaction() as cursor:
-                cursor.execute(
-                    f"""
-                    UPDATE {_TABLE}
-                    SET status = ?, reason = ?, updated_at = ?
-                    WHERE status = ?
-                    """,
-                    (
-                        STATUS_UNKNOWN,
-                        "上一次进程中断遗留的发送记录，结果待核实",
-                        self._clock.now(),
-                        STATUS_SENDING,
-                    ),
-                )
-                recovered = cursor.rowcount
-                cursor.execute(
-                    f"UPDATE {_TABLE} SET comment_status = ?, updated_at = ? "
-                    "WHERE comment_status = ?",
-                    (STATUS_UNKNOWN, self._clock.now(), STATUS_SENDING),
-                )
-                return recovered + cursor.rowcount
-        except (sqlite3.Error, OSError) as error:
-            raise LedgerUnavailableError(_describe(error)) from None
+        with self._transaction() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE {_TABLE}
+                SET status = ?, reason = ?, updated_at = ?
+                WHERE status = ?
+                """,
+                (
+                    STATUS_UNKNOWN,
+                    "上一次进程中断遗留的发送记录，结果待核实",
+                    self._clock.now(),
+                    STATUS_SENDING,
+                ),
+            )
+            recovered = cursor.rowcount
+            cursor.execute(
+                f"UPDATE {_TABLE} SET comment_status = ?, updated_at = ? "
+                "WHERE comment_status = ?",
+                (STATUS_UNKNOWN, self._clock.now(), STATUS_SENDING),
+            )
+            return recovered + cursor.rowcount
 
     def mark_sent(self, key: DeliveryKey, target_message_id: str) -> bool:
         """把在途占位登记为成功（保存真实目标消息 ID）。
@@ -611,17 +605,14 @@ class DeliveryLedger:
     def reserve_comment(self, key: DeliveryKey) -> Reservation:
         """仅对源 sent 且评论空态原子授予一次 sending 占位，不创建缺失源行。"""
 
-        try:
-            with self._transaction() as cursor:
-                cursor.execute(
-                    f"UPDATE {_TABLE} SET comment_status = ?, updated_at = ? "
-                    f"WHERE {_key_where()} AND status = ? AND comment_status = ''",
-                    (STATUS_SENDING, self._clock.now(), *_key_values(key), STATUS_SENT),
-                )
-                granted = _single_row_changed(cursor)
-                record = self._fetch(cursor, key)
-        except (sqlite3.Error, OSError) as error:
-            raise LedgerUnavailableError(_describe(error)) from None
+        with self._transaction() as cursor:
+            cursor.execute(
+                f"UPDATE {_TABLE} SET comment_status = ?, updated_at = ? "
+                f"WHERE {_key_where()} AND status = ? AND comment_status = ''",
+                (STATUS_SENDING, self._clock.now(), *_key_values(key), STATUS_SENT),
+            )
+            granted = _single_row_changed(cursor)
+            record = self._fetch(cursor, key)
         return Reservation(granted=granted, record=record)
 
     def record_comment(self, key: DeliveryKey, *, status: LedgerStatus, message_id: str = "") -> bool:
@@ -643,11 +634,8 @@ class DeliveryLedger:
     def get(self, key: DeliveryKey) -> DeliveryRecord | None:
         """读取记录快照：不存在返回 `None`；读取失败抛 `LedgerUnavailableError`。"""
 
-        try:
-            with self._transaction() as cursor:
-                return self._fetch(cursor, key)
-        except (sqlite3.Error, OSError) as error:
-            raise LedgerUnavailableError(_describe(error)) from None
+        with self._transaction() as cursor:
+            return self._fetch(cursor, key)
 
     def close(self) -> None:
         """关闭连接（不删除任何数据）。"""
@@ -673,12 +661,9 @@ class DeliveryLedger:
     def _write(self, sql: str, parameters: tuple[object, ...]) -> bool:
         """执行一条更新：返回是否命中在途占位；存储失败抛 `LedgerUnavailableError`。"""
 
-        try:
-            with self._transaction() as cursor:
-                cursor.execute(sql, parameters)
-                return _single_row_changed(cursor)
-        except (sqlite3.Error, OSError) as error:
-            raise LedgerUnavailableError(_describe(error)) from None
+        with self._transaction() as cursor:
+            cursor.execute(sql, parameters)
+            return _single_row_changed(cursor)
 
     def _fetch(self, cursor: sqlite3.Cursor, key: DeliveryKey) -> DeliveryRecord | None:
         """在给定游标（同一事务）内读回记录。"""
@@ -701,24 +686,27 @@ class DeliveryLedger:
         BEGIN、事务体与 COMMIT 任一失败都显式回滚：连接若停在未结束事务，下一次
         `BEGIN` 会报 `cannot start a transaction within a transaction`，把一次
         存储故障扩散成整个账本不可用。游标创建与关闭统一放在 finally，任何分支
-        都不泄漏游标。
+        都不泄漏游标。存储异常在此统一转成安全中文错误，覆盖游标创建与关闭。
         """
 
-        with self._mutex:
-            if self._unavailable:
-                raise LedgerUnavailableError("状态库连接已停用，须关闭并重新核对后使用")
-            cursor: sqlite3.Cursor | None = None
-            try:
-                cursor = self._connection.cursor()
-                cursor.execute("BEGIN IMMEDIATE")
-                yield cursor
-                self._connection.commit()
-            except BaseException:
-                self._rollback_quietly()
-                raise
-            finally:
-                if cursor is not None and not self._unavailable:
-                    cursor.close()
+        try:
+            with self._mutex:
+                if self._unavailable:
+                    raise LedgerUnavailableError("状态库连接已停用，须关闭并重新核对后使用")
+                cursor: sqlite3.Cursor | None = None
+                try:
+                    cursor = self._connection.cursor()
+                    cursor.execute("BEGIN IMMEDIATE")
+                    yield cursor
+                    self._connection.commit()
+                except BaseException:
+                    self._rollback_quietly()
+                    raise
+                finally:
+                    if cursor is not None and not self._unavailable:
+                        cursor.close()
+        except (sqlite3.Error, OSError) as error:
+            raise LedgerUnavailableError(_describe(error)) from None
 
     def _rollback_quietly(self) -> None:
         """最多两次回滚并核实事务结束；仍失败则停用，保留独占直至公开关闭。

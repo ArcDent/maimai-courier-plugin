@@ -907,6 +907,13 @@ class _FaultCursor(sqlite3.Cursor):
             raise sqlite3.OperationalError(_SYNTHETIC_PRIVATE)
         return result
 
+    def close(self) -> None:
+        connection = self.connection
+        super().close()
+        if connection.failure == "cursor_close":
+            connection.failure = ""
+            raise connection.cursor_error(_SYNTHETIC_PRIVATE)
+
 
 class _FaultConnection(sqlite3.Connection):
     """通过公开连接工厂注入开始、写入、查询和提交故障。"""
@@ -914,6 +921,7 @@ class _FaultConnection(sqlite3.Connection):
     failure = ""
     rollback_failures = 0
     close_failure = False
+    cursor_error = sqlite3.OperationalError
 
     def rollback(self) -> None:
         if self.rollback_failures:
@@ -931,6 +939,9 @@ class _FaultConnection(sqlite3.Connection):
         self.commands: list[tuple[str, tuple[Any, ...]]] = []
 
     def cursor(self, *args: Any, **kwargs: Any) -> Any:
+        if self.failure == "cursor":
+            self.failure = ""
+            raise self.cursor_error(_SYNTHETIC_PRIVATE)
         return super().cursor(factory=_FaultCursor)
 
     def commit(self) -> None:
@@ -953,6 +964,34 @@ def _fault_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Delive
 
     monkeypatch.setattr(sqlite3, "connect", create)
     return open_test_ledger(tmp_path), connections[-1]
+
+
+@pytest.mark.parametrize("phase", ["cursor", "cursor_close"])
+@pytest.mark.parametrize("error_type", [sqlite3.OperationalError, OSError])
+@pytest.mark.parametrize("operation", ["get", "reserve"])
+def test_游标创建及关闭故障保持安全错误与真实提交结果(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, error_type: type[Exception], operation: str,
+) -> None:
+    import traceback
+
+    ledger, connection = _fault_open(tmp_path, monkeypatch)
+    key = ledger_key()
+    try:
+        connection.failure, connection.cursor_error = phase, error_type
+        with pytest.raises(LedgerUnavailableError) as caught:
+            getattr(ledger, operation)(key)
+        assert not connection.in_transaction
+        assert _SYNTHETIC_PRIVATE not in "".join(traceback.format_exception(caught.value))
+        assert str(caught.value) == ("状态库不可读或所在目录不可写" if error_type is sqlite3.OperationalError else "存储路径不可用")
+        record = ledger.get(key)
+        if phase == "cursor_close" and operation == "reserve":
+            assert record is not None and record.status == STATUS_SENDING
+            assert not ledger.reserve(key).granted, "提交后的清理故障不能抹除防重占位"
+        else:
+            assert record is None
+        assert ledger.reserve(ledger_key(message_id="after-cursor-fault")).granted
+    finally:
+        ledger.close()
 
 
 @pytest.mark.parametrize("phase", ["begin", "write", "commit"])

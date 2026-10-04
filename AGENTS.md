@@ -169,11 +169,9 @@ uv run --no-project --with pytest --with aiohttp pytest tests/ -q
 uv run --no-project --with pyright pyright
 ```
 
-2026-10-04：无网络库838 passed/6 skipped；aiohttp 3.14.3为932 passed/无skip；
-pyright 1.1.414为22生产文件零错误，Python 3.14.7、pytest 9.1.1。每次修改重跑实际
-结果，不套用旧数字；可用 `aiohttp==3.14.3` 固定下限复验。第9组实机部署返修后的
-完整记录见本变更 `verification/09-deployment-revision.md`。
-默认两个真实传输模块导入期跳过、另4节点运行期跳过，只有带库才覆盖真实回环WS完整链。
-根默认收集与tests同范围，历史不收集。类型检查13根模块+8共享模块+service包墓碑，
-历史明确排除，目标Python 3.11；缺真实SDK故关闭reportMissingImports，不安装真SDK。
-测试只用临时合成数据与本地端点，不SSH、读真实状态、部署或发QQ。
+覆盖边界详见 [README 的离线开发验证](README.md#离线开发验证)。每次修改
+重跑实际结果，不沿用旧数字；测试仅使用临时合成数据与本地端点，不安装真实 SDK、
+SSH、读取真实状态、部署或发 QQ。根默认收集与 `tests/` 同范围，历史不收集。
+`pyrightconfig.json` 明确排除历史，目标 Python 3.11；真实 SDK 未安装，因此关闭
+`reportMissingImports`。实机返修证据见归档 `verification/09-deployment-revision.md`，
+离线通过不能代替实际加载版本确认、独立验收或真实 QQ 联验。

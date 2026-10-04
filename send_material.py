@@ -1,29 +1,14 @@
-"""转发内容完整性预检：只接受可完整恢复并原样发送的消息材料。
+"""宿主与 OneBot 源材料转换：共享提及呈现，只输出材料与结构指纹，不发送或落盘。
 
-预检的目标是「不丢段、不降级、不以描述冒充媒体」：普通消息逐段校验并保留宿主
-接收侧序列化形态；合并转发按节点递归校验，全部可恢复时才准备聊天记录卡片。
-任一段不可用时整条拒绝，绝不发送缺失媒体、也绝不只发送一部分。
+`build_send_material` 保留宿主材料的公开兼容接口，包括递归节点校验；普通图片须有
+`binary_data_base64`，错误定位到段或节点。实际工具预检先以 `is_forward_card` 识别
+唯一顶层卡片并绕过递归校验，卡片内部内容不因此被拒绝或改写。
 
-- 图片必须带 `binary_data_base64`：宿主序列化时只有内存二进制存在、或 hash 命中
-  图片库且文件存在才会给出该字段（`message_utils.py:168-198`），缺失时发送侧
-  `to_seg()` 会抛错，描述文本不能代替原图；
-- 未展开的合并转发会被宿主收成 `DictComponent`（`message_utils.py:327-328`）；
-  空内容节点会被宿主在解析期替换成占位文本 `[empty forward node]`
-  （`:312-317`，字面量在 `:317`），DB 回读也无法还原原文
-  （`message_component_data_model.py:359` 要求节点内容非空）：两者都是降级路径，
-  预检一经发现即整条拒绝（顶层消息里的同名字符串是真实正文，不算占位）；
-- 卡片层数上限对齐网关 `MAX_FORWARD_DEPTH`（SnowLuma
-  `packages/onebot/src/modules/message-actions.ts:1484,1570-1577`）。
+`build_source_material` / `source_outbound_segments` 只使用可信 OneBot 源材料：
+原卡片保留资源引用，普通消息校验图片引用并将提及文本化。相邻文本归并不跨越原有
+分段、不新增换行；对象不明或材料不可完整发送时整条拒绝。
 
-本模块只产出材料与结构指纹，不发送、不落盘；拒绝原因只描述内容本身，
 「本次未发送任何消息」定尾由工具入口的 `Rejected.not_sent` 统一补齐。
-
-个人与全体成员提及是「普通消息保持原形态」的唯一例外（ADR 0002、design D1）：
-已核实形态的 `at` 段（`{"type": "at", "data": {"target_user_id",
-"target_user_nickname", "target_user_cardname"}}`，入站载荷、存储回读与转发节点
-三处同形）转换成不触发提醒的普通文本，并与紧邻的文字段归并（不跨越源消息本来就
-相邻的文本分段），不新增换行；对象标识不可确认（缺失、空串、非字典结构）时整条
-拒绝，不猜测、也不把空标识当成全体成员。
 """
 
 from __future__ import annotations
@@ -148,9 +133,7 @@ _SAFE_SEGMENT_LABEL = re.compile(r"[a-z0-9_]{1,16}\Z")
 _AT_SEGMENT_TYPE = "at"
 """宿主提及段的类型名（`message_utils.py:134-142` 的唯一序列化出口）。"""
 
-# 全体成员标识、全体成员文本与两种个人提及格式（含压平口径）的唯一实现在共享层
-# `shared/mentions.py`（design D9）；本模块只保留宿主形态的字段映射与可确认性判定，
-# 上面的导入保证与 `service/materials.py` 逐字一致。
+# 提及格式与压平规则只定义在 shared/mentions.py；本模块分别映射宿主和 OneBot 字段。
 
 SendKind = Literal["text", "image", "mixed", "forward"]
 """发送材料种类：纯文本、纯图片、混合，或合并转发卡片。"""
@@ -165,12 +148,9 @@ class UnsupportedContent:
 
 @dataclass(frozen=True, slots=True)
 class SendMaterial:
-    """预检通过的发送材料。
+    """宿主材料的兼容结果：普通段 `segments`、卡片节点 `nodes` 与无正文的 `shape`。
 
-    - `segments`：普通消息的段序列（宿主接收侧序列化形态，可直接交给发送链）；
-    - `nodes`：合并转发的节点列表（同样可直接交给 `send.forward`）；
-    - `shape`：与材料同构的结构指纹（只有段类型与嵌套、不含正文），用于在不发送
-      的前提下验证材料完整性。
+    实际投递只发送可信 OneBot 源材料，不把此处节点交给宿主发送或重建原卡片。
     """
 
     kind: SendKind
@@ -185,14 +165,6 @@ class _BuiltSegments:
 
     segments: tuple[dict[str, Any], ...]
     shape: tuple[Any, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _BuiltCard:
-    """已校验的合并转发段（重建后的段）与其节点内容指纹。"""
-
-    segment: dict[str, Any]
-    contents: tuple[Any, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,8 +195,7 @@ def is_forward_card(segment: Any) -> bool:
     展开形态是 `{"type": "forward", "data": [节点…]}`；宿主无法恢复节点材料时会
     收成 `DictComponent`（`message_utils.py:327-338`），序列化后是
     `{"type": "dict", "data": {"type": "forward", …}}`。自动入口（只需消息 ID 就能
-    给判断机会）与内容预检（要求节点可完整恢复）共用本形状判据，避免宿主序列化
-    形态变化时一处放行、一处拒绝。
+    给判断机会）与工具预检共用本形状判据；实际卡片只检查顶层，不递归处理节点。
     """
 
     if not isinstance(segment, dict):
@@ -326,7 +297,7 @@ def _build_segments(
             card = _build_card(item, location=segment_location, depth=depth + 1)
             if isinstance(card, UnsupportedContent):
                 return card
-            pieces.append(_SegmentPiece(card.segment, {"forward": list(card.contents)}))
+            pieces.append(card)
             continue
         if _is_unexpanded_forward(item):
             return UnsupportedContent(f"{segment_location}是未展开的合并转发（宿主未能恢复节点）")
@@ -387,16 +358,10 @@ def _assemble_segments(pieces: list[_TextPiece | _SegmentPiece]) -> _BuiltSegmen
 
 
 def _mention_display_text(item: dict[str, Any], location: str) -> str | UnsupportedContent:
-    """把已核实形态的提及段转成不触发提醒的普通文本（对象不可确认时整条拒绝）。
+    """映射宿主提及字段并复用共享呈现；对象缺失、类型错误或压平后为空即整条拒绝。
 
-    对象标识必须可确认（非空字符串，且按显示口径压平后仍非空）：缺失、空串、非字符串、
-    压平后为空、非字典结构都直接拒绝，绝不猜测，也不把空标识当成全体成员。对象标识
-    恰为网关字面量 `all` 时按全体成员呈现（名称字段不参与）；其余标识按个人提及呈现，
-    显示名只取自源材料里宿主已补写的字段（群名片优先、其次昵称）。对象标识与显示名走
-    同一压平口径（`shared/mentions.flatten_mention_text`：不可打印字符转空格、折叠多余
-    空白），因此标识里的换行／控制字符不会原样进入发送文本；没有可用名称时只呈现对象
-    标识。三种格式字面量与压平规则见 `shared/mentions.py`（与 `service/materials.py`
-    共用同一实现）。
+    `all` 表示全体成员；个人名称取源群名片、其次昵称，不查询目标群补全。
+    名称和标识的控制字符压平、三种文本格式统一由 `shared/mentions.py` 定义。
     """
 
     data = item.get("data")
@@ -411,7 +376,7 @@ def _mention_display_text(item: dict[str, Any], location: str) -> str | Unsuppor
     return mention_display_text(identifier, name)
 
 
-def _build_card(forward_segment: dict[str, Any], *, location: str, depth: int) -> _BuiltCard | UnsupportedContent:
+def _build_card(forward_segment: dict[str, Any], *, location: str, depth: int) -> _SegmentPiece | UnsupportedContent:
     """递归校验合并转发的全部节点，重建完整聊天记录卡片段。"""
 
     raw_nodes = forward_segment.get("data")
@@ -441,7 +406,7 @@ def _build_card(forward_segment: dict[str, Any], *, location: str, depth: int) -
 
     rebuilt_segment = deepcopy(forward_segment)
     rebuilt_segment["data"] = nodes
-    return _BuiltCard(segment=rebuilt_segment, contents=tuple(contents))
+    return _SegmentPiece(segment=rebuilt_segment, shape={"forward": contents})
 
 
 def _is_unexpanded_forward(item: dict[str, Any]) -> bool:

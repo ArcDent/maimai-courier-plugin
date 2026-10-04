@@ -180,9 +180,8 @@ uv run --no-project --with pytest --with aiohttp pytest tests/ -q
 uv run --no-project --with pyright pyright
 ```
 
-2026-10-04 实跑：默认 **777 passed, 6 skipped**；带 aiohttp 3.14.3 **856 passed，无跳过**；
-pyright 1.1.414 检查 22 个生产文件，零错误。Python 3.14.7、pytest 9.1.1。
-固定下限复验可把第二条的 `aiohttp` 改为 `aiohttp==3.14.3`。
+固定下限复验可把第二条的 `aiohttp` 改为 `aiohttp==3.14.3`；结果以本次实际输出为准，
+历史数字及其适用代码范围留在验收附件中，不作为当前版本的通过证明。
 
 默认不装网络库：两个真实传输模块导入期跳过，另四个依赖网络库节点跳过；带库才执行
 真实 HTTP 握手/回环 WebSocket、公共工具完整链。旧 HTTP 服务及跨进程用例已隔离，
