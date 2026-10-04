@@ -3,7 +3,8 @@
 断言的是替身自身的公共契约：真实 SDK 被拦截、Hook 枚举按真实 SDK 精确校验、
 上下文经 `_set_context` 注入且 `ctx` 只读、消息就绪可控、详细发送回执可控、
 在途发送可取消、可控时钟无需真实等待、存储故障可注入、合并转发夹具使用宿主
-接收侧序列化键形状。生产行为不在这里断言（各实现组按自己的 seam 写行为测试）。
+接收侧序列化键形状、配置字段声明保留元数据且按注解校验。生产行为不在这里断言
+（各实现组按自己的 seam 写行为测试）。
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import importlib
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
 import pytest
 
@@ -247,3 +248,133 @@ def test_自动入口账号别名与宿主路由键工厂一致() -> None:
     """生产的账号候选键不得偏离宿主 `RouteKeyFactory.ACCOUNT_ID_KEYS`。"""
 
     assert tuple(ACCOUNT_ID_KEYS) == HOST_ACCOUNT_ID_KEYS
+
+
+def test_配置字段替身保留声明元数据与默认值() -> None:
+    """`Field()` 必须保留默认值与宿主 Schema 生成器读取的元数据，而不是丢弃后只回默认值。
+
+    对照证据（tasks 1.3）：真实 SDK 的 `Field` 是 pydantic `Field`，宿主 Schema
+    生成器只读 `json_schema_extra` 里的封闭键集合（label / hint / x-widget /
+    rows / max_length / order 等），`max_length` 另有 pydantic 约束语义。
+    """
+
+    class Section(fake_maibot_sdk.PluginConfigBase):
+        modes: list[Literal["text", "image", "forward"]] = fake_maibot_sdk.Field(
+            default_factory=lambda: ["forward"],
+            description="候选类型。",
+            json_schema_extra={"label": "候选类型", "hint": "默认仅合并转发", "order": 1},
+        )
+        note: str = fake_maibot_sdk.Field(
+            default="",
+            max_length=8,
+            json_schema_extra={"x-widget": "textarea", "rows": 4, "max_length": 8},
+        )
+
+    assert Section.modes.description == "候选类型。"
+    assert Section.modes.json_schema_extra == {
+        "label": "候选类型",
+        "hint": "默认仅合并转发",
+        "order": 1,
+    }
+    assert Section.note.max_length == 8
+    assert Section.note.json_schema_extra == {"x-widget": "textarea", "rows": 4, "max_length": 8}
+    assert Section().model_dump() == {"modes": ["forward"], "note": ""}
+
+
+def test_配置枚举列表逐项校验且拒绝未知值() -> None:
+    """`list[Literal[...]]` 逐项校验：空列表与合法组合通过，未知值明确报错而非放宽成全选。"""
+
+    class Section(fake_maibot_sdk.PluginConfigBase):
+        modes: list[Literal["text", "image", "forward"]] = fake_maibot_sdk.Field(
+            default_factory=lambda: ["forward"]
+        )
+
+    assert Section(modes=[]).modes == [], "空列表是合法的候选集合"
+    assert Section(modes=["text"]).modes == ["text"]
+    assert Section(modes=["text", "forward"]).modes == ["text", "forward"]
+    assert Section().modes == ["forward"], "缺省回落默认工厂"
+
+    for invalid in (["video"], ["text", "video"], ["TEXT"], [""], "text", None):
+        with pytest.raises(ValueError):
+            Section(modes=invalid)
+
+
+def test_配置字符串长度上限按字符校验且不改写内容() -> None:
+    """字符串长度按 `Field(max_length=…)` 强制；合法内容（含换行）不得被压平或截断。"""
+
+    class Section(fake_maibot_sdk.PluginConfigBase):
+        short: str = fake_maibot_sdk.Field(default="", max_length=5)
+        note: str = fake_maibot_sdk.Field(default="")
+
+    assert Section(short="12345").short == "12345"
+    with pytest.raises(ValueError):
+        Section(short="123456")
+    with pytest.raises(ValueError):
+        Section(short=None)
+
+    value = "  第一行\n\t第二行  "
+    assert Section(note=value).note == value
+
+
+def test_配置实例间默认值相互隔离() -> None:
+    """默认工厂每次实例化都应产出独立副本，实例之间的默认值不得互相污染。"""
+
+    class Section(fake_maibot_sdk.PluginConfigBase):
+        items: list[str] = fake_maibot_sdk.Field(default_factory=list)
+
+    first, second = Section(), Section()
+    first.items.append("x")
+    assert second.items == []
+    assert Section().items == []
+
+
+class _DemoInner(fake_maibot_sdk.PluginConfigBase):
+    """替身自测用的嵌套 section（模块级，供 `get_type_hints` 解析注解）。"""
+
+    enabled: bool = fake_maibot_sdk.Field(default=False)
+    names: list[str] = fake_maibot_sdk.Field(default_factory=list)
+
+
+class _DemoOuter(fake_maibot_sdk.PluginConfigBase):
+    """替身自测用的外层配置（含嵌套 section 与字符串版本字段）。"""
+
+    inner: _DemoInner = fake_maibot_sdk.Field(default_factory=_DemoInner)
+    version: str = fake_maibot_sdk.Field(default="1.0.0")
+
+
+def test_配置嵌套覆盖与未知键忽略不退化() -> None:
+    """嵌套 section 的 dict 覆盖要转成对应实例，未知键按 `extra="ignore"` 忽略。
+
+    两个演示模型放在模块级：`get_type_hints` 只解析模块全局命名空间里的注解，
+    与真实 pydantic 对模块级配置模型的解析口径一致。
+
+    类型不符的值必须报错。这里用 `"maybe"` 而非 `"yes"`：真实 pydantic 的宽松
+    模式会把 `"yes"` 强转为 `True`，替身有意只接受精确 bool（见
+    `fake_maibot_sdk._validate_config_value`），`"maybe"` 在两者都报错。
+    """
+
+    config = _DemoOuter(inner={"enabled": True, "unknown": 1}, unknown=2)
+    assert isinstance(config.inner, _DemoInner)
+    assert config.inner.enabled is True
+    assert config.inner.names == []
+    assert config.model_dump() == {
+        "inner": {"enabled": True, "names": []},
+        "version": "1.0.0",
+    }
+    with pytest.raises(ValueError):
+        _DemoOuter(inner={"enabled": "maybe"})
+
+
+def test_配置替身跳过ClassVar并保持默认配置导出() -> None:
+    """`ClassVar` 注解（WebUI 标签）不算配置字段；`build_default_config()` 仍可用。"""
+
+    class Section(fake_maibot_sdk.PluginConfigBase):
+        __ui_label__: ClassVar[str] = "演示"
+        value: int = fake_maibot_sdk.Field(default=1)
+
+    assert Section().model_dump() == {"value": 1}
+
+    class FakePlugin(fake_maibot_sdk.MaiBotPlugin):
+        config_model = Section
+
+    assert FakePlugin.build_default_config() == {"value": 1}

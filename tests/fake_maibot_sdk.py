@@ -17,7 +17,7 @@ from __future__ import annotations
 import copy
 import enum
 from pathlib import Path
-from typing import Any, ClassVar, get_origin, get_type_hints
+from typing import Any, ClassVar, Literal, get_args, get_origin, get_type_hints
 
 CONFIG_RELOAD_SCOPE_SELF = "self"
 """插件自身配置热重载的 scope 值（对齐真实 SDK）。"""
@@ -53,44 +53,100 @@ SDK_ROOT_EXPORTS = frozenset(
 """
 
 
+class _FakeFieldInfo:
+    """字段声明替身（对齐真实 SDK 里 pydantic `Field()` 返回的 `FieldInfo` 常用面）。
+
+    只保留本仓库配置声明与测试实际消费的只读信息：默认值／默认工厂、
+    `description`、`json_schema_extra`（宿主 Schema 生成器读取的封闭元数据键集合）
+    与 pydantic 字符串约束 `max_length`；不复制 pydantic 的完整 `FieldInfo`。
+    `max_length` 是唯一的约束面：只写 `json_schema_extra["max_length"]` 不会拦下
+    超长输入，真实宿主同样由 pydantic 约束（tasks 1.3 已核实）。
+    """
+
+    __slots__ = ("default", "default_factory", "description", "json_schema_extra", "max_length")
+
+    def __init__(
+        self,
+        default: Any = None,
+        *,
+        default_factory: Any = None,
+        description: str = "",
+        json_schema_extra: Any = None,
+        max_length: int | None = None,
+    ) -> None:
+        self.default = default
+        self.default_factory = default_factory
+        self.description = description
+        self.json_schema_extra = dict(json_schema_extra or {})
+        self.max_length = max_length
+
+    def get_default(self) -> Any:
+        """取本次实例化应使用的默认值：默认工厂每次调用都产出新对象。"""
+
+        if self.default_factory is not None:
+            return self.default_factory()
+        return copy.deepcopy(self.default)
+
+
 def Field(
     default: Any = None,
     *,
     default_factory: Any = None,
     description: str = "",
     json_schema_extra: Any = None,
-    **_: Any,
+    max_length: int | None = None,
+    **metadata: Any,
 ) -> Any:
     """字段声明替身（对齐真实 SDK 里 pydantic `Field` 的常用参数）。
 
-    `default_factory` 立即求值：`PluginConfigBase` 构造时对默认值做深拷贝，
-    每次实例化都拿到独立副本。
+    `json_schema_extra` 承载宿主 Schema 生成器读取的 UI 元数据（label / hint /
+    x-widget / rows / order 等），`max_length` 承载 pydantic 字符串长度约束。
+    未识别的关键字参数会被忽略：UI 元数据必须写进 `json_schema_extra`，宿主
+    Schema 生成器只读该处，替身不发明宽松别名。`default_factory` 延迟到实例化时
+    才求值，`PluginConfigBase` 据此保证每次实例化都拿到独立副本。
+
+    差异说明：真实 pydantic v2 会把未识别的关键字参数并入 `json_schema_extra`
+    （并给出弃用警告），替身不复制这一行为、一律忽略；因此用未识别关键字声明的
+    元数据在替身里不生效，测试不得依赖这种写法。
     """
 
-    del description, json_schema_extra
-    if default_factory is not None:
-        return default_factory()
-    return default
+    del metadata
+    return _FakeFieldInfo(
+        default,
+        default_factory=default_factory,
+        description=description,
+        json_schema_extra=json_schema_extra,
+        max_length=max_length,
+    )
 
 
 class PluginConfigBase:
-    """配置模型替身：按类注解逐字段取默认值，支持嵌套 section。
+    """配置模型替身：按类注解逐字段取默认值，支持嵌套 section 与构造期校验。
 
     `model_dump()` 产出与真实 SDK（pydantic `model_dump(mode="python")`）同形的
     嵌套字典；构造时把 dict 覆盖值转成对应 section 实例，缺省字段回落默认值。
     `ClassVar` 注解（如 WebUI 用的 `__ui_label__`）按类属性处理，不算配置字段。
+
+    校验口径对齐真实 SDK 的 pydantic 配置模型：`Literal` 与 `list[Literal]` 精确
+    匹配枚举成员（未知值明确报错，不解释成全选）、字符串按 `Field(max_length=…)`
+    限长且不改写内容、未知键按 `extra="ignore"` 忽略、嵌套 section 递归构造。
+    校验失败抛 `ValueError`（真实 pydantic 的 `ValidationError` 是 `ValueError`
+    子类）。替身不复制完整 pydantic，只覆盖本仓库配置声明实际使用的注解形态；
+    有意不实现 pydantic 的宽松输入归一（如 `"yes"` → `True`、`"5"` → `5`、tuple
+    收作 `list`），差异只可能误拒、不会误放。
     """
 
     def __init__(self, **overrides: Any) -> None:
-        for key in _config_field_names(type(self)):
-            default = getattr(type(self), key, None)
-            if key not in overrides:
-                setattr(self, key, copy.deepcopy(default))
-                continue
-            value = overrides[key]
-            if isinstance(default, PluginConfigBase) and isinstance(value, dict):
-                value = type(default)(**value)
-            setattr(self, key, value)
+        for key, annotation in _config_fields(type(self)).items():
+            field = getattr(type(self), key, None)
+            raw = overrides[key] if key in overrides else _field_default(field)
+            setattr(
+                self,
+                key,
+                _validate_config_value(
+                    annotation, raw, key, max_length=_field_max_length(field)
+                ),
+            )
 
     def model_dump(self) -> dict[str, Any]:
         """导出嵌套字典（对齐真实 SDK 的 `model_dump(mode="python")`）。"""
@@ -102,19 +158,110 @@ class PluginConfigBase:
         return dumped
 
 
-def _config_field_names(cls: type) -> list[str]:
-    """配置字段名：跳过 `ClassVar` 注解（对齐 pydantic 把 ClassVar 当类属性）。"""
+def _resolved_annotations(cls: type) -> dict[str, Any]:
+    """已解析的类注解；`get_type_hints` 失败时回退原始注解（含字符串形态）。"""
 
     raw_annotations = dict(getattr(cls, "__annotations__", {}))
     try:
         resolved_annotations = get_type_hints(cls)
     except Exception:
         resolved_annotations = {}
-    return [
-        name
+    return {
+        name: resolved_annotations.get(name, annotation)
         for name, annotation in raw_annotations.items()
-        if get_origin(resolved_annotations.get(name, annotation)) is not ClassVar
-    ]
+    }
+
+
+def _config_fields(cls: type) -> dict[str, Any]:
+    """配置字段名 → 注解：跳过 `ClassVar` 注解（对齐 pydantic 把 ClassVar 当类属性）。"""
+
+    return {
+        name: annotation
+        for name, annotation in _resolved_annotations(cls).items()
+        if get_origin(annotation) is not ClassVar
+    }
+
+
+def _config_field_names(cls: type) -> list[str]:
+    """配置字段名（保持声明顺序）。"""
+
+    return list(_config_fields(cls))
+
+
+def _field_default(field: Any) -> Any:
+    """取字段声明的默认值：`Field()` 声明走其默认工厂，裸默认值直接深拷贝。"""
+
+    if isinstance(field, _FakeFieldInfo):
+        return field.get_default()
+    return copy.deepcopy(field)
+
+
+def _field_max_length(field: Any) -> int | None:
+    """取字段声明的字符串长度上限（仅 `Field(max_length=…)` 参与校验）。"""
+
+    return field.max_length if isinstance(field, _FakeFieldInfo) else None
+
+
+def _describe_choices(choices: tuple[Any, ...]) -> str:
+    """拼出 pydantic 风格的候选措辞（如 `'text', 'image' or 'forward'`）。"""
+
+    rendered = [repr(choice) for choice in choices]
+    if len(rendered) == 1:
+        return rendered[0]
+    return ", ".join(rendered[:-1]) + f" or {rendered[-1]}"
+
+
+def _validate_config_value(
+    annotation: Any,
+    value: Any,
+    field_name: str,
+    *,
+    max_length: int | None = None,
+) -> Any:
+    """按注解校验配置值，返回可安全落进实例的值（列表产出新对象，隔离调用方）。
+
+    只覆盖本仓库配置声明实际使用的形态：`Literal`、`list[X]`、嵌套
+    `PluginConfigBase`、`str`（含 `max_length`）、`bool` 与 `int`；其余注解不设
+    约束（替身不做 pydantic 的完整类型系统）。报错路径与真实 SDK 一致（抛
+    `ValueError`），有意不实现 pydantic 的宽松输入归一（如 `"yes"` → `True`、
+    `"5"` → `5`、tuple 收作 `list`）：差异只可能误拒、不会误放。
+    """
+
+    if annotation is None:
+        return value
+    origin = get_origin(annotation)
+    if origin is Literal:
+        choices = get_args(annotation)
+        if value not in choices:
+            raise ValueError(f"{field_name}: Input should be {_describe_choices(choices)}")
+        return value
+    if origin is list:
+        if not isinstance(value, list):
+            raise ValueError(f"{field_name}: Input should be a valid list")
+        (item_annotation,) = get_args(annotation)
+        return [_validate_config_value(item_annotation, item, field_name) for item in value]
+    if isinstance(annotation, type) and issubclass(annotation, PluginConfigBase):
+        if isinstance(value, annotation):
+            return value
+        if isinstance(value, dict):
+            return annotation(**value)
+        raise ValueError(f"{field_name}: Input should be a valid {annotation.__name__}")
+    if annotation is str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name}: Input should be a valid string")
+        if max_length is not None and len(value) > max_length:
+            raise ValueError(f"{field_name}: String should have at most {max_length} characters")
+        return value
+    if annotation is bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"{field_name}: Input should be a valid boolean")
+        return value
+    if annotation is int:
+        # bool 是 int 的子类，显式拒绝，避免 True 被当成 1 存进整型字段。
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field_name}: Input should be a valid int")
+        return value
+    return value
 
 
 class _HookMode(str, enum.Enum):

@@ -1,188 +1,178 @@
 # AGENTS.md
 
-麦麦搬运喵（`maimai-courier-plugin`）：麦麦在群聊间分享消息的**独立** MaiBot 插件。
-源群出现**合并转发**后由源群 Maisaka 自主决定是否分享，并可通过 `forward_message`
-工具把本群指定**源消息**转发到白名单**目标群**，可选附带一条延迟 0.5 秒的评论。
+麦麦搬运喵（`maimai-courier-plugin`）是麦麦跨群分享消息的**独立** MaiBot 插件。
+源群 Maisaka 可对已选类型（默认仅合并转发）按可编辑标准自主判断，也可响应群友明确
+请求，以三参数 `forward_message` 转发本群源消息到一个白名单目标，另附可选评论。
+当前发送路径为**插件内客户端 → 已有 SnowLuma 正向 WebSocket 服务端**，不新增服务进程。
+本插件自己的持久账本是唯一投递权威；旧独立服务及客户端已隔离，不是备用通道。
 
-术语见 CONTEXT.md，行为契约见主规格 `openspec/specs/cross-group-forward/spec.md`，
-设计取舍见 `openspec/changes/archive/2026-09-29-introduce-maimai-courier/`。
+## 阅读入口与当前边界
 
-## 独立性
+- 修改行为前读主规格 `openspec/specs/cross-group-forward/spec.md` 与
+  `openspec/specs/snowluma-direct-client/spec.md`（直连变更已归档并同步，旧服务能力已退休）；
+  设计取舍见归档 `openspec/changes/archive/2026-10-04-direct-snowluma-websocket-forwarding/design.md`
+  D1–D11，当前架构决定见 `docs/adr/0007-direct-snowluma-websocket-client.md`；原卡片边界见 ADR 0004。
+- 核对外部契约时读归档 `verification/01`–`07` 与 `unverified-server-contracts.md`
+  （位于 `openspec/changes/archive/2026-10-04-direct-snowluma-websocket-forwarding/`）。
+  U1–U8 均未确认，网关服务端字段为显式假设；离线通过不代表线上已支持。
+  SDK 2.8.0 的公开接口已核对，但实际加载版本未确认；宿主锁文件 2.5.2 不证明运行版本，
+  若实际为 2.5.2 则低于插件下限，不放行。
+- 术语以 `CONTEXT.md` 为准，只收领域词汇、不塞实现细节；旧 ADR/归档保留历史事实。
+  操作见 `docs/direct-snowluma-operations.md`，真实 QQ 检查见 `docs/real-qq-validation.md`。
+  第8组离线映射与第9组实机返修见归档 `verification/08-offline-acceptance.md` 与
+  `verification/09-deployment-revision.md`；不把实现者自测说成独立验收。
+- `CLAUDE.md` 必须是 `AGENTS.md` 的相对软链接，不另建规则副本。代码、注释、文档均中文。
 
-- 本插件不 import、不复制、不依赖同级**复读插件** `repeat-plugin`：没有旧项目的
-  import、配置或任务集合依赖（由 `tests/test_plugin.py::test_生产代码不依赖复读插件`
-  守住）。
-- 不读旧插件的运行配置、凭证或投递记录；本插件状态只落在宿主授予的
-  `ctx.paths.data_dir`，不与任何其他插件共享。
-- `_manifest.json` 的 capabilities 随插件整体声明、由第 3–7 组逐步消费；每一项都
-  已在 Host `src/plugin_runtime/capabilities/registry.py` 核实。Hook 名称不是能力，
-  不进该列表。
+## 独立性与安全
 
-## 结构
+- 不 import、不复制、不依赖复读插件 `repeat-plugin`，不读取其他插件配置、凭证、状态或
+  账本。本插件状态只在宿主授予的 `ctx.paths.data_dir`，不访问真实服务数据库。
+- `_manifest.json` 是插件专属依赖唯一入口，结构 `{type: "python_package", name, version_spec}`，
+  当前 `aiohttp>=3.14.3`；不把历史服务项目环境复活为插件安装依赖，不全局安装依赖。
+- 能力仅 `message.get_by_id`、`chat.get_all_streams`、`maisaka.proactive.trigger`，已核实；
+  `send.*`、`chat.open_session`、`api.call` 及反向监听均不声明。Hook 名称不是能力。
+- 真实发送仅经 `snowluma_client.py` / `snowluma_transport.py` 的固定 `send_msg` 群分支，
+  源和评论各最多一次。禁止 `ctx.send.*`、适配器 API、旧 HTTP、历史服务或更换动作 fallback。
+  不注册同路由第二发送网关、不自动重试、不用发送探测结果。
+- 凭证可由操作者直接写入插件配置 `snowluma.token`；非空优先使用，空白则建连时读取
+  `token_env_var` 指定的环境变量。真实令牌只允许存于受控插件配置，不进仓库、账本、
+  URL、日志或结果，不从模型参数或其他插件文件补齐。地址固定，明文 `ws` 只允许回环、私有或链路本地目标（主机名
+  在建连前解析确认，解析出公网或失败即拒绝），公网必须 `wss` 校验证书，拒绝用户信息、
+  查询串、片段、未指定监听地址与握手重定向；容器 localhost 不是宿主机。
+- 源正文、评论、群名、提及名及协议样式文本仅作数据，不能执行命令、改变权限或路由；
+  媒体只来自可信源，拒绝本机路径、非法/私有地址，不下载调用者任意资源。真实图片
+  流量前必须确认 U5 的 DNS/重定向安全前提，unknown 不能补救资源越界访问。
+- 引用宿主源码前先在获准范围只读核实。原参考 `arcwsl:~/github/REFERENCE/` 不可达时，
+  本变更第1组曾获准读取 `arclinux` 的特定宿主/适配器源码；此历史授权不是新的远端操作
+  授权。禁止自行部署、发群、修改远端、读取凭证/运行配置/真实数据、迁移账本或 Git 写操作。
 
-- `plugin.py` — 插件主类：三生命周期（`on_load` / `on_unload` /
-  `on_config_update(scope, config_data, version)`）、一个群聊 Tool
-  `forward_message`、两个 Hook：`maisaka.planner.after_response`（blocking，
-  在模型输出工具调用后签发一次性来源凭据）与 `chat.receive.after_process`
-  （observe，观察已处理入站消息：筛选自动入口候选并把等待/唤起登记为本插件自己的
-  后台任务）；`get_components()` 覆写把 Tool 的 `chat_scope` 提到组件声明**顶层**
-  （承载性修正，见下）。它同时是组合根：在 `data_dir` 下打开账本（加载时一次检查、
-  损坏即关闭发送）、把预检结果交给投递编排，并持有可注入的时钟、发送接缝与账本
-  打开方式。生命周期语义：`_tasks` 只装本插件创建的后台任务（自动等待 `_auto_tasks`
-  与在途投递），每项附带可定位描述（源消息／目标群／阶段）供超时告警逐条列出；
-  `on_unload` 取消并**有界等待**它们退出（`TASK_EXIT_WAIT_SECONDS`
-  = 5 秒，超出即按任务描述告警，不静默；宿主 Runner 的单次能力 RPC 自带 30 秒默认
-  超时，取消在最近的 await 点生效）后释放账本；`forward_message` 在预检返回后、
-  创建发送任务前复检卸载标记（预检期间卸载时直接按 `rejected` 返回，不打开账本、
-  不发送）；`on_config_update` 立即取消已失效的待执行自动判断；
-  投递在**源发送前与评论发送前**共用 `_send_allowed` 复验（卸载标记 + 总开关 +
-  来源群/目标群白名单，读发送时最新配置）——复验失败时不发送、把占位按「明确未
-  发送」释放并对外按 `rejected` 报告。
-- `source_binding.py` — 工具参数面（公开参数声明、校验与统一拒绝措辞）与一次性
-  来源凭据表：授权只由宿主 Hook 载荷签发、首次消费即作废；清洗与签发只作用于
-  指向本插件 `forward_message` 的调用（同批其它工具调用原样保留，也不得获得
-  凭据），工具调用里的会话/授权字段一概不读。
-- `send_material.py` — 内容完整性预检与发送材料构建：图片必须带可恢复二进制、
-  合并转发逐节点递归校验（含宿主空节点占位文本），任一缺失即整条拒绝；导出
-  `is_forward_card` 作为**唯一**的「是否合并转发卡片」形状判据（含宿主未展开的
-  `dict` 包装形态），自动入口与预检共用，避免序列化形态变化时一处放行一处拒绝。
-- `forward_precheck.py` — 工具入口的权限与内容预检编排：凭据换可信会话、
-  来源/目标白名单与目标路由核对，全部通过才产出 `PreparedForward`（不发送）；
-  导出 `whitelist_entries` / `source_group_is_allowed` / `target_is_allowed`，让
-  预检、发送前复验与自动入口共用同一份白名单口径。
-- `delivery_ledger.py` — `ctx.paths.data_dir` 内的 SQLite 投递账本：唯一键为
-  账号 + 源群 + 源消息 ID + 目标群（评论不参与键），状态由单一 `LedgerStatus`
-  （`sending` / `sent` / `failed` / `unknown`）表达并附带评论结果；SQL 全参数绑定、
-  每次操作独立短事务（BEGIN／事务体／COMMIT 失败都显式回滚，网络等待期间不持有
-  事务）；插件打开账本后调用一次 `recover_interrupted()` 把上一次进程中断遗留的
-  `sending` 归并为待核实，恢复失败至少告警一次（遗留记录继续阻止重发）；读、写与
-  恢复失败一律抛 `LedgerUnavailableError`，`None` 只表示记录不存在、`False` 只表示
-  没有可更新的在途占位；库损坏或不可读时返回 `LedgerUnavailable` 供调用方关闭发送，
-  不覆盖也不删除既有状态数据。**单实例假设**：启动恢复不区分占位归属的进程，多进程
-  共享同一 `data_dir` 时会把活进程的 `sending` 一并归并为 `unknown`（只影响可用性，
-  不破坏防重安全），因此插件按单实例（单进程）运行。
-- `forward_delivery.py` — 投递编排：预检通过 → 账本占位（`sending`）→ **源发送前
-  权限复验**（`SendPermission`，失败即按「明确未发送」释放占位并返回 `rejected`）→
-  源发送步骤 → 回执落账（`sent` / `failed` / `unknown`）→ 非空评论固定等待 0.5 秒 →
-  重验总开关与目标权限 → 发送评论 → 保存评论结果。`SourceSendStep` 与
-  `CommentSendStep` 是插件仅有的两个发送接缝（`SourceSendResult` 带状态、真实目标
-  消息 ID 与原因），编排自身不调用任何宿主发送能力；发送步骤返回契约外状态字面量
-  （空串、大小写不符、超时/取消等）一律按 `unknown` 兜底，不得降级为可重试失败；
-  源发送明确失败但终态登记失败时对外同样按待核实报告。统一结果面由
-  `render_forward_result` 产出：`status` 七态（`sent` / `partial` /
-  `already_forwarded` / `sending` / `rejected` / `failed` / `unknown`，另有
-  `ledger_unavailable`），`success` 只表示完整成功（`sent` / `already_forwarded`），
-  `sent`/`delivered` 表示源消息已确认投递（含「已发送但状态未落盘」），评论另由
-  `comment_status` 表达，错误阶段由 `stage` 表达。
-- `host_send.py` — 两个发送接缝的真实实现：纯文字 `send.text`、单张图片
-  `send.image`、多图或图文混排 `send.hybrid`、合并转发卡片 `send.forward`、评论
-  `send.text`（普通文本，不解析成命令或消息段）；一律显式开启 `storage_message` 与
-  `sync_to_maisaka_history` 并请求详细回执。成功证据只能是非空真实目标消息 ID
-  （`sent=True` 但无回执 ID 按待核实）；宿主把平台失败与发送后的异常都归为未成功
-  回执，因此「未成功回执」按待核实保守登记，绝不换通路重发；只有调用宿主前就能
-  确定「没有发出任何消息」（如空文本材料）才返回 `failed`。
-- `config.py` / `config.toml` — 最小配置：总开关、自动入口开关、源／目标白名单，
-  外加宿主强制的 `plugin.config_version`（SDK `extract_plugin_config_version`
-  缺它即抛 `PluginConfigVersionError`）；两处默认值必须逐项一致。
-- `auto_entry.py` — 源群自动判断入口（只唤起判断，不发送消息）：按宿主
-  `chat.receive.after_process` 载荷筛选候选（白名单源群、非机器人自身、非通知的
-  QQ 合并转发，含未展开卡片；无法确认机器人账号或发送者时放弃候选），用源消息 ID
-  经注入时钟**有限**确认消息可读取（`AUTO_READINESS_TIMEOUT_SECONDS` = 10 秒、
-  轮询 `AUTO_READINESS_POLL_INTERVAL_SECONDS` = 0.5 秒，皆是代码常量），再对源群
-  调用一次 `maisaka.proactive.trigger`。候选的会话 ID 与源消息 ID 先过
-  `safe_identifier`（限长 128、无空白/控制字符/尖括号引号反引号）才允许进入意图与
-  metadata：形态异常直接放弃候选，绝不净化成对不上真实消息的另一个字符串。意图只含
-  源消息 ID、合法目标群号与可用名称、以及「自行判断、可以沉默」的说明；群名按不可信
-  显示文本处理（尖括号转全角、压平空白、限长），永不作为路由依据。等待结束后按**最新**
-  配置重验总开关/自动入口与来源群、目标白名单；去重是内存有界状态
-  （`AUTO_DEDUP_WINDOW_SECONDS` = 10 分钟、`AUTO_DEDUP_MAX_ENTRIES` = 4096，逐出
-  最早登记项），与持久投递账本完全分离，不掷骰、不签目标群决策票、不唤起目标群、
-  不追加上下文。
-- `clock.py` — 时钟边界（`Clock` 协议 + `SystemClock`）：评论延迟与有界等待一律走
-  注入时钟，测试注入可控替身即可确定性推进超时。
-- `README.md` / `docs/` — 公开文档：README 面向插件使用者（独立安装、默认关闭、
-  白名单、三参数用法、支持与拒绝类型、结果状态与人工核对、账本备份、版本与能力
-  声明），`docs/handover-cross-group-forward-switch.md` 是部署切换与回滚清单
-  （对照旧项目 `remove-cross-group-forward`），`docs/adr/` 记录设计取舍；
-  私有操作手册在 `.local/runbooks/`（`.gitignore` 已排除，不入库）。
-- `tests/` — pytest 与 `tests/fake_maibot_sdk.py` 替身（本机不安装真实 SDK）；
-  组件声明经插件公共入口 `get_components()` 断言；组 4 起另有 `tests/support.py`
-  的替身发送步骤（经替身 `ctx.send` 记录「进入源发送」）与账本替身（按方法注入
-  落盘失败）；组 5 起 `tests/fake_maibot_sdk.py` 的 `ctx.send` 覆盖
-  `text`/`image`/`hybrid`/`forward` 四通路与按调用顺序注入的回执队列，并可让单次
-  发送悬停在途，`tests/test_forward_send.py` 以真实发送链驱动 5.1–5.6 的验收；
-  组 6 起替身 `ctx.maisaka.proactive` 覆盖主动唤起（回执队列与异常注入），
-  `tests/support.py` 的 `received_message()` 按宿主真实载荷形状构造入站消息
-  （`merged_forward_message()` 复用同一构造点）、`drive_observe_hook()` 以后台任务
-  方式分发观察 Hook 并推进注入时钟、`apply_config_update()` 按宿主顺序驱动配置
-  热更新（先 `set_plugin_config` 再 `on_config_update`），
-  `tests/test_auto_entry.py` 驱动 6.1–6.5、`tests/test_lifecycle.py` 驱动 7.1–7.4
-  的验收。
+## 模块职责
 
-## 关键规则
+- `plugin.py`：组合根持有时钟、独占账本、自己的客户端和可定位任务表。公共工厂
+  `create_plugin` 可无参创建，支持测试注入；`on_load` 仅本地检查、不联网。三生命周期
+  为 `on_load/on_unload/on_config_update(scope, config_data, version)`，不改成猜测名称。
+  一个群聊工具、两个 Hook（`maisaka.planner.after_response` blocking 来源签发；
+  `chat.receive.after_process` observe 自动候选）。最多8个在途工具请求（含预检和等待）。
+- `source_binding.py`：三参数声明与校验、统一拒绝、一次性来源凭据。凭据只由宿主 Hook
+  载荷签发，首次消费作废；仅清洗本插件 `forward_message`，同批其他工具原样保留且
+  不获凭据。模型会话/平台/账号/授权字段不能替代宿主来源。
+- `forward_precheck.py`：可信会话、源/目标白名单、异群、宿主源归属及标识保留链；本地
+  预检不访问 SnowLuma、不发送。`PreparedForward.onebot_message_id` 只来自可信映射，
+  不因字符串可解析就认定对应，不重写四字段账本键。目标可用性由直连查询、不依赖宿主
+  目标发送会话。共用 `whitelist_entries/source_group_is_allowed/target_is_allowed`。
+- `send_material.py`：宿主 `build_send_material/is_forward_card` 与 OneBot
+  `build_source_material/source_outbound_segments` 的单一材料责任；两种输入分别映射，
+  共用提及呈现。`is_forward_card` 为宿主卡片唯一形状判据（含未展开 dict 包装）。
+  宿主图片须有可恢复二进制，不能替代 OneBot 安全重放核验；卡片仅判唯一顶层形状，
+  不本地递归拒绝节点，原资源仅从可信 OneBot 源取得。
+- `snowluma_client.py`：小接口 `prepare_source/send_source/send_comment/close`。
+  准备按账号→目标名册→同账号源查询→ID/群归属→材料，不发送；源/评论在取得执行机会
+  后再次查账号，固定连接代次，实际写入前同步许可。统一四项回执核验与未知分类。
+- `snowluma_transport.py`：`OneBotConnection` 持有地址、环境变量名和可选配置令牌（repr 隐藏），固定四动作
+  `get_login_info/get_group_list/get_msg/send_msg` 与关闭，没有任意动作代理。每实例一连接、
+  一接收任务、一个待决槽，动作串行；echo 区分运行实例/连接/动作。平台事件、其他客户端、
+  迟到/旧连接响应、带匹配 echo 的伪装事件不完成动作；空闲持续消费丢弃，不存聊天缓存。
+  后续独立只读操作可重建连接，旧阶段不能跨代次自动续发。
+- `delivery_ledger.py`：唯一活跃账本 `delivery_ledger.sqlite3`，先独占、查历史、验证库，
+  再兼容扩展与恢复；短事务不持有网络等待。保留原 `open_ledger/reserve/get/mark_*`，
+  `reserve_comment` 在评论发送前原子占位，`record_comment` 保存终态，关闭释放独占。
+- `forward_delivery.py`：账本先查→只读准备→复验/源占位→最终复验/源发送→落账→非空评论
+  等待0.5秒→复验/评论占位→最终复验/评论发送→落账；结果统一由 `shared/result.py`
+  的 `render_forward_result` 渲染，不分散状态机，不调用旧通道。
+- `shared/`：保留活跃纯类型、四字段键与状态、准备/发送请求、结果、提及、标识符、配置
+  规则、时钟单点定义；根 `clock.py` 重导出 `shared.clock`。生产用相对导入，禁止复制
+  第二套类型/状态机，或用 conftest 别名掩盖历史依赖。
+- `config.py/config.toml`：业务三节加 `[snowluma]`；该节仅 `websocket_url/token/token_env_var`，
+  默认空。`plugin.config_version="1.4.0"` 是宿主强制项；模型/样例默认逐项一致。
+  `MessageType` 是候选配置与分类的唯一词汇，旧 `[service]` 不转换为可发送配置。
+- `auto_entry.py`：只从宿主已处理入站筛选候选、有限等可读、唤起源群一次；不调用直连
+  执行、不选目标、不复制聊天链。规则见下节。
+- `host_send.py`、`remote_client.py`、`service/__init__.py`：无发送、无旧导入的退役墓碑。
+  旧服务/专属测试/环境完整留在 `history/snowluma-forward-service/`，MANIFEST 的109项
+  1,633,141字节不得覆盖；65项退出原路径的证据见 ISOLATION。历史不导入、不收集，
+  不是第二套产品。旧服务手册与 adapter API 方向报告已加历史抬头，不抹除原记录。
+- `tests/`：仅活跃用例，SDK 替身不安装真 SDK。`direct_support` 是内存平台装配，
+  `test_direct_acceptance` 经真实 aiohttp 回环端点测公共 Hook/Tool、账本和线路互证；
+  二者不能互相冒充。参数与期待独立，测试公共接口，不通过私有实现函数证明行为。
 
-- **默认安全**：默认总开关关闭、自动入口开启、白名单为空；总开关关闭时工具与观察
-  Hook 都不得产生任何发送。
-- **不把延迟与概率做成配置**：0.5 秒评论延迟、自动去重与等待上限是代码常量
-  （change design D1），不要改造成配置项或随机时长。
-- **投递状态只落在账本**：发送前先持久登记 `sending`，成功回执后立即登记 `sent`
-  并保存真实目标消息 ID；只有「明确未发送」的失败可登记 `failed` 并允许后续显式
-  重试；超时、取消、回执丢失与重启遗留的 `sending` 一律待核实（`unknown`），禁止
-  自动重试或盲目重发。发送前落盘失败不发送；发送后落盘失败停止后续评论、保留已知
-  回执用于报告。评论结果附属于源发送记录（`record_comment`，含评论消息 ID），评论
-  结果未能落盘时不得声称评论结果已知。成功记录不按 TTL 或容量静默清除，账本不提供
-  删除接口；发送步骤返回契约外状态字面量时一律按待核实兜底，不得当作可重试的
-  `failed`。
-- **发送只能走两个发送接缝**：编排代码不得直接调用宿主发送能力，源消息走
-  `SourceSendStep`、评论走 `CommentSendStep`，真实 `send.*` 只出现在
-  `host_send.py`（`send.text` / `send.image` / `send.hybrid` / `send.forward`，
-  全部显式开启 `storage_message` 与 `sync_to_maisaka_history` 并请求详细回执）。
-  成功证据只能是非空真实目标消息 ID：`sent=True` 而无回执 ID、或宿主只给出未成功
-  回执（无法区分「明确未发送」与「可能已发出但回执丢失」）时，一律按待核实保守
-  登记，禁止改走另一通路重发。
-- **评论段固定顺序**：源发送成功回执 → 立即落账 → 等待代码常量 0.5 秒 → 重验总开关
-  与两级白名单（与源发送前共用 `_send_allowed`）→ 按普通文本发送本次评论 → 保存
-  评论结果。评论缺省/空/全空白不等待也
-  不发送；源发送明确失败或结果未知都不进入评论段；评论未完成返回部分成功并保留源
-  消息已投递的事实，重复调用不重发源消息、也不自动补发评论；评论内容只来自本次
-  参数，不再次调用目标群麦麦生成。
-- **自动入口只唤起、不发送**：唯一可信来源是宿主 `chat.receive.after_process` 载荷
-  （不经模型）；只对白名单源群里非机器人自身、非通知的 QQ 合并转发给源群**一次**
-  `maisaka.proactive.trigger` 机会，意图不得伪造或摘抄聊天内容，群名只作不可信显示
-  文本（不得成为路由依据，尖括号转全角），不掷骰、不签目标群决策票、不追加上下文、
-  不对目标群唤起。消息可读取性用源消息 ID **有限**确认（10 秒上限），确认不了就放弃
-  并记录可定位原因；同一候选的去重是有界内存状态（10 分钟／4096 项），与持久投递
-  账本无关，普通文字与图片不触发自动入口。
-- **生命周期与 Hook 名称以核实契约为准**（Host `a995cc4` / SDK `4d8e577`）：
-  `on_load` / `on_unload` / `on_config_update`，观察 Hook 为
-  `chat.receive.after_process`。不要凭记忆改写成 `on_start` 之类的名字。
-- **卸载与热更新只取消自己的工作**：插件持有并等待**本插件创建的**后台任务
-  （自动等待 + 在途投递，登记在 `_tasks`），`on_unload` 取消后**有界等待**退出
-  （上限 `TASK_EXIT_WAIT_SECONDS`，超出告警而非静默），不触碰其他插件的任务；
-  `on_config_update` 只取消失效的待执行自动判断，投递不整体取消——在途发送可能已
-  产生副作用，正确做法是**源发送前与评论发送前**按最新配置复验（`_send_allowed`），
-  未发送的一律不发送、已成功的不回滚。热更新入口按宿主顺序（先注入配置再调用）读
-  `self.config`，不得缓存旧快照；复验失败的占位按「明确未发送」释放（可显式重试），
-  绝不降级为待核实，也不得跳过复验直接发送。
-- **只导入 SDK 根 `__all__` 内的名字**：`HookMode` / `HookOrder` / `ErrorPolicy`
-  只存在于 `maibot_sdk.types`，不在根导出面，hook 模式用字符串字面量
-  `"observe"` / `"blocking"`（由 `tests/fake_maibot_sdk.py` 的
-  `SDK_ROOT_EXPORTS` 与 `test_生产代码只导入SDK顶层导出的名字` 守住）。
-- **`get_components()` 顶层 `chat_scope` 修正不得删除**：Runner 只读组件声明顶层，
-  `@Tool(chat_scope=…)` 经 SDK 只落进 metadata，删掉会让群聊专用工具在私聊可见。
-- 引用宿主源码前先在 `arcwsl:~/github/REFERENCE/` 只读核实；禁止部署、发群消息、
-  修改远端仓库、读取凭证与运行配置。
-- 代码、注释与文档一律中文；不使用全局依赖。
+## 来源、材料与自动判断规则
+
+- 公开工具只有必填字符串 `message_id/target_group_id` 和可选 `comment`（默认空）。
+  源群、源消息、可信账号必须对应；目标在白名单且不同源群，还须同账号群名册确认。
+  缺失/非法/私聊/越权/源不可定位在发送前拒绝，不泄露越权正文。
+- 只导入 SDK 根 `__all__` 名字：`HookMode/HookOrder/ErrorPolicy` 不在根导出，模式用
+  `"observe"/"blocking"`。保留 `get_components()` 的顶层 `chat_scope="group"` 修正，
+  SDK 装饰器只落 metadata、Runner 读顶层，删除会使私聊可见。
+- 默认关闭、空白名单；直连缺配置/认证失败/账号不符/账本不可用一律不发送。
+- 普通消息不支持段、缺媒体、未知提及对象整条拒绝；文字/图片顺序保留。提及转换为
+  `［提及：显示名称（对象标识）］` / `［提及：对象标识］` / `［提及：全体成员］`，
+  名称和标识仅来自源、压平控制字符、不截断、不猜造、不查目标成员。相邻文本按原
+  换行归并，转换不新增换行、输入不原地修改，不生成顶层 `at` 提醒。引用（reply）
+  段只作消息装饰，随消息整条拒绝并指引改用被引用卡片自身的消息 ID，不读被引用内容。
+- 原卡片是例外：整张原资源保留内部回复、提及、媒体与未知段，不逐节点清洗/提及文本化，
+  不因内部段不支持而拒绝；顶层多卡片/混排、资源或缓存缺失仍整条拒绝，不摘要/拆段/
+  重建/以源ID猜资源。外层预览、跨群展开和内部提醒不作未经真实验证的保证。
+- 自动入口仅白名单源群、非机器人自身、非通知的 QQ 消息；身份/发送者不明就放弃。
+  卡片优先 `forward`（含未展开），无卡片时图文为 `image`、非空文字为 `text`，提及只
+  附属；非法结构/不支持段放弃。分类成功不承诺可发送，未选类型不触发。
+- 会话ID和源ID先过 `safe_identifier`（限128、无空白/控制字符/尖括号引号反引号），
+  异常直接放弃、不净化成另一ID。意图含真实源ID、实际候选类型、合法目标与可用名称、
+  标准原文和“自行判断、可以沉默”边界；不摘抄/伪造正文，不掷骰、不签目标决策票。
+- 群名仅显示：压平空白、尖括号全角、限长，不作路由。标准最多4000字符，空白回退
+  设计默认，只作文字、不模板展开或执行；模型不保证遵循，显式工具不受自动偏好门禁。
+  候选默认 `["forward"]`，空列表不自动判断、未知枚举拒绝，普通类型须显式选中。
+- 可读等待最多10秒、每0.5秒轮询；失败记定位原因后放弃。去重为内存10分钟/4096项，
+  逐出最早登记，与持久账本分离。等待后和目标名称查询后用最新开关/白名单/候选/标准；
+  只改标准不取消合法候选，移除类型等只取消失效等待。已提交判断不追溯、不重复唤起。
+- 直连事件不进入自动候选、不伪造宿主入站；只唤起源群，不向目标追加上下文、不强制
+  评论。Planner 沉默零发送，关闭自动入口不阻止合法显式工具。
+
+## 持久事实、提交与生命周期
+
+- 四字段键固定为账号/源群/源消息ID/目标群；评论、请求、连接或进程变化不改键。
+  源/评论发送前各持久占位，同键并发只一次。`sent/sending/unknown` 阻断重发和补评论，
+  只有明确未提交 `failed` 允许后续显式新尝试。成功/未知无 TTL/容量清理、无删除接口。
+- 完整原库保留，确认新装才建库；有服务收据（含临时文件）、主库以外的数据库/归档
+  副本、主库缺失伴随文件、链接文件、损坏/不兼容库，或命中状态类证据名字规则（导出
+  临时名、归档扩展名、中文「快照/归档/备份」标记等）的条目即 `ledger_unavailable`；
+  插件自身源码、文档、配置与缓存不构成证据。不自动回迁、不删证据/新建空历史。
+  独占失败不恢复另一实例，源sending重启归unknown、评论sending只恢复评论unknown。
+- 可靠成功要求合法匹配响应及同ID记录、目标群、账号、正整数平台群序列；非空ID、
+  写帧成功、受理、自发事件不够。回执只查该候选ID，最多8次/总3秒/间隔0.5秒受剩余预算
+  约束，不模糊搜索或重发探测。契约外状态、提交后断线/取消/模糊失败一律保守unknown。
+- 源确认但终态未落盘：保留已知真实ID，整体unknown/source_persist，不评论、不称完整成功。
+  评论结果未落盘：partial/unknown/comment_persist，可保留真实评论ID，不称可靠保存。
+  评论等待中撤权/取消：本次partial/comment_status=failed，账本评论字段仍空；后续
+  already_forwarded不补评论，不声称所有未提交评论结果均已持久化。
+- 评论仅本次参数、普通文本单独发；源成功落账后固定至少0.5秒，再复验、占位、提交。
+  缺省/空/全空白不等待、不占位；源失败/未知不进入评论，不再次调用目标模型生成。
+- 在所有异步准备、排队、账号查询之后、实际写入之前同步 `_send_allowed` 检查最新
+  卸载/总开关/两级白名单，加连接/配置代次及账号条件；检查与开始提交间无异步等待。
+  固定连接断开不跨新连接续发旧阶段；地址/凭证引用更新使旧未提交阶段失效。
+  尚未提交源的权限拒绝为rejected、评论为partial；已提交按可靠结果或unknown，不假装撤回。
+- `on_config_update` 遵守宿主先注入配置再回调，只取消失效自动任务、不整体取消投递。
+  `forward_message` 预检后复查卸载、创建投递前复验；变更标准不充当发送许可变更。
+- `on_unload` 立即停止新提交，取消/等待自己的任务、停接收、关自己的连接和账本，
+  全部共享5秒总预算。任务表含源ID/目标/阶段，超时逐项告警，残留写入风险时保持账本
+  独占、不让新实例接管，不假称全部退出；不动别的插件/客户端、不注销QQ、不撤回消息。
+- 时钟统一注入：动作排队/握手/等待10秒，帧上限4MiB，最多8个在途工具，评论0.5秒，
+  回执3秒，卸载5秒；自动可读/去重上限同上。均代码常量，不改成随机、模型参数或配置。
+- 日志只保留安全定位，不记录凭证/原文/评论/资源/签名媒体地址；临时材料随有限工作结束
+  释放，账本只存必要投递事实，不保存发送队列。
+- 目标群宿主消息记录与 Maisaka 历史同步不保证；冷目标不创建/唤起 Planner，不写宿主
+  数据库、不伪造入站、不追加摘要或重发补齐。真实 QQ 可见性与展示另行联验。
 
 ## 验证
 
 ```bash
-uv run --no-project --with pytest pytest tests/ -q      # 全部通过
-uv run --no-project --with pyright pyright              # 生产代码零错误
+uv run --no-project --with pytest pytest tests/ -q
+uv run --no-project --with pytest --with aiohttp pytest tests/ -q
+uv run --no-project --with pyright pyright
 ```
 
-`pyrightconfig.json` 只检查生产代码（根目录生产模块 `config.py` / `plugin.py` /
-`clock.py` / `source_binding.py` / `send_material.py` / `forward_precheck.py` /
-`delivery_ledger.py` / `forward_delivery.py` / `host_send.py` / `auto_entry.py`，
-不含 `tests/`），并关掉 `reportMissingImports`：真实 `maibot_sdk` 只存在于
-MaiBot 容器内，本机永远解析不到。
+覆盖边界详见 [README 的离线开发验证](README.md#离线开发验证)。每次修改
+重跑实际结果，不沿用旧数字；测试仅使用临时合成数据与本地端点，不安装真实 SDK、
+SSH、读取真实状态、部署或发 QQ。根默认收集与 `tests/` 同范围，历史不收集。
+`pyrightconfig.json` 明确排除历史，目标 Python 3.11；真实 SDK 未安装，因此关闭
+`reportMissingImports`。实机返修证据见归档 `verification/09-deployment-revision.md`，
+离线通过不能代替实际加载版本确认、独立验收或真实 QQ 联验。

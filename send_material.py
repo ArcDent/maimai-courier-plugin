@@ -1,30 +1,120 @@
-"""转发内容完整性预检：只接受可完整恢复并原样发送的消息材料。
+"""宿主与 OneBot 源材料转换：共享提及呈现，只输出材料与结构指纹，不发送或落盘。
 
-预检的目标是「不丢段、不降级、不以描述冒充媒体」：普通消息逐段校验并保留宿主
-接收侧序列化形态；合并转发按节点递归校验，全部可恢复时才准备聊天记录卡片。
-任一段不可用时整条拒绝，绝不发送缺失媒体、也绝不只发送一部分。
+`build_send_material` 保留宿主材料的公开兼容接口，包括递归节点校验；普通图片须有
+`binary_data_base64`，错误定位到段或节点。实际工具预检先以 `is_forward_card` 识别
+唯一顶层卡片并绕过递归校验，卡片内部内容不因此被拒绝或改写。
 
-- 图片必须带 `binary_data_base64`：宿主序列化时只有内存二进制存在、或 hash 命中
-  图片库且文件存在才会给出该字段（`message_utils.py:168-198`），缺失时发送侧
-  `to_seg()` 会抛错，描述文本不能代替原图；
-- 未展开的合并转发会被宿主收成 `DictComponent`（`message_utils.py:327-328`）；
-  空内容节点会被宿主在解析期替换成占位文本 `[empty forward node]`
-  （`:312-317`，字面量在 `:317`），DB 回读也无法还原原文
-  （`message_component_data_model.py:359` 要求节点内容非空）：两者都是降级路径，
-  预检一经发现即整条拒绝（顶层消息里的同名字符串是真实正文，不算占位）；
-- 卡片层数上限对齐网关 `MAX_FORWARD_DEPTH`（SnowLuma
-  `packages/onebot/src/modules/message-actions.ts:1484,1570-1577`）。
+`build_source_material` / `source_outbound_segments` 只使用可信 OneBot 源材料：
+原卡片保留资源引用，普通消息校验图片引用并将提及文本化。相邻文本归并不跨越原有
+分段、不新增换行；对象不明或材料不可完整发送时整条拒绝。
 
-本模块只产出材料与结构指纹，不发送、不落盘；拒绝原因只描述内容本身，
 「本次未发送任何消息」定尾由工具入口的 `Rejected.not_sent` 统一补齐。
 """
 
 from __future__ import annotations
 
 import re
+import ipaddress
+import socket
+from urllib.parse import urlsplit
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from .shared.identifiers import verbatim_identifier
+from .shared.mentions import flatten_mention_text, mention_display_text
+from .shared.send_steps import PrepareRejected, PreparedSource, SourceMaterial
+
+
+def build_source_material(message: object) -> SourceMaterial | PrepareRejected:
+    """OneBot 源记录的纯转换入口，与宿主序列化形状分开处理。"""
+    if not isinstance(message, list) or not message:
+        return PrepareRejected("source_empty", "源消息没有可发送的内容段，发送前拒绝")
+    cards = [segment for segment in message if isinstance(segment, dict) and segment.get("type") == "forward"]
+    if cards:
+        if len(message) != 1:
+            return PrepareRejected("source_shape_unsupported", "顶层卡片与其它内容混排，整条拒绝")
+        data = cards[0].get("data")
+        raw_id = data.get("id") if isinstance(data, dict) else None
+        resource_id = verbatim_identifier(str(raw_id)) if isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool) else ""
+        if not resource_id:
+            return PrepareRejected("source_resource_missing", "原卡片资源缺失，不能以源消息 ID 代替，整条拒绝")
+        return SourceMaterial(kind="forward", forward_resource_id=resource_id)
+    pieces: list[_TextPiece | _SegmentPiece] = []
+    for segment in message:
+        if not isinstance(segment, dict):
+            return PrepareRejected("source_segment_unsupported", "普通源消息结构无效，整条拒绝")
+        kind, data = segment.get("type"), segment.get("data")
+        if kind == "text" and isinstance(data, dict) and isinstance(data.get("text"), str):
+            text = data["text"]
+        elif kind == "at" and isinstance(data, dict):
+            raw = data.get("qq")
+            identifier = flatten_mention_text(str(raw) if type(raw) is int else raw)
+            if (isinstance(raw, bool) or not identifier or
+                    (identifier != "all" and not (identifier.isascii() and identifier.isdigit() and any(c != "0" for c in identifier)))):
+                return PrepareRejected("source_mention_unconfirmed", "提及对象不可确认，整条拒绝")
+            name = next((value for field in ("card", "nickname", "name")
+                         if (value := flatten_mention_text(data.get(field)))), "")
+            text = mention_display_text(identifier, name)
+        elif kind == "image" and isinstance(data, dict):
+            url = _safe_media_url(data.get("url"))
+            if not url:
+                return PrepareRejected("source_media_unsafe", "图片没有可安全重放的 HTTPS 媒体引用，整条拒绝")
+            pieces.append(_SegmentPiece({"type": "image", "data": {"url": url}}, "image"))
+            continue
+        else:
+            return PrepareRejected("source_segment_unsupported", "普通源消息含不支持或不完整段，整条拒绝")
+        pieces.append(_TextPiece(text, kind == "at", {"type": "text", "data": text}))
+    built = _assemble_segments(pieces)
+    segments = tuple({"type": "text", "data": {"text": s["data"]}} if s["type"] == "text" else s for s in built.segments)
+    return SourceMaterial(kind=_segments_kind(segments), segments=segments)
+
+def _safe_media_url(raw: object) -> str:
+    """附件03的媒体字面量边界；DNS及重定向安全仍是上线门槛U5，不在本机下载。"""
+    if not isinstance(raw, str) or not raw or "\\" in raw or any(not 0x21 <= ord(c) <= 0x7e for c in raw):
+        return ""
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").rstrip(".").lower()
+        if (parts.scheme != "https" or parts.username is not None or parts.password is not None
+                or parts.fragment or not host or parts.port == 0):
+            return ""
+    except ValueError:
+        return ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # inet_aton 只解析数字字面量，不进行 DNS；传统混淆写法一律拒绝。
+        try:
+            socket.inet_aton(host)
+        except (OSError, ValueError):
+            pass
+        else:
+            return ""
+        if ("." not in host or host.endswith((".localhost", ".local", ".internal"))
+                or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in host.split("."))
+                or not any(c.isalpha() for c in host.rsplit(".", 1)[-1])):
+            return ""
+    else:
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if not address.is_global or address.is_multicast or address.is_reserved:
+            return ""
+    return raw
+
+
+def source_outbound_segments(material: SourceMaterial) -> tuple[dict[str, Any], ...] | PrepareRejected:
+    """只重建冻结的输出字段；卡片内部从不读取、不展开或上传。"""
+    if material.kind == "forward":
+        resource_id = verbatim_identifier(material.forward_resource_id)
+        if not resource_id:
+            return PrepareRejected("source_resource_missing", "卡片资源不可用，未进入平台调用")
+        return ({"type": "forward", "data": {"id": resource_id}},)
+    checked = build_source_material(list(material.segments))
+    if isinstance(checked, PrepareRejected):
+        return checked
+    return checked.segments
+
 
 MAX_FORWARD_DEPTH = 3
 """合并转发卡片最大层数：与网关递归深度上限一致，超出即整条拒绝。"""
@@ -40,6 +130,14 @@ EMPTY_FORWARD_NODE_PLACEHOLDER = "[empty forward node]"
 _SAFE_SEGMENT_LABEL = re.compile(r"[a-z0-9_]{1,16}\Z")
 """可安全回显的段类型词法：短小、纯 ASCII 小写；其余一律显示为「未知」。"""
 
+_AT_SEGMENT_TYPE = "at"
+"""宿主提及段的类型名（`message_utils.py:134-142` 的唯一序列化出口）。"""
+
+_REPLY_SEGMENT_TYPE = "reply"
+"""宿主引用（回复）段的类型名：只作消息装饰，不能随消息整体转发。"""
+
+# 提及格式与压平规则只定义在 shared/mentions.py；本模块分别映射宿主和 OneBot 字段。
+
 SendKind = Literal["text", "image", "mixed", "forward"]
 """发送材料种类：纯文本、纯图片、混合，或合并转发卡片。"""
 
@@ -53,12 +151,9 @@ class UnsupportedContent:
 
 @dataclass(frozen=True, slots=True)
 class SendMaterial:
-    """预检通过的发送材料。
+    """宿主材料的兼容结果：普通段 `segments`、卡片节点 `nodes` 与无正文的 `shape`。
 
-    - `segments`：普通消息的段序列（宿主接收侧序列化形态，可直接交给发送链）；
-    - `nodes`：合并转发的节点列表（同样可直接交给 `send.forward`）；
-    - `shape`：与材料同构的结构指纹（只有段类型与嵌套、不含正文），用于在不发送
-      的前提下验证材料完整性。
+    实际投递只发送可信 OneBot 源材料，不把此处节点交给宿主发送或重建原卡片。
     """
 
     kind: SendKind
@@ -76,11 +171,25 @@ class _BuiltSegments:
 
 
 @dataclass(frozen=True, slots=True)
-class _BuiltCard:
-    """已校验的合并转发段（重建后的段）与其节点内容指纹。"""
+class _TextPiece:
+    """待归并的文本片段：原文文本段或提及转换出的普通文本。
+
+    `mention` 标记该片段是否由提及转换而来（决定相邻文本片段是否归并）；
+    `segment` 是片段对应的独立文本段副本，归并时以其中「原文文本段」为基底，
+    保留宿主可能附带的其它字段。
+    """
+
+    text: str
+    mention: bool
+    segment: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _SegmentPiece:
+    """不参与文本归并的已校验段（图片或合并转发卡片）与其结构指纹。"""
 
     segment: dict[str, Any]
-    contents: tuple[Any, ...]
+    shape: Any
 
 
 def is_forward_card(segment: Any) -> bool:
@@ -89,8 +198,7 @@ def is_forward_card(segment: Any) -> bool:
     展开形态是 `{"type": "forward", "data": [节点…]}`；宿主无法恢复节点材料时会
     收成 `DictComponent`（`message_utils.py:327-338`），序列化后是
     `{"type": "dict", "data": {"type": "forward", …}}`。自动入口（只需消息 ID 就能
-    给判断机会）与内容预检（要求节点可完整恢复）共用本形状判据，避免宿主序列化
-    形态变化时一处放行、一处拒绝。
+    给判断机会）与工具预检共用本形状判据；实际卡片只检查顶层，不递归处理节点。
     """
 
     if not isinstance(segment, dict):
@@ -141,10 +249,13 @@ def _build_segments(
     `depth` 是当前段序列所在的卡片层数（顶层消息为 0）：节点内容里的转发段按
     层数继续递归，超过 `MAX_FORWARD_DEPTH` 即整条拒绝；`depth > 0` 同时表示
     「这段文本位于转发节点内」，宿主空节点占位文本只可能出现在这里。
+
+    逐段校验（含占位文本检查）全部在归并之前完成：先按原文逐段判定，再把含提及的
+    相邻文本片段归并成普通文本段（`_assemble_segments`），任何异常都不会因归并
+    被洗掉。
     """
 
-    segments: list[dict[str, Any]] = []
-    shapes: list[Any] = []
+    pieces: list[_TextPiece | _SegmentPiece] = []
     for index, item in enumerate(raw_segments, start=1):
         segment_location = f"{location}第 {index} 段"
         if not isinstance(item, dict):
@@ -152,23 +263,34 @@ def _build_segments(
 
         segment_type = str(item.get("type") or "").strip()
         if segment_type == "text":
-            if not isinstance(item.get("data"), str):
+            text = item.get("data")
+            if not isinstance(text, str):
                 return UnsupportedContent(f"{segment_location}文本内容无效，无法完整转发")
-            if depth > 0 and item["data"] == EMPTY_FORWARD_NODE_PLACEHOLDER:
+            if depth > 0 and text == EMPTY_FORWARD_NODE_PLACEHOLDER:
                 return UnsupportedContent(
                     f"{segment_location}是宿主对空节点的占位文本"
                     f"（{EMPTY_FORWARD_NODE_PLACEHOLDER}），原文无法恢复"
                 )
-            segments.append(deepcopy(item))
-            shapes.append("text")
+            pieces.append(_TextPiece(text=text, mention=False, segment=deepcopy(item)))
+            continue
+        if segment_type == _AT_SEGMENT_TYPE:
+            mention_text = _mention_display_text(item, segment_location)
+            if isinstance(mention_text, UnsupportedContent):
+                return mention_text
+            pieces.append(
+                _TextPiece(
+                    text=mention_text,
+                    mention=True,
+                    segment={"type": "text", "data": mention_text},
+                )
+            )
             continue
         if segment_type == "image":
             if not _has_image_material(item):
                 return UnsupportedContent(
                     f"{segment_location}图片缺少可恢复的媒体数据（描述文本不能代替原图）"
                 )
-            segments.append(deepcopy(item))
-            shapes.append("image")
+            pieces.append(_SegmentPiece(deepcopy(item), "image"))
             continue
         if segment_type == "forward":
             if depth + 1 > MAX_FORWARD_DEPTH:
@@ -178,17 +300,96 @@ def _build_segments(
             card = _build_card(item, location=segment_location, depth=depth + 1)
             if isinstance(card, UnsupportedContent):
                 return card
-            segments.append(card.segment)
-            shapes.append({"forward": list(card.contents)})
+            pieces.append(card)
             continue
         if _is_unexpanded_forward(item):
             return UnsupportedContent(f"{segment_location}是未展开的合并转发（宿主未能恢复节点）")
 
+        if segment_type == _REPLY_SEGMENT_TYPE:
+            # 引用段是消息装饰，不是可随消息整体转发的内容：群里「回复聊天记录卡片」
+            # 的那条消息在气泡里显示被引用卡片的预览，宿主侧却只有 reply 段。这里给出
+            # 可定位原因与下一步（改用被引用卡片自身的消息 ID），不读取或回显被引用内容。
+            return UnsupportedContent(
+                f"{segment_location}是引用（{_REPLY_SEGMENT_TYPE}）消息段，不支持随消息整体转发"
+                + ("；要转发被引用的合并转发卡片，请使用该卡片自身的消息 ID" if depth == 0 else "")
+                + "，无法完整转发"
+            )
+
         return UnsupportedContent(f"{segment_location}类型 {_segment_label(item)} 无法完整发送")
+    return _assemble_segments(pieces)
+
+
+def _assemble_segments(pieces: list[_TextPiece | _SegmentPiece]) -> _BuiltSegments:
+    """把已校验片段组装成材料段序列：含提及的相邻文本片段归并为一个文本段。
+
+    归并范围只覆盖「紧邻提及的文本」：提及左侧只并入紧邻的那一个原文文本段、右侧
+    只并入紧邻的那一个，两个原文文本段之间的既有分段（发送通路按换行拼接的排版）
+    不因转换被跨过，也不顺带改写其它消息的排版。归并直接拼接片段内容、不插入分隔
+    符，因此提及转换不会新增换行，原文里的换行原样保留；片段顺序不变，结构指纹
+    描述归并后的实际材料形态。
+    """
+
+    segments: list[dict[str, Any]] = []
+    shapes: list[Any] = []
+    index = 0
+    while index < len(pieces):
+        piece = pieces[index]
+        if isinstance(piece, _SegmentPiece):
+            segments.append(piece.segment)
+            shapes.append(piece.shape)
+            index += 1
+            continue
+
+        # 归并范围只延伸到紧邻提及的文本段：两个原文文本段相邻即是源消息本来的
+        # 分段边界，就此断开；边界另一侧的文本段保持独立分段。
+        run = [piece]
+        cursor = index + 1
+        while cursor < len(pieces):
+            following = pieces[cursor]
+            if not isinstance(following, _TextPiece):
+                break
+            if not following.mention and not run[-1].mention:
+                break
+            run.append(following)
+            cursor += 1
+        index = cursor
+
+        # run 长度 ≥2 时必然含提及（归并循环只在相邻片段之一为提及时才继续延伸）；
+        # 长度 1 时没有可归并的邻居，直接追加该片段即可。
+        if len(run) == 1:
+            segments.append(piece.segment)
+            shapes.append("text")
+            continue
+
+        # 以原文文本段为基底（保留宿主可能附带的其它字段），内容直接拼接。
+        base = next((item.segment for item in run if not item.mention), run[0].segment)
+        merged = dict(base)
+        merged["data"] = "".join(item.text for item in run)
+        segments.append(merged)
+        shapes.append("text")
     return _BuiltSegments(tuple(segments), tuple(shapes))
 
 
-def _build_card(forward_segment: dict[str, Any], *, location: str, depth: int) -> _BuiltCard | UnsupportedContent:
+def _mention_display_text(item: dict[str, Any], location: str) -> str | UnsupportedContent:
+    """映射宿主提及字段并复用共享呈现；对象缺失、类型错误或压平后为空即整条拒绝。
+
+    `all` 表示全体成员；个人名称取源群名片、其次昵称，不查询目标群补全。
+    名称和标识的控制字符压平、三种文本格式统一由 `shared/mentions.py` 定义。
+    """
+
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return UnsupportedContent(f"{location}的提及结构无效，无法确认提及对象")
+    identifier = flatten_mention_text(data.get("target_user_id"))
+    if not identifier:
+        return UnsupportedContent(f"{location}的提及缺少可确认的对象标识，无法完整转发")
+    name = flatten_mention_text(data.get("target_user_cardname")) or flatten_mention_text(
+        data.get("target_user_nickname")
+    )
+    return mention_display_text(identifier, name)
+
+
+def _build_card(forward_segment: dict[str, Any], *, location: str, depth: int) -> _SegmentPiece | UnsupportedContent:
     """递归校验合并转发的全部节点，重建完整聊天记录卡片段。"""
 
     raw_nodes = forward_segment.get("data")
@@ -218,7 +419,7 @@ def _build_card(forward_segment: dict[str, Any], *, location: str, depth: int) -
 
     rebuilt_segment = deepcopy(forward_segment)
     rebuilt_segment["data"] = nodes
-    return _BuiltCard(segment=rebuilt_segment, contents=tuple(contents))
+    return _SegmentPiece(segment=rebuilt_segment, shape={"forward": contents})
 
 
 def _is_unexpanded_forward(item: dict[str, Any]) -> bool:

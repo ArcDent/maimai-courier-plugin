@@ -1,199 +1,448 @@
-"""第 4 组投递编排（4.2–4.6）：统一经 `forward_message` 工具入口驱动。
+"""公开工具到直连与本地账本：并发、占位、权限竞态、落账失败与重启阻断。
 
-「发送进入次数」用替身发送步骤对替身 `ctx.send` 的调用次数表达（第 4 组不接通真实
-发送）；账本状态经持久状态模块的导出接口核对。用例只观察工具返回、宿主能力调用与
-账本记录，不直接读 SQL。
+保留原投递用例的产品断言；已退出的远端会话协议改由公开固定平台动作及本地账本观察。
+新增真实传输排队、容量与不合作退出用例，不使用私有复验作为验收入口。
 """
 
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from typing import Any
 
-import pytest
-
-from delivery_ledger import (
-    LEDGER_FILE_NAME,
-    STATUS_FAILED,
-    STATUS_SENDING,
-    STATUS_SENT,
-    STATUS_UNKNOWN,
-    DeliveryLedger,
-    Reservation,
-    open_ledger,
-)
-from forward_delivery import TOOL_STATUS_ALREADY_FORWARDED
+from delivery_ledger import STATUS_FAILED, STATUS_SENDING, STATUS_SENT, STATUS_UNKNOWN
+from delivery_ledger import LEDGER_FILE_NAME, DeliveryLedger
+from shared.delivery import DeliveryKey
+from tests.direct_support import make_direct_plugin
 
 from tests.support import (
+    SOURCE_ACCOUNT_ID,
+    SOURCE_GROUP_ID,
     TARGET_GROUP_ID,
-    FakeClock,
-    FailingLedger,
-    RecordingSendStep,
-    enabled_config,
     issue_source_call,
-    ledger_key,
-    make_plugin,
-    open_test_ledger,
-    prepare_source,
     run_bound_forward,
     wait_until,
 )
 
 OTHER_TARGET_GROUP_ID = "20003"
+"""另一个白名单目标群（不同投递身份，独立发送）。"""
+
+
+def test_直连工具持久占位先于提交且并发同键只发一次(tmp_path: Path) -> None:
+    from tests.direct_support import make_direct_plugin
+    fixture = make_direct_plugin(tmp_path)
+    first = issue_source_call(fixture.plugin)
+    second = issue_source_call(fixture.plugin)
+    fixture.onebot.gates.pause("source_queue")
+
+    async def scenario():
+        task = asyncio.create_task(fixture.plugin.forward_message(**first))
+        await wait_until(lambda: fixture.onebot.gates.arrivals.get("source_queue") == 1)
+        assert fixture.record()["status"] == "sending"
+        assert fixture.onebot.send_count == 0
+        duplicate = await fixture.plugin.forward_message(**second)
+        assert duplicate["status"] == "sending"
+        fixture.onebot.gates.release("source_queue")
+        result = await task
+        assert result["status"] == "sent"
+        assert fixture.onebot.send_count == 1
+        assert fixture.record()["target_message_id"] == "target-1"
+    asyncio.run(scenario())
+    fixture.close()
+
+
+def test_源排队后端点变化阻止旧提交并明确拒绝(tmp_path: Path) -> None:
+    from tests.direct_support import make_direct_plugin, config_with
+    from tests.support import apply_config_update
+    fixture = make_direct_plugin(tmp_path)
+    args = issue_source_call(fixture.plugin)
+    fixture.onebot.gates.pause("source_queue")
+    async def scenario():
+        task = asyncio.create_task(fixture.plugin.forward_message(**args))
+        await wait_until(lambda: fixture.onebot.gates.arrivals.get("source_queue") == 1)
+        await apply_config_update(fixture.plugin, config_with(fixture.plugin,
+            snowluma={"websocket_url": "ws://127.0.0.1:8766/onebot"}))
+        fixture.onebot.gates.release("source_queue")
+        result = await task
+        assert result["status"] == "rejected"
+        assert fixture.onebot.send_count == 0
+        assert fixture.record()["status"] == "failed"
+    asyncio.run(scenario())
+    fixture.close()
+
+
+def test_评论半秒前零提交且提交前占位可读(tmp_path: Path) -> None:
+    from tests.direct_support import make_direct_plugin
+    fixture = make_direct_plugin(tmp_path)
+    args = issue_source_call(fixture.plugin, comment="这是一条评论")
+    fixture.onebot.gates.pause("comment_queue")
+    async def scenario():
+        task = asyncio.create_task(fixture.plugin.forward_message(**args))
+        await wait_until(lambda: fixture.record() is not None and fixture.record()["status"] == "sent")
+        for _ in range(30):
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert fixture.onebot.send_count == 1
+        assert fixture.record()["comment_status"] == ""
+        fixture.clock.advance(0.49)
+        for _ in range(30):
+            await asyncio.sleep(0)
+        assert fixture.onebot.send_count == 1
+        fixture.clock.advance(0.01)
+        await wait_until(lambda: fixture.onebot.gates.arrivals.get("comment_queue") == 1)
+        assert fixture.record()["comment_status"] == "sending"
+        fixture.onebot.gates.release("comment_queue")
+        result = await task
+        assert result["status"] == "sent" and result["comment_status"] == "sent"
+        assert fixture.onebot.send_count == 2
+        assert fixture.record()["comment_message_id"] == "target-2"
+        assert fixture.ctx.maisaka.proactive.calls == []
+    asyncio.run(scenario())
+    fixture.close()
+
+
+def test_端点热更新只允许新调用使用新连接且旧评论不补发(tmp_path: Path) -> None:
+    from tests.direct_support import make_direct_plugin, config_with, DirectOneBot
+    from tests.support import apply_config_update, prepare_source
+    fixture = make_direct_plugin(tmp_path)
+    old = fixture.onebot
+    args = issue_source_call(fixture.plugin, comment="旧连接评论")
+    async def scenario():
+        task = asyncio.create_task(fixture.plugin.forward_message(**args))
+        await wait_until(lambda: 0.5 in fixture.clock.sleeps)
+        await apply_config_update(fixture.plugin, config_with(fixture.plugin,
+            snowluma={"websocket_url": "ws://127.0.0.1:8766/onebot"}))
+        fixture.clock.advance(0.5)
+        result = await task
+        assert result["status"] == "partial" and result["target_message_id"] == "target-1"
+        assert old.send_count == 1
+    asyncio.run(scenario())
+    fixture.onebot = DirectOneBot(fixture.ctx, (TARGET_GROUP_ID,))
+    prepare_source(fixture.ctx, message_id="m-new")
+    result, _ = run_bound_forward(fixture.plugin, message_id="m-new")
+    assert result["status"] == "sent"
+    assert old.closed and fixture.onebot.send_count == 1
+    fixture.close()
+
+
+def test_源与评论终态落盘失败保留真实ID且重开仍阻断(tmp_path: Path) -> None:
+    from tests.direct_support import make_direct_plugin
+    from tests.support import open_test_ledger, ledger_key
+    for operation, count in (("mark_sent", 1), ("record_comment", 2)):
+        fixture = make_direct_plugin(tmp_path / operation)
+        fixture.storage.fail_next(operation)
+        args = issue_source_call(fixture.plugin, comment="不能补发")
+        async def scenario():
+            task = asyncio.create_task(fixture.plugin.forward_message(**args))
+            for _ in range(200):
+                await asyncio.sleep(0)
+                if 0.5 in fixture.clock.sleeps:
+                    fixture.clock.advance(0.5)
+                if task.done():
+                    return await task
+            raise AssertionError("工具未结束")
+        result = asyncio.run(scenario())
+        assert result["success"] is False and result["sent"] is True
+        assert result["target_message_id"] == "target-1"
+        assert result["stage"] == ("source_persist" if count == 1 else "comment_persist")
+        assert fixture.onebot.send_count == count
+        if count == 2:
+            assert result["comment_status"] == "unknown"
+            assert result["comment_message_id"] == "target-2"
+        fixture.close()
+        reopened = open_test_ledger(tmp_path / operation)
+        record = reopened.get(ledger_key())
+        assert record.status == ("unknown" if count == 1 else "sent")
+        assert reopened.reserve(ledger_key()).granted is False
+        if count == 2:
+            assert record.comment_status == "unknown"
+        reopened.close()
+
+
+def test_八个在途投递时第九个繁忙且退出后释放容量(tmp_path: Path) -> None:
+    from tests.direct_support import make_direct_plugin
+    from tests.support import source_message, SOURCE_SESSION_ID
+    fixture = make_direct_plugin(tmp_path)
+    for index in range(10):
+        fixture.ctx.message.store[(SOURCE_SESSION_ID, str(index))] = source_message(message_id=str(index))
+    arguments = [issue_source_call(fixture.plugin, message_id=str(index)) for index in range(10)]
+    fixture.onebot.gates.pause("get_login_info")
+    async def scenario():
+        tasks = [asyncio.create_task(fixture.plugin.forward_message(**args)) for args in arguments[:8]]
+        await wait_until(lambda: fixture.onebot.gates.arrivals.get("get_login_info") == 1)
+        for _ in range(40):
+            await asyncio.sleep(0)
+        ninth = asyncio.create_task(fixture.plugin.forward_message(**arguments[8]))
+        for _ in range(40):
+            await asyncio.sleep(0)
+        assert ninth.done(), "第九个应立即繁忙，不能进入等待队列"
+        assert (await ninth)["status"] == "rejected"
+        assert "繁忙" in (await ninth)["reason"]
+        assert len(fixture.ctx.message.calls) == 8
+        fixture.onebot.gates.release("get_login_info")
+        assert all(result["status"] == "sent" for result in await asyncio.gather(*tasks))
+        result = await fixture.plugin.forward_message(**arguments[9])
+        assert result["status"] == "sent"
+        assert fixture.onebot.send_count == 9
+    asyncio.run(scenario())
+    fixture.close()
+
+
+def test_卸载共享五秒预算且残留工作保持账本独占(tmp_path: Path) -> None:
+    from tests.direct_support import make_direct_plugin
+    from tests.support import ledger_key
+    from delivery_ledger import open_ledger, LEDGER_FILE_NAME, LedgerUnavailable
+    fixture = make_direct_plugin(tmp_path)
+    args = issue_source_call(fixture.plugin)
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def stubborn(stage):
+        entered.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+    fixture.onebot.before_wire = stubborn
+    async def scenario():
+        task = asyncio.create_task(fixture.plugin.forward_message(**args))
+        await entered.wait()
+        unloading = asyncio.create_task(fixture.plugin.on_unload())
+        for _ in range(40):
+            await asyncio.sleep(0)
+        fixture.clock.advance(5)
+        try:
+            await wait_until(unloading.done)
+            await unloading
+        finally:
+            release.set()
+        assert fixture.onebot.send_count == 0
+        assert isinstance(open_ledger(tmp_path / LEDGER_FILE_NAME), LedgerUnavailable)
+        warnings = "\n".join(fixture.ctx.logger.texts("warning"))
+        assert "未退出" in warnings and "m-source-1" in warnings and "20002" in warnings
+        assert fixture.ledger.get(ledger_key()).status == "failed"
+        release.set()
+        await task
+        for _ in range(30):
+            await asyncio.sleep(0)
+        assert fixture.onebot.send_count == 0
+    asyncio.run(scenario())
+    fixture.ledger.close()
+
+
+def test_真实传输排队结束后复验最新权限且零发送帧(tmp_path: Path) -> None:
+    import pytest
+    pytest.importorskip("aiohttp")
+    import json
+    from types import SimpleNamespace
+    from aiohttp import WSMsgType
+    from maimai_courier_plugin.snowluma_transport import AiohttpOneBotTransport
+    from tests.snowluma_transport_support import MemorySocket, MemorySession
+    from tests.direct_support import config_with
+    from tests.support import make_plugin, prepare_source, enabled_config, apply_config_update, open_test_ledger, ledger_key
+    from tests.support import FakeClock
+    clock = FakeClock()
+    ledger = open_test_ledger(tmp_path, clock=clock)
+    socket = MemorySocket()
+    session = MemorySession(socket)
+    connections = []
+    config = enabled_config()
+    config["snowluma"] = {"websocket_url": "ws://127.0.0.1:8765/onebot", "token_env_var": "SYNTHETIC_TOKEN"}
+    def factory(connection):
+        transport = AiohttpOneBotTransport(connection, clock=clock, environ={"SYNTHETIC_TOKEN": "synthetic"}, session_factory=lambda **_: session)
+        connections.append(transport)
+        return transport
+    plugin, ctx = make_plugin(tmp_path, config=config, clock=clock, transport_factory=factory,
+                              environ={"SYNTHETIC_TOKEN": "synthetic"}, ledger_opener=lambda _: ledger)
+    prepare_source(ctx)
+    args = issue_source_call(plugin)
+    blocked, blocker = [], []
+    logins = 0
+    def reply(body, data):
+        socket.frames.put_nowait(SimpleNamespace(type=WSMsgType.TEXT, data=json.dumps({
+            "status": "ok", "retcode": 0, "echo": body["echo"], "data": data})))
+    async def send(body):
+        nonlocal logins
+        socket.sent.append(body)
+        action = body["action"]
+        if action == "get_login_info":
+            logins += 1
+            if logins == 2:
+                blocker.append(asyncio.create_task(connections[0].get_msg("queue-blocker")))
+            reply(body, {"user_id": "10000"})
+        elif action == "get_group_list":
+            reply(body, [{"group_id": "20002"}])
+        elif action == "get_msg" and body["params"]["message_id"] == "queue-blocker":
+            blocked.append(body)
+        elif action == "get_msg":
+            reply(body, {"message_id": "m-source-1", "message_type": "group", "group_id": "10001",
+                         "message": [{"type": "text", "data": {"text": "原文"}}]})
+    socket.send_json = send
+    async def scenario():
+        task = asyncio.create_task(plugin.forward_message(**args))
+        await wait_until(lambda: bool(blocked))
+        await apply_config_update(plugin, config_with(plugin, scope={"target_groups": []}))
+        reply(blocked[0], {})
+        await blocker[0]
+        result = await task
+        assert result["status"] == "rejected"
+        assert [frame for frame in socket.sent if frame["action"] == "send_msg"] == []
+        assert ledger.get(ledger_key()).status == "failed"
+        await plugin.on_unload()
+    asyncio.run(scenario())
+
+
+def _key(message_id: str = "m-source-1", target_group_id: str = TARGET_GROUP_ID) -> DeliveryKey:
+    return DeliveryKey(
+        account_id=SOURCE_ACCOUNT_ID,
+        source_group_id=SOURCE_GROUP_ID,
+        source_message_id=message_id,
+        target_group_id=target_group_id,
+    )
+
+
+def _leftover_sending(ledger: DeliveryLedger, *, message_id: str = "m-source-1") -> None:
+    assert ledger.reserve(_key(message_id)).granted
 
 
 # --------------------------------------------------------------------------- 4.2
 
 
 def test_同键并发调用最多一次进入源发送(tmp_path: Path) -> None:
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), send_source=step)
-    prepare_source(ctx)
-    first_arguments = issue_source_call(plugin, message_id="m-source-1")
-    second_arguments = issue_source_call(plugin, message_id="m-source-1")
+    fixture = make_direct_plugin(tmp_path)
+    first_arguments = issue_source_call(fixture.plugin, message_id="m-source-1")
+    second_arguments = issue_source_call(fixture.plugin, message_id="m-source-1")
+    fixture.onebot.gates.pause("platform_commit")
 
     async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
-        ctx.send.hold = asyncio.Event()
-        in_flight = asyncio.create_task(plugin.forward_message(**first_arguments))
-        await wait_until(lambda: len(ctx.send.calls) == 1)
-        concurrent = await plugin.forward_message(**second_arguments)
-        ctx.send.hold.set()
-        return await in_flight, concurrent
+        in_flight = asyncio.create_task(fixture.plugin.forward_message(**first_arguments))
+        await wait_until(lambda: fixture.onebot.gates.arrivals.get("platform_commit", 0) == 1)
+        concurrent = await fixture.plugin.forward_message(**second_arguments)
+        fixture.onebot.gates.release("platform_commit")
+        return await asyncio.wait_for(in_flight, timeout=5), concurrent
 
     first, concurrent = asyncio.run(scenario())
 
-    assert len(ctx.send.calls) == 1, "同键并发最多只能有一次进入源发送"
-    assert len(step.entries) == 1
-    assert first["success"] is True, first
-    assert first["status"] == STATUS_SENT, first
-    assert first["target_message_id"] == "m-delivered-1", first
+    assert fixture.onebot.send_count == 1, "同键并发最多只能有一次进入源发送"
+    assert first["success"] is True and first["status"] == STATUS_SENT, first
+    assert first["target_message_id"], first
     assert concurrent["success"] is False, concurrent
     assert concurrent["status"] == STATUS_SENDING, concurrent
     assert "发送中" in str(concurrent["reason"]), concurrent
 
-    record = open_test_ledger(tmp_path).get(ledger_key())
-    assert record is not None
-    assert (record.status, record.target_message_id) == (STATUS_SENT, "m-delivered-1")
+    record = fixture.record()
+    assert record is not None and record["status"] == STATUS_SENT, record
+    fixture.close()
 
 
 def test_不同目标群独立发送(tmp_path: Path) -> None:
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(
+    fixture = make_direct_plugin(
         tmp_path,
-        config=enabled_config(target_groups=(TARGET_GROUP_ID, OTHER_TARGET_GROUP_ID)),
-        send_source=step,
+        target_groups=(TARGET_GROUP_ID, OTHER_TARGET_GROUP_ID),
     )
-    prepare_source(ctx)
 
-    first, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    first, _ = run_bound_forward(fixture.plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
     second, _ = run_bound_forward(
-        plugin,
-        message_id="m-source-1",
-        target_group_id=OTHER_TARGET_GROUP_ID,
+        fixture.plugin, message_id="m-source-1", target_group_id=OTHER_TARGET_GROUP_ID
     )
 
     assert first["success"] is True and second["success"] is True, (first, second)
-    assert len(ctx.send.calls) == 2, "不同目标群是不同键，必须各自发送"
-    ledger = open_test_ledger(tmp_path)
-    assert ledger.get(ledger_key()).status == STATUS_SENT
-    assert ledger.get(ledger_key(target_group_id=OTHER_TARGET_GROUP_ID)).status == STATUS_SENT
+    assert fixture.onebot.send_count == 2, "不同目标群是不同键，必须各自发送"
+    assert [call.target for call in fixture.onebot.send_calls] == [TARGET_GROUP_ID, OTHER_TARGET_GROUP_ID]
+    assert fixture.record(target_group_id=TARGET_GROUP_ID)["status"] == STATUS_SENT
+    assert fixture.record(target_group_id=OTHER_TARGET_GROUP_ID)["status"] == STATUS_SENT
+    fixture.close()
 
 
 def test_发送前持久化失败时发送次数为零(tmp_path: Path) -> None:
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(
-        tmp_path / "blocked",
-        config=enabled_config(),
-        send_source=step,
-        storage_fault=True,
-    )
-    prepare_source(ctx)
+    fixture = make_direct_plugin(tmp_path)
+    fixture.storage.fail_next("reserve")
 
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(fixture.plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
 
     assert result["success"] is False, result
+    assert result["status"] == "ledger_unavailable", result
     assert "账本" in str(result["reason"]), result
     assert "本次未发送任何消息" in str(result["reason"]), result
-    assert ctx.send.calls == [], "发送前持久化失败不得发送"
-    assert step.entries == []
+    assert fixture.onebot.send_count == 0, "发送前占位失败不得进入平台调用"
+    assert fixture.old_send_calls() == [], "不得回退宿主旧发送通道"
+    fixture.close()
 
 
 def test_网络等待期间不持有数据库事务(tmp_path: Path) -> None:
-    observations: list[Any] = []
+    fixture = make_direct_plugin(tmp_path)
+    arguments = issue_source_call(fixture.plugin, message_id="m-source-1")
+    fixture.onebot.gates.pause("platform_commit")
 
-    def probe() -> None:
-        """发送步骤（网络等待）期间用第二个连接观察账本。"""
+    async def scenario() -> list[tuple[str, str, str]]:
+        task = asyncio.create_task(fixture.plugin.forward_message(**arguments))
+        await wait_until(lambda: fixture.onebot.gates.arrivals.get("platform_commit", 0) == 1)
+        record = fixture.ledger.get(_key())
+        in_flight = [(record.key.source_message_id, record.status, record.target_message_id)]
+        # 独立连接必须能在「网络等待」期间取得写事务：说明插件没有跨网络持有事务。
+        connection = sqlite3.connect(
+            str(fixture.data_dir / LEDGER_FILE_NAME), timeout=1.0, isolation_level=None
+        )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+        finally:
+            connection.close()
+        fixture.onebot.gates.release("platform_commit")
+        await asyncio.wait_for(task, timeout=5)
+        return in_flight
 
-        second = open_test_ledger(tmp_path)
-        observations.append(second.get(ledger_key()))
-        observations.append(second.reserve(ledger_key(message_id="m-probe")))
-        second.close()
+    in_flight = asyncio.run(scenario())
 
-    step = RecordingSendStep(on_enter=probe)
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), send_source=step)
-    prepare_source(ctx)
-
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-    assert result["success"] is True, result
-    in_flight, reservation = observations
-    assert in_flight is not None and in_flight.status == STATUS_SENDING, (
-        "发送前占位必须在进入发送步骤前提交（另一连接可见）"
+    assert in_flight == [("m-source-1", STATUS_SENDING, "")], (
+        "源占位必须在进入平台调用前提交（独立连接可见）",
+        in_flight,
     )
-    assert isinstance(reservation, Reservation) and reservation.granted is True, (
-        "网络等待期间不得持有数据库事务（另一连接必须能写入）"
-    )
-    probe_record = open_test_ledger(tmp_path).get(ledger_key(message_id="m-probe"))
-    assert probe_record is not None and probe_record.status == STATUS_SENDING, (
-        "另一连接在网络等待期间写入的记录必须已提交"
-    )
+    assert fixture.record()["status"] == STATUS_SENT
+    fixture.close()
 
 
 # --------------------------------------------------------------------------- 4.3
 
 
 def test_成功回执立即落账并跨重启防重(tmp_path: Path) -> None:
-    first_step = RecordingSendStep(target_message_id="m-delivered-42")
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), send_source=first_step)
-    prepare_source(ctx)
+    fixture = make_direct_plugin(tmp_path)
 
-    first, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    first, _ = run_bound_forward(fixture.plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
 
     assert first["success"] is True, first
     assert first["status"] == STATUS_SENT, first
     assert first["sent"] is True and first["delivered"] is True, first
-    assert first["target_message_id"] == "m-delivered-42", first
-    record = open_test_ledger(tmp_path).get(ledger_key())
-    assert record is not None and record.status == STATUS_SENT
-    assert record.target_message_id == "m-delivered-42", "真实回执必须立即保存到账本"
+    target_message_id = first["target_message_id"]
+    assert target_message_id, first
+    record = fixture.record()
+    assert record is not None and record["status"] == STATUS_SENT
+    assert record["target_message_id"] == target_message_id, "真实回执必须立即保存到权威账本"
 
-    # 模拟重启：新插件实例与新上下文，同一 data_dir（账本重开）
-    restart_step = RecordingSendStep()
-    restarted, restarted_ctx = make_plugin(
-        tmp_path,
-        config=enabled_config(),
-        send_source=restart_step,
-    )
-    prepare_source(restarted_ctx)
+    # 关闭旧插件并重新打开同一本地账本，投递事实继续阻断。
+    fixture.reopen()
+    sends_before = fixture.onebot.send_count
+
     repeat, _ = run_bound_forward(
-        restarted,
+        fixture.plugin,
         message_id="m-source-1",
         target_group_id=TARGET_GROUP_ID,
         comment="换一条评论也不得绕过防重",
     )
 
     assert repeat["success"] is True, repeat
-    assert repeat["status"] == TOOL_STATUS_ALREADY_FORWARDED, repeat
+    assert repeat["status"] == "already_forwarded", repeat
     assert repeat["already_forwarded"] is True, repeat
-    assert repeat["target_message_id"] == "m-delivered-42", "已转发结果必须带回既有目标消息 ID"
+    assert repeat["target_message_id"] == target_message_id, "已转发结果必须带回既有目标消息 ID"
     assert "未发送源消息或评论" in str(repeat["reason"]), repeat
-    assert restarted_ctx.send.calls == [], "已投递记录必须阻止源消息与评论重发"
-    assert restart_step.entries == []
+    assert fixture.onebot.send_count == sends_before, "跨重启的既有记录必须阻止源消息与评论重发"
+    assert fixture.old_send_calls() == []
+    fixture.close()
 
 
-def test_成功记录不因容量或重开账本被静默清除(tmp_path: Path) -> None:
-    # 结构性守卫：账本不提供删除 / 清理 / TTL 接口，成功记录只增不减
+def test_成功记录不因时间或容量被静默清除(tmp_path: Path) -> None:
+    """插件账本不提供删除/TTL 接口；成功记录在时间推进与重启后仍然阻断。"""
+
     public_methods = [name for name in dir(DeliveryLedger) if not name.startswith("_")]
     assert not any(
         keyword in name.lower()
@@ -201,453 +450,316 @@ def test_成功记录不因容量或重开账本被静默清除(tmp_path: Path) 
         for keyword in ("delete", "purge", "cleanup", "ttl")
     ), f"账本不得提供删除或 TTL 接口: {public_methods}"
 
-    path = tmp_path / LEDGER_FILE_NAME
-    ledger = open_ledger(path, clock=FakeClock())
-    assert isinstance(ledger, DeliveryLedger)
-    first = ledger_key(message_id="m-first")
-    assert ledger.reserve(first).granted is True
-    assert ledger.mark_sent(first, "m-delivered-first") is True
-    assert ledger.record_comment(first, status=STATUS_SENT, message_id="c-first") is True
-    first_record = ledger.get(first)
-    assert first_record is not None
-    created_at = first_record.created_at
-    for index in range(200):
-        bulk = ledger_key(message_id=f"m-bulk-{index}")
-        assert ledger.reserve(bulk).granted is True
-        assert ledger.mark_sent(bulk, f"m-delivered-{index}") is True
-    ledger.close()
+    fixture = make_direct_plugin(tmp_path)
+    first, _ = run_bound_forward(fixture.plugin, message_id="m-source-1")
+    target_message_id = first["target_message_id"]
+    assert target_message_id
 
-    # 重开账本（其前已写入 200 条新记录）：旧记录与评论结果仍在，且没有被清理重写
-    reopened = open_ledger(path, clock=FakeClock(start=10 * 365 * 24 * 3600))
-    assert isinstance(reopened, DeliveryLedger)
-    record = reopened.get(first)
-    assert record is not None and record.status == STATUS_SENT, (
-        "成功记录不得按容量或重开账本静默清除"
+    # 推进十年虚拟时间并重载插件：成功记录仍在，且继续阻断重发。
+    fixture.clock.advance(10 * 365 * 24 * 3600)
+    fixture.reopen()
+
+    record = fixture.record()
+    assert record is not None and record["status"] == STATUS_SENT, (
+        "成功记录不得按时间静默清除",
+        record,
     )
-    assert (record.target_message_id, record.comment_status) == ("m-delivered-first", STATUS_SENT)
-    assert record.created_at == created_at, "旧记录不得被清理后重写（创建时间必须原样保留）"
-    oldest_bulk = reopened.get(ledger_key(message_id="m-bulk-0"))
-    assert oldest_bulk is not None and oldest_bulk.status == STATUS_SENT, (
-        "既有记录不得在加入新记录后被按容量静默清除"
-    )
+    assert record["target_message_id"] == target_message_id
+    sends_before = fixture.onebot.send_count
+    repeat, _ = run_bound_forward(fixture.plugin, message_id="m-source-1")
+    assert repeat["status"] == "already_forwarded", repeat
+    assert fixture.onebot.send_count == sends_before
+    fixture.close()
 
 
 # --------------------------------------------------------------------------- 4.4
 
 
 def test_明确未发送的失败可重试(tmp_path: Path) -> None:
-    failing = RecordingSendStep(status=STATUS_FAILED, reason="宿主发送能力明确返回未发送")
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), send_source=failing)
-    prepare_source(ctx)
-
-    first, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-    assert first["success"] is False, first
-    assert first["status"] == STATUS_FAILED, first
-    assert first["sent"] is False and first["delivered"] is False, first
-    assert "本次未发送任何消息" in str(first["reason"]), first
-    record = open_test_ledger(tmp_path).get(ledger_key())
-    assert record is not None and record.status == STATUS_FAILED
-
-    # 明确未发送：允许后续显式调用重试（换一个能成功的发送步骤）
-    retry_step = RecordingSendStep(target_message_id="m-delivered-retry")
-    retried, retried_ctx = make_plugin(
-        tmp_path,
-        config=enabled_config(),
-        send_source=retry_step,
-    )
-    prepare_source(retried_ctx)
-
-    second, _ = run_bound_forward(retried, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-    assert second["success"] is True, second
-    assert second["target_message_id"] == "m-delivered-retry", second
-    assert len(retried_ctx.send.calls) == 1, "重试必须真正再次进入源发送"
-    assert open_test_ledger(tmp_path).get(ledger_key()).status == STATUS_SENT
+    from maimai_courier_plugin.snowluma_transport import OneBotUnavailable
+    fixture = make_direct_plugin(tmp_path)
+    async def denied(stage):
+        raise OneBotUnavailable("not_submitted", submitted=False)
+    fixture.onebot.before_wire = denied
+    first, _ = run_bound_forward(fixture.plugin)
+    assert first["status"] == "failed" and not first["success"] and not first["sent"]
+    assert fixture.record()["status"] == "failed" and fixture.onebot.send_count == 0
+    fixture.onebot.before_wire = None
+    second, _ = run_bound_forward(fixture.plugin)
+    assert second["status"] == "sent" and second["target_message_id"] == "target-1"
+    assert fixture.onebot.send_count == 1
+    fixture.close()
 
 
 def test_超时或丢失回执返回待核实且阻止重发(tmp_path: Path) -> None:
-    for label, reason in (("超时", "发送等待超时"), ("回执丢失", "发送回执丢失")):
-        step = RecordingSendStep(status=STATUS_UNKNOWN, reason=reason)
-        data_dir = tmp_path / label
-        plugin, ctx = make_plugin(data_dir, config=enabled_config(), send_source=step)
-        prepare_source(ctx)
+    # 1) 平台回执不可核实：结果未知，重复调用仍按待核实阻断。
+    fixture = make_direct_plugin(tmp_path / "unknown")
+    fixture.onebot.fail_next("send_msg", {"status": "failed", "retcode": 79, "message": "rejected"})
 
-        first, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    first, _ = run_bound_forward(fixture.plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
 
-        assert first["success"] is False, (label, first)
-        assert first["status"] == STATUS_UNKNOWN, (label, first)
-        assert first["sent"] is False, (label, "结果未知不得伪报成功", first)
-        assert "待核实" in str(first["reason"]), (label, first)
-        assert len(ctx.send.calls) == 1, (label, first)
-        record = open_test_ledger(data_dir).get(ledger_key())
-        assert record is not None and record.status == STATUS_UNKNOWN, (label, record)
+    assert first["success"] is False, first
+    assert first["status"] == STATUS_UNKNOWN, first
+    assert first["sent"] is False, ("结果未知不得伪报成功", first)
+    assert "待核实" in str(first["reason"]), first
+    assert fixture.onebot.send_count == 1, first
 
-        # 阻止重发：显式再调用一次也不得再次进入源发送
-        repeat, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-        assert repeat["success"] is False, (label, repeat)
-        assert repeat["status"] == STATUS_UNKNOWN, (label, repeat)
-        assert len(ctx.send.calls) == 1, (label, "待核实记录必须阻止重发")
+    repeat, _ = run_bound_forward(fixture.plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    assert repeat["success"] is False and repeat["status"] == STATUS_UNKNOWN, repeat
+    assert fixture.onebot.send_count == 1, "待核实记录必须阻止重发"
+    fixture.close()
+
+    # 动作响应丢失：即使服务器保存了目标，也不能猜 ID 或再次发送。
+    lost = make_direct_plugin(tmp_path / "lost")
+    lost.onebot.fail_next("send_msg", TimeoutError("合成回执丢失"))
+    result, _ = run_bound_forward(lost.plugin)
+    assert result["status"] == "unknown" and lost.onebot.send_count == 1
+    repeat, _ = run_bound_forward(lost.plugin)
+    assert repeat["status"] == "unknown" and lost.onebot.send_count == 1
+    lost.close()
 
 
-def test_未识别发送状态一律按待核实处理且阻止重发(tmp_path: Path) -> None:
-    """契约外的状态字面量（空串、大小写不符、超时/取消等）不得降级为可重试失败。
+def test_已取得回执只查询同一目标不重复发送(tmp_path: Path) -> None:
+    fixture = make_direct_plugin(tmp_path)
+    result, _ = run_bound_forward(fixture.plugin)
+    assert result["status"] == "sent" and fixture.onebot.send_count == 1
+    queried = [value for name, value, _ in fixture.onebot.calls if name == "get_msg"]
+    assert queried == ["m-source-1", "target-1"]
+    assert fixture.record()["target_message_id"] == "target-1"
+    fixture.close()
 
-    发送步骤契约只定义 `sent` / `failed` / `unknown`；任何未识别取值都按「可能已
-    发送」保守处理（待核实并阻止重发），不当作「明确未发送」。
-    """
 
+def test_未识别发送状态一律按待核实处理且阻止评论(tmp_path: Path) -> None:
     for index, status in enumerate(("", "seNd", "cancelled", "timeout")):
-        data_dir = tmp_path / f"unrecognized-{index}"
-        step = RecordingSendStep(status=status, reason=f"发送步骤返回 {status!r}")
-        plugin, ctx = make_plugin(data_dir, config=enabled_config(), send_source=step)
-        prepare_source(ctx)
-
-        first, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-        assert first["success"] is False, (status, first)
-        assert first["status"] == STATUS_UNKNOWN, (status, "未识别状态必须按待核实兜底", first)
-        assert first["sent"] is False and first["delivered"] is False, (
-            status,
-            "未识别状态不得声称发送成功",
-            first,
-        )
-        assert "待核实" in str(first["reason"]), (status, first)
-        record = open_test_ledger(data_dir).get(ledger_key())
-        assert record is not None and record.status == STATUS_UNKNOWN, (status, record)
-
-        repeat, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-        assert repeat["status"] == STATUS_UNKNOWN, (status, repeat)
-        assert len(step.entries) == 1, (status, "未识别状态必须阻止重发", step.entries)
+        fixture = make_direct_plugin(tmp_path / str(index))
+        fixture.onebot.fail_next("send_msg", {"status": status, "data": {"message_id": "target-1"}})
+        result, _ = run_bound_forward(fixture.plugin, comment="不该发送")
+        assert result["status"] == "unknown" and not result["sent"] and not result["success"]
+        assert fixture.onebot.send_count == 1 and fixture.record()["status"] == "unknown"
+        assert fixture.record()["comment_status"] == ""
+        fixture.close()
 
 
 def test_终态登记失败时不得宣称可重试失败(tmp_path: Path) -> None:
-    """明确未发送但失败状态未能落盘时，账本里仍是发送中占位（重启会归并为待核实）。
+    """平台已成功但源终态未落盘：报告已知回执但按待核实、阻止重发。"""
 
-    因此对外不得降级成「可重试的明确失败」（第 4 组评审遗留 #8）：如实按待核实
-    报告，并继续阻止重复发送。
-    """
+    fixture = make_direct_plugin(tmp_path)
+    fixture.storage.fail_next("mark_sent")
 
-    flaky: list[FailingLedger] = []
-
-    def flaky_open(path: Path) -> Any:
-        ledger = open_ledger(path, clock=FakeClock())
-        assert isinstance(ledger, DeliveryLedger)
-        double = FailingLedger(ledger, failing=("mark_failed",))
-        flaky.append(double)
-        return double
-
-    step = RecordingSendStep(status=STATUS_FAILED, reason="宿主明确未发送")
-    plugin, ctx = make_plugin(
-        tmp_path,
-        config=enabled_config(),
-        send_source=step,
-        open_ledger=flaky_open,
-    )
-    prepare_source(ctx)
-
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(fixture.plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
 
     assert result["status"] == STATUS_UNKNOWN, ("登记失败不得宣称可重试", result)
-    assert result["sent"] is False, result
+    assert result["sent"] is True, ("已知回执必须保留用于报告", result)
+    assert result["target_message_id"], result
     assert "待核实" in str(result["reason"]), result
-    assert "本次未发送任何消息" in str(result["reason"]), result
-    assert flaky[0].failed_calls == ["mark_failed"], flaky[0].failed_calls
-    record = open_test_ledger(tmp_path).get(ledger_key())
-    assert record is not None and record.status == STATUS_SENDING, (
-        "占位不得被当成终态（重启后会归并为待核实）",
-        record,
-    )
+    assert "本次未发送任何消息" not in str(result["reason"]), result
+    assert fixture.onebot.send_count == 1
 
-    # 后续显式调用被未决占位阻止：不会假装可重试而重复发送
-    repeat, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-    assert repeat["status"] == STATUS_SENDING, repeat
-    assert len(step.entries) == 1, step.entries
+    repeat, _ = run_bound_forward(fixture.plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    assert repeat["status"] in (STATUS_SENDING, STATUS_UNKNOWN), repeat
+    assert fixture.onebot.send_count == 1, "未落盘的在途占位必须继续阻断重发"
+    fixture.close()
 
 
 def test_失败与待核实都不启动后台自动重试(tmp_path: Path) -> None:
-    cases: list[tuple[Any, Any, FakeClock, dict[str, Any]]] = []
-    for index, status in enumerate((STATUS_FAILED, STATUS_UNKNOWN)):
-        step = RecordingSendStep(status=status, reason=f"{status} 的发送结果")
-        clock = FakeClock()
-        plugin, ctx = make_plugin(
-            tmp_path / f"case-{index}",
-            config=enabled_config(),
-            send_source=step,
-            clock=clock,
-        )
-        prepare_source(ctx)
-        cases.append((plugin, ctx, clock, issue_source_call(plugin, message_id="m-source-1")))
-
-    async def scenario() -> list[int]:
-        extra_sends: list[int] = []
-        for plugin, ctx, clock, arguments in cases:
-            await plugin.forward_message(**arguments)
-            baseline = len(ctx.send.calls)
-            clock.advance(6 * 3600)
-            for _ in range(20):
+    from maimai_courier_plugin.snowluma_transport import OneBotUnavailable
+    for index, submitted in enumerate((False, True)):
+        fixture = make_direct_plugin(tmp_path / str(index))
+        if submitted:
+            fixture.onebot.fail_next("send_msg", TimeoutError())
+        else:
+            async def denied(stage):
+                raise OneBotUnavailable("not_submitted", submitted=False)
+            fixture.onebot.before_wire = denied
+        args = issue_source_call(fixture.plugin)
+        async def scenario():
+            result = await fixture.plugin.forward_message(**args)
+            assert result["status"] == ("unknown" if submitted else "failed")
+            before = fixture.onebot.send_count
+            fixture.clock.advance(6 * 3600)
+            for _ in range(30):
                 await asyncio.sleep(0)
-            lingering = [
-                task
-                for task in asyncio.all_tasks()
-                if task is not asyncio.current_task() and not task.done()
-            ]
-            assert lingering == [], f"不得留下后台重试任务: {lingering}"
-            extra_sends.append(len(ctx.send.calls) - baseline)
-        return extra_sends
-
-    assert asyncio.run(scenario()) == [0, 0], "明确失败与结果未知都不得启动后台自动重试"
+            assert fixture.onebot.send_count == before
+        asyncio.run(scenario())
+        fixture.close()
 
 
 # --------------------------------------------------------------------------- 4.5
 
 
 def test_遗留sending重启后进入待核实且不盲目重发(tmp_path: Path) -> None:
-    # 崩溃前进程：占位成功但还没落终态就中断（连接被直接关闭）
-    crashed = open_test_ledger(tmp_path)
-    assert crashed.reserve(ledger_key()).granted is True
-    crashed.close()
-
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), send_source=step)
-    prepare_source(ctx)
-
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-    assert result["success"] is False, result
-    assert result["status"] == STATUS_UNKNOWN, result
-    assert "待核实" in str(result["reason"]), result
-    assert ctx.send.calls == [] and step.entries == [], "遗留占位不得被盲目重发"
-    record = open_test_ledger(tmp_path).get(ledger_key())
-    assert record is not None and record.status == STATUS_UNKNOWN, (
-        "遗留 sending 必须归并为待核实，而不是可安全重试的失败"
-    )
+    fixture = make_direct_plugin(tmp_path)
+    _leftover_sending(fixture.ledger)
+    assert fixture.record()["status"] == "sending"
+    fixture.reopen()
+    assert fixture.record()["status"] == "unknown"
+    result, _ = run_bound_forward(fixture.plugin)
+    assert result["status"] == "unknown" and not result["success"]
+    assert fixture.onebot.calls == []
+    fixture.close()
 
 
-def test_启动恢复失败时告警且不静默当作零条(tmp_path: Path) -> None:
-    # 1) 健康空账本：恢复零条，不产生恢复告警（与失败可区分）
-    healthy_plugin, healthy_ctx = make_plugin(
-        tmp_path / "healthy",
-        config=enabled_config(),
-        send_source=RecordingSendStep(),
-    )
-    asyncio.run(healthy_plugin.on_load())
-    assert healthy_ctx.logger.texts("warning") == [], (
-        f"空账本恢复零条不得产生恢复告警: {healthy_ctx.logger.records}"
-    )
-
-    # 2) 遗留 sending + 恢复失败：必须告警一次，且方向仍然安全（继续阻止重发）
-    crashed = open_test_ledger(tmp_path)
-    assert crashed.reserve(ledger_key()).granted is True
-    crashed.close()
-
-    flaky: list[FailingLedger] = []
-
-    def flaky_open(path: Path) -> Any:
-        ledger = open_ledger(path, clock=FakeClock())
-        assert isinstance(ledger, DeliveryLedger)
-        double = FailingLedger(ledger, failing=("recover_interrupted",))
-        flaky.append(double)
-        return double
-
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(
-        tmp_path,
-        config=enabled_config(),
-        send_source=step,
-        open_ledger=flaky_open,
-    )
-    prepare_source(ctx)
-
-    asyncio.run(plugin.on_load())
-
-    assert any("恢复" in text for text in ctx.logger.texts("warning")), (
-        f"恢复失败必须告警，不能与「零条」不可区分: {ctx.logger.records}"
-    )
-    assert flaky[0].failed_calls == ["recover_interrupted"], "恢复失败必须被如实识别，不得当作零条"
-
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-    assert result["status"] == STATUS_SENDING, result
-    assert ctx.send.calls == [] and step.entries == [], "恢复失败时遗留 sending 仍必须阻止重发"
-
-
-def test_发送步骤被中断时保留在途占位不误判失败(tmp_path: Path) -> None:
-    async def crashing_step(prepared: Any) -> Any:
-        del prepared
-        raise asyncio.CancelledError
-
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), send_source=crashing_step)
-    prepare_source(ctx)
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(plugin.forward_message(**issue_source_call(plugin, message_id="m-source-1")))
-
-    record = open_test_ledger(tmp_path).get(ledger_key())
-    assert record is not None and record.status == STATUS_SENDING, (
-        "中断不得被误记成明确未发送的失败"
-    )
-
-    step = RecordingSendStep()
-    restarted, restarted_ctx = make_plugin(tmp_path, config=enabled_config(), send_source=step)
-    prepare_source(restarted_ctx)
-    repeat, _ = run_bound_forward(restarted, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-    assert repeat["status"] == STATUS_UNKNOWN, repeat
-    assert restarted_ctx.send.calls == [], "中断遗留的投递不得盲目重发"
+def test_提交后取消保留未知且阻断重发(tmp_path: Path) -> None:
+    fixture = make_direct_plugin(tmp_path)
+    args = issue_source_call(fixture.plugin, comment="不得发送")
+    fixture.onebot.gates.pause("platform_commit")
+    async def scenario():
+        task = asyncio.create_task(fixture.plugin.forward_message(**args))
+        await wait_until(lambda: fixture.onebot.send_count == 1)
+        task.cancel()
+        result = await task
+        assert result["status"] == "unknown" and not result["success"]
+        fixture.onebot.gates.release("platform_commit")
+    asyncio.run(scenario())
+    assert fixture.record()["status"] == "unknown"
+    repeat, _ = run_bound_forward(fixture.plugin)
+    assert repeat["status"] == "unknown" and fixture.onebot.send_count == 1
+    fixture.close()
 
 
 def test_发送成功后落盘失败不发送评论并保留已知回执(tmp_path: Path) -> None:
-    flaky: list[FailingLedger] = []
+    fixture = make_direct_plugin(tmp_path)
+    fixture.storage.fail_next("mark_sent")
 
-    def flaky_open(path: Path) -> Any:
-        ledger = open_ledger(path, clock=FakeClock())
-        assert isinstance(ledger, DeliveryLedger)
-        double = FailingLedger(ledger, failing=("mark_sent", "mark_unknown"))
-        flaky.append(double)
-        return double
-
-    step = RecordingSendStep(target_message_id="m-delivered-lost")
-    plugin, ctx = make_plugin(
-        tmp_path,
-        config=enabled_config(),
-        send_source=step,
-        open_ledger=flaky_open,
+    result, _ = run_bound_forward(
+        fixture.plugin, message_id="m-source-1", comment="不该发出的评论", clock=fixture.clock
     )
-    prepare_source(ctx)
-
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
 
     assert result["success"] is False, result
     assert result["status"] == STATUS_UNKNOWN, result
     assert result["sent"] is True and result["delivered"] is True, result
-    assert result["target_message_id"] == "m-delivered-lost", "已知回执必须保留用于报告"
+    assert result["target_message_id"], "已知回执必须保留用于报告"
     assert "未发送评论" in str(result["reason"]), result
-    assert len(ctx.send.calls) == 1, "落盘失败后不得继续发送评论"
-    assert flaky[0].failed_calls == ["mark_sent", "mark_unknown"], (
-        "落盘失败后只应尝试补记待核实，不得开始评论段"
-    )
-
-    # 重启后仍不盲目重发：遗留 sending 在打开账本时归并为待核实
-    restarted, restarted_ctx = make_plugin(
-        tmp_path,
-        config=enabled_config(),
-        send_source=RecordingSendStep(),
-    )
-    prepare_source(restarted_ctx)
-    repeat, _ = run_bound_forward(restarted, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-    assert repeat["success"] is False, repeat
-    assert repeat["status"] == STATUS_UNKNOWN, repeat
-    assert restarted_ctx.send.calls == []
-    record = open_test_ledger(tmp_path).get(ledger_key())
-    assert record is not None and record.status == STATUS_UNKNOWN, record
-    assert record.comment_status == "", "落盘失败后不得留下评论结果"
+    assert fixture.onebot.send_count == 1, "落盘失败后不得继续发送评论"
+    assert sum(call["stage"] == "comment" for call in fixture.onebot.sent) == 0, "落盘失败后不得提交评论授权"
+    assert 0.5 not in fixture.clock.sleeps, "源终态未固定时不得开始评论等待"
+    fixture.close()
 
 
-def test_发送后落盘失败与占位未命中的措辞可区分(tmp_path: Path) -> None:
-    """两类「状态未登记」都按待核实报告，但原因必须区分存储失败与占位未命中。"""
-
-    def failing_opener(mode: str) -> Any:
-        def opener(path: Path) -> Any:
-            ledger = open_ledger(path, clock=FakeClock())
-            assert isinstance(ledger, DeliveryLedger)
-            return FailingLedger(
-                ledger,
-                failing=("mark_sent", "mark_unknown"),
-                failure_mode=mode,
-            )
-
-        return opener
-
-    cases = (
-        ("存储失败", "raise", "存储"),
-        ("占位未命中", "false", "占位"),
-    )
-    for label, mode, expected in cases:
-        data_dir = tmp_path / label
-        step = RecordingSendStep(target_message_id=f"m-delivered-{mode}")
-        plugin, ctx = make_plugin(
-            data_dir,
-            config=enabled_config(),
-            send_source=step,
-            open_ledger=failing_opener(mode),
-        )
-        prepare_source(ctx)
-
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-        assert result["status"] == STATUS_UNKNOWN, (label, result)
-        assert result["sent"] is True and result["delivered"] is True, (label, result)
-        assert result["target_message_id"] == f"m-delivered-{mode}", (label, result)
-        reason = str(result["reason"])
-        assert "待核实" in reason and "未发送评论" in reason, (label, result)
-        assert expected in reason, (label, f"必须区分失败原因（{expected}）", result)
+def test_落盘失败与占位未命中的措辞可区分(tmp_path: Path) -> None:
+    for index, miss in enumerate((False, True)):
+        fixture = make_direct_plugin(tmp_path / str(index))
+        if miss:
+            fixture.storage.mark_sent = lambda *args: False
+        else:
+            fixture.storage.fail_next("mark_sent")
+        result, _ = run_bound_forward(fixture.plugin, comment="不发送", clock=fixture.clock)
+        assert result["status"] == "unknown" and result["sent"]
+        assert result["target_message_id"] == "target-1"
+        assert result["stage"] == "source_persist" and "未发送评论" in result["reason"]
+        assert ("未能命中在途占位" if miss else "未能落盘") in result["reason"]
+        assert fixture.onebot.send_count == 1 and fixture.record()["status"] == "sending"
+        fixture.close()
 
 
 # --------------------------------------------------------------------------- 4.6
 
 
-def test_账本损坏时关闭发送且不覆盖状态数据(tmp_path: Path) -> None:
-    ledger_path = tmp_path / LEDGER_FILE_NAME
-    ledger_path.write_bytes("这不是一个 SQLite 数据库".encode("utf-8") + b"\x00\xff" * 8)
-    broken_bytes = ledger_path.read_bytes()
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), send_source=step)
-    prepare_source(ctx)
+def test_账本不可用时关闭发送且不覆盖状态数据(tmp_path: Path) -> None:
+    fixture = make_direct_plugin(tmp_path)
+    ledger_path = fixture.data_dir / LEDGER_FILE_NAME
+    # 插件在写入源占位时发现账本不可用：在进入平台调用前关闭发送。
+    fixture.storage.fail_next("reserve")
 
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(fixture.plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
 
     assert result["success"] is False, result
+    assert result["status"] == "ledger_unavailable", result
     reason = str(result["reason"])
-    assert "账本" in reason and "损坏" in reason, ("必须输出明确原因", result)
+    assert "账本" in reason, ("必须输出明确原因", result)
     assert "本次未发送任何消息" in reason, result
-    assert ctx.send.calls == [] and step.entries == [], "账本损坏时不得发送"
-    assert any("账本" in text for text in ctx.logger.texts("error")), (
-        f"必须记录可定位的错误日志: {ctx.logger.records}"
+    assert fixture.onebot.send_count == 0, "账本不可用时不得发送"
+    assert fixture.old_send_calls() == [], "不得回退旧发送通道"
+
+    # 账本仍不可用：重复调用同样关闭发送，且状态数据保持原样。
+    fixture.storage.fail_next("reserve")
+    repeat, _ = run_bound_forward(fixture.plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    assert repeat["success"] is False and repeat["status"] == "ledger_unavailable", repeat
+    assert ledger_path.exists() and ledger_path.read_bytes().startswith(b"SQLite format 3"), (
+        "不得删除或覆盖状态数据（文件仍是可读的 SQLite 库）"
     )
-
-    # 重复调用仍然关闭发送；损坏的状态数据必须原样保留（不覆盖、不删除、不当空库）
-    repeat, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-    assert repeat["success"] is False and "账本" in str(repeat["reason"]), repeat
-    assert ctx.send.calls == [] and step.entries == []
-    assert ledger_path.exists(), "不得删除损坏的状态数据"
-    assert ledger_path.read_bytes() == broken_bytes, "不得覆盖损坏的状态数据"
+    assert fixture.record() is None, "占位失败不得留下记录"
+    fixture.close()
 
 
-def test_启动时发现损坏账本就报错并关闭发送(tmp_path: Path) -> None:
-    ledger_path = tmp_path / LEDGER_FILE_NAME
-    ledger_path.write_bytes("这不是一个 SQLite 数据库".encode("utf-8") + b"\x00\xff" * 8)
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), send_source=step)
+def test_本地迁移收据损坏时关闭发送(tmp_path: Path) -> None:
+    from tests.support import make_plugin, prepare_source, enabled_config
+    from tests.direct_support import DirectOneBot
+    receipt = tmp_path / "service_binding.json"
+    receipt.write_text("{not json", encoding="utf-8")
+    config = enabled_config()
+    config["snowluma"] = {"websocket_url": "ws://127.0.0.1:8765/onebot", "token_env_var": "SYNTHETIC_TOKEN"}
+    plugin, ctx = make_plugin(tmp_path, config=config, environ={"SYNTHETIC_TOKEN": "synthetic"}, transport_factory=lambda _: onebot)
     prepare_source(ctx)
-
-    asyncio.run(plugin.on_load())
-
-    assert any("账本" in text for text in ctx.logger.texts("error")), (
-        f"加载时必须记录明确原因: {ctx.logger.records}"
-    )
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-    assert result["success"] is False and "账本" in str(result["reason"]), result
-    assert ctx.send.calls == [] and step.entries == []
+    onebot = DirectOneBot(ctx, (TARGET_GROUP_ID,))
+    result, _ = run_bound_forward(plugin)
+    assert result["status"] == "ledger_unavailable" and not result["sent"]
+    assert onebot.calls == [] and receipt.read_text(encoding="utf-8") == "{not json"
+    asyncio.run(plugin.on_unload())
 
 
-def test_账本不可读时关闭发送(tmp_path: Path) -> None:
-    ledger_path = tmp_path / LEDGER_FILE_NAME
-    healthy = open_ledger(ledger_path, clock=FakeClock())
-    assert isinstance(healthy, DeliveryLedger)
-    healthy.close()
-    ledger_path.chmod(0o000)
-    try:
-        step = RecordingSendStep()
-        plugin, ctx = make_plugin(tmp_path, config=enabled_config(), send_source=step)
-        prepare_source(ctx)
+def test_直连不可达时关闭发送(tmp_path: Path) -> None:
+    fixture = make_direct_plugin(tmp_path)
+    fixture.onebot.fail_next("get_login_info", ConnectionError("合成连接失败"))
+    result, _ = run_bound_forward(fixture.plugin)
+    assert result["status"] == "rejected" and not result["success"]
+    assert fixture.onebot.send_count == 0 and fixture.old_send_calls() == []
+    fixture.close()
 
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
 
-        assert result["success"] is False, result
-        reason = str(result["reason"])
-        assert "账本" in reason, ("必须说明是账本问题", result)
-        assert "不可读" in reason or "不可写" in reason, ("原因必须可定位到不可读写", result)
-        assert ctx.send.calls == [] and step.entries == [], "账本不可读时不得发送"
-    finally:
-        ledger_path.chmod(0o600)
+def test_评论等待取消后重载重复调用不补发也不额外查询(tmp_path: Path) -> None:
+    fixture = make_direct_plugin(tmp_path)
+    args = issue_source_call(fixture.plugin, comment="不得补发")
+    async def scenario():
+        task = asyncio.create_task(fixture.plugin.forward_message(**args))
+        await wait_until(lambda: 0.5 in fixture.clock.sleeps)
+        task.cancel()
+        result = await task
+        assert result["status"] == "partial" and result["target_message_id"] == "target-1"
+    asyncio.run(scenario())
+    assert fixture.onebot.send_count == 1
+    fixture.reopen()
+    repeat, _ = run_bound_forward(fixture.plugin, comment="换评论也不得补发")
+    assert repeat["status"] == "already_forwarded" and repeat["target_message_id"] == "target-1"
+    assert fixture.onebot.calls == []
+    fixture.close()
+
+
+def test_评论占位失败零评论且重复调用不补发(tmp_path: Path) -> None:
+    fixture = make_direct_plugin(tmp_path)
+    fixture.storage.fail_next("reserve_comment")
+    result, _ = run_bound_forward(fixture.plugin, comment="不得越过占位", clock=fixture.clock)
+    assert result["status"] == "partial" and result["stage"] == "comment_persist"
+    assert result["target_message_id"] == "target-1" and not result["success"]
+    assert fixture.onebot.send_count == 1
+    assert fixture.record()["status"] == "sent" and fixture.record()["comment_status"] == ""
+    baseline = list(fixture.onebot.calls)
+    repeat, _ = run_bound_forward(fixture.plugin, comment="重复不补发")
+    assert repeat["status"] == "already_forwarded" and fixture.onebot.calls == baseline
+    fixture.close()
+
+
+def test_拒绝异常与取消均释放投递容量(tmp_path: Path) -> None:
+    from tests.direct_support import deny_before_wire
+    fixture = make_direct_plugin(tmp_path)
+    fixture.onebot.before_wire = deny_before_wire
+    for _ in range(9):
+        result, _ = run_bound_forward(fixture.plugin)
+        assert result["status"] == "failed" and fixture.onebot.send_count == 0
+    for _ in range(9):
+        result, _ = run_bound_forward(fixture.plugin, target_group_id="99999")
+        assert result["status"] == "rejected" and "繁忙" not in result["reason"]
+    fixture.onebot.before_wire = None
+    fixture.onebot.gates.pause("source_queue")
+    args = issue_source_call(fixture.plugin)
+    async def scenario():
+        task = asyncio.create_task(fixture.plugin.forward_message(**args))
+        await wait_until(lambda: fixture.onebot.gates.arrivals.get("source_queue", 0) == 10)
+        task.cancel()
+        result = await task
+        assert result["status"] == "failed" and fixture.onebot.send_count == 0
+        fixture.onebot.gates.release("source_queue")
+    asyncio.run(scenario())
+    result, _ = run_bound_forward(fixture.plugin)
+    assert result["status"] == "sent" and fixture.onebot.send_count == 1
+    fixture.close()

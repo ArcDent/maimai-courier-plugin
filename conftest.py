@@ -40,10 +40,27 @@ PRODUCTION_MODULES = (
     "forward_precheck",
     "delivery_ledger",
     "forward_delivery",
-    "host_send",
     "auto_entry",
     "plugin",
 )
 for stem in PRODUCTION_MODULES:
     module = importlib.import_module(f"{PKG_NAME}.{stem}")
     sys.modules.setdefault(stem, module)
+
+# 共享层的顶层名只兼容活跃测试的既有导入，全部指向插件包里的同一模块对象。
+# 公共加载另由无 conftest 的子进程验证，生产导入不得依赖这里的别名或历史目录。
+SHARED_MODULES = (
+    "clock",
+    "config_rules",
+    "delivery",
+    "identifiers",
+    "mentions",
+    "result",
+    "send_steps",
+)
+"""共享层子模块名单（随 `shared/` 新增模块扩展；子包聚合 `shared/__init__.py` 除外）。"""
+shared_package = importlib.import_module(f"{PKG_NAME}.shared")
+sys.modules.setdefault("shared", shared_package)
+for stem in SHARED_MODULES:
+    module = importlib.import_module(f"{PKG_NAME}.shared.{stem}")
+    sys.modules.setdefault(f"shared.{stem}", module)

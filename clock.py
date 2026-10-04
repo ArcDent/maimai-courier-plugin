@@ -2,36 +2,13 @@
 
 生产用 `SystemClock`（单调时间 + `asyncio.sleep`）；测试注入实现了同一 `Clock`
 协议的替身，无需真实等待即可确定性地推进超时与延迟。
+
+定义已迁入共享层 `shared/clock.py`（服务进程同样需要时钟且不能依赖插件侧模块，
+design D9）；本模块只做兼容重导出，插件侧既有导入入口与对象身份不变。
 """
 
 from __future__ import annotations
 
-import asyncio
-import time
-from typing import Protocol
+from .shared.clock import Clock, SystemClock
 
-
-class Clock(Protocol):
-    """插件消费的最小时间面。"""
-
-    def now(self) -> float:
-        """单调时间（秒）。"""
-
-        ...
-
-    async def sleep(self, seconds: float) -> None:
-        """等待指定秒数；非正数立即返回。"""
-
-        ...
-
-
-class SystemClock:
-    """生产时钟：`time.monotonic()` + `asyncio.sleep`。"""
-
-    def now(self) -> float:
-        return time.monotonic()
-
-    async def sleep(self, seconds: float) -> None:
-        if seconds <= 0:
-            return
-        await asyncio.sleep(seconds)
+__all__ = ["Clock", "SystemClock"]

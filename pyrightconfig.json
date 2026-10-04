@@ -1,4 +1,6 @@
 {
+  // 活跃生产模块与共享纯逻辑；历史服务完整保留，但不参与类型检查。
+  // 三个退役墓碑仍受检查，两个直连模块显式纳入；插件依赖仅由清单声明。
   "include": [
     "config.py",
     "plugin.py",
@@ -9,9 +11,15 @@
     "delivery_ledger.py",
     "forward_delivery.py",
     "host_send.py",
-    "auto_entry.py"
+    "auto_entry.py",
+    "remote_client.py",
+    "snowluma_client.py",
+    "snowluma_transport.py",
+    "shared",
+    "service/__init__.py"
   ],
-  "pythonVersion": "3.10",
+  "exclude": ["history", "tests", "**/__pycache__"],
+  "pythonVersion": "3.11",
   "typeCheckingMode": "standard",
   "reportMissingImports": "none"
 }
