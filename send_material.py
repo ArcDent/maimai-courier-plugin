@@ -29,9 +29,107 @@
 from __future__ import annotations
 
 import re
+import ipaddress
+import socket
+from urllib.parse import urlsplit
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from .shared.identifiers import verbatim_identifier
+from .shared.mentions import flatten_mention_text, mention_display_text
+from .shared.send_steps import PrepareRejected, PreparedSource, SourceMaterial
+
+
+def build_source_material(message: object) -> SourceMaterial | PrepareRejected:
+    """OneBot 源记录的纯转换入口，与宿主序列化形状分开处理。"""
+    if not isinstance(message, list) or not message:
+        return PrepareRejected("source_empty", "源消息没有可发送的内容段，发送前拒绝")
+    cards = [segment for segment in message if isinstance(segment, dict) and segment.get("type") == "forward"]
+    if cards:
+        if len(message) != 1:
+            return PrepareRejected("source_shape_unsupported", "顶层卡片与其它内容混排，整条拒绝")
+        data = cards[0].get("data")
+        raw_id = data.get("id") if isinstance(data, dict) else None
+        resource_id = verbatim_identifier(str(raw_id)) if isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool) else ""
+        if not resource_id:
+            return PrepareRejected("source_resource_missing", "原卡片资源缺失，不能以源消息 ID 代替，整条拒绝")
+        return SourceMaterial(kind="forward", forward_resource_id=resource_id)
+    pieces: list[_TextPiece | _SegmentPiece] = []
+    for segment in message:
+        if not isinstance(segment, dict):
+            return PrepareRejected("source_segment_unsupported", "普通源消息结构无效，整条拒绝")
+        kind, data = segment.get("type"), segment.get("data")
+        if kind == "text" and isinstance(data, dict) and isinstance(data.get("text"), str):
+            text = data["text"]
+        elif kind == "at" and isinstance(data, dict):
+            raw = data.get("qq")
+            identifier = flatten_mention_text(str(raw) if type(raw) is int else raw)
+            if (isinstance(raw, bool) or not identifier or
+                    (identifier != "all" and not (identifier.isascii() and identifier.isdigit() and any(c != "0" for c in identifier)))):
+                return PrepareRejected("source_mention_unconfirmed", "提及对象不可确认，整条拒绝")
+            name = next((value for field in ("card", "nickname", "name")
+                         if (value := flatten_mention_text(data.get(field)))), "")
+            text = mention_display_text(identifier, name)
+        elif kind == "image" and isinstance(data, dict):
+            url = _safe_media_url(data.get("url"))
+            if not url:
+                return PrepareRejected("source_media_unsafe", "图片没有可安全重放的 HTTPS 媒体引用，整条拒绝")
+            pieces.append(_SegmentPiece({"type": "image", "data": {"url": url}}, "image"))
+            continue
+        else:
+            return PrepareRejected("source_segment_unsupported", "普通源消息含不支持或不完整段，整条拒绝")
+        pieces.append(_TextPiece(text, kind == "at", {"type": "text", "data": text}))
+    built = _assemble_segments(pieces)
+    segments = tuple({"type": "text", "data": {"text": s["data"]}} if s["type"] == "text" else s for s in built.segments)
+    return SourceMaterial(kind=_segments_kind(segments), segments=segments)
+
+def _safe_media_url(raw: object) -> str:
+    """附件03的媒体字面量边界；DNS及重定向安全仍是上线门槛U5，不在本机下载。"""
+    if not isinstance(raw, str) or not raw or "\\" in raw or any(not 0x21 <= ord(c) <= 0x7e for c in raw):
+        return ""
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").rstrip(".").lower()
+        if (parts.scheme != "https" or parts.username is not None or parts.password is not None
+                or parts.fragment or not host or parts.port == 0):
+            return ""
+    except ValueError:
+        return ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # inet_aton 只解析数字字面量，不进行 DNS；传统混淆写法一律拒绝。
+        try:
+            socket.inet_aton(host)
+        except (OSError, ValueError):
+            pass
+        else:
+            return ""
+        if ("." not in host or host.endswith((".localhost", ".local", ".internal"))
+                or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in host.split("."))
+                or not any(c.isalpha() for c in host.rsplit(".", 1)[-1])):
+            return ""
+    else:
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if not address.is_global or address.is_multicast or address.is_reserved:
+            return ""
+    return raw
+
+
+def source_outbound_segments(material: SourceMaterial) -> tuple[dict[str, Any], ...] | PrepareRejected:
+    """只重建冻结的输出字段；卡片内部从不读取、不展开或上传。"""
+    if material.kind == "forward":
+        resource_id = verbatim_identifier(material.forward_resource_id)
+        if not resource_id:
+            return PrepareRejected("source_resource_missing", "卡片资源不可用，未进入平台调用")
+        return ({"type": "forward", "data": {"id": resource_id}},)
+    checked = build_source_material(list(material.segments))
+    if isinstance(checked, PrepareRejected):
+        return checked
+    return checked.segments
+
 
 MAX_FORWARD_DEPTH = 3
 """合并转发卡片最大层数：与网关递归深度上限一致，超出即整条拒绝。"""
@@ -50,15 +148,9 @@ _SAFE_SEGMENT_LABEL = re.compile(r"[a-z0-9_]{1,16}\Z")
 _AT_SEGMENT_TYPE = "at"
 """宿主提及段的类型名（`message_utils.py:134-142` 的唯一序列化出口）。"""
 
-_ALL_MENTION_IDENTIFIER = "all"
-"""全体成员提及的对象标识：网关字面量（第 1 组 1.1 核实，宿主不特判、原样透传）。
-
-命中判据是**精确等于**该字面量；缺失或空的标识不是全体成员（见
-`_mention_display_text`），换适配器／网关时需要重新核实。
-"""
-
-_ALL_MENTION_TEXT = "［提及：全体成员］"
-"""全体成员提及的普通文本呈现：只表达「全体成员」含义，不形成提醒全群的段。"""
+# 全体成员标识、全体成员文本与两种个人提及格式（含压平口径）的唯一实现在共享层
+# `shared/mentions.py`（design D9）；本模块只保留宿主形态的字段映射与可确认性判定，
+# 上面的导入保证与 `service/materials.py` 逐字一致。
 
 SendKind = Literal["text", "image", "mixed", "forward"]
 """发送材料种类：纯文本、纯图片、混合，或合并转发卡片。"""
@@ -301,43 +393,22 @@ def _mention_display_text(item: dict[str, Any], location: str) -> str | Unsuppor
     压平后为空、非字典结构都直接拒绝，绝不猜测，也不把空标识当成全体成员。对象标识
     恰为网关字面量 `all` 时按全体成员呈现（名称字段不参与）；其余标识按个人提及呈现，
     显示名只取自源材料里宿主已补写的字段（群名片优先、其次昵称）。对象标识与显示名走
-    同一压平口径（`_flatten_mention_name`：不可打印字符转空格、折叠多余空白），因此
-    标识里的换行／控制字符不会原样进入发送文本；没有可用名称时只呈现对象标识。
+    同一压平口径（`shared/mentions.flatten_mention_text`：不可打印字符转空格、折叠多余
+    空白），因此标识里的换行／控制字符不会原样进入发送文本；没有可用名称时只呈现对象
+    标识。三种格式字面量与压平规则见 `shared/mentions.py`（与 `service/materials.py`
+    共用同一实现）。
     """
 
     data = item.get("data")
     if not isinstance(data, dict):
         return UnsupportedContent(f"{location}的提及结构无效，无法确认提及对象")
-    identifier = _flatten_mention_name(data.get("target_user_id"))
+    identifier = flatten_mention_text(data.get("target_user_id"))
     if not identifier:
         return UnsupportedContent(f"{location}的提及缺少可确认的对象标识，无法完整转发")
-    if identifier == _ALL_MENTION_IDENTIFIER:
-        return _ALL_MENTION_TEXT
-
-    name = _flatten_mention_name(data.get("target_user_cardname")) or _flatten_mention_name(
+    name = flatten_mention_text(data.get("target_user_cardname")) or flatten_mention_text(
         data.get("target_user_nickname")
     )
-    if name:
-        return f"［提及：{name}（{identifier}）］"
-    return f"［提及：{identifier}］"
-
-
-def _flatten_mention_name(raw: Any) -> str:
-    """把提及显示文本（显示名或对象标识）压平成单行：不可打印字符转空格、折叠空白。
-
-    文本来自源群、属不可信内容：这里只做压平，不做模板或命令求值，也不查询成员
-    信息。压平后可能是空串（原本只由控制字符／空白组成），空串的处置由调用方决定：
-    显示名回退到对象标识，对象标识整条拒绝。
-
-    本策略与 `auto_entry.display_name` 是平行实现（`send_material` 不能反向 import
-    `auto_entry`）：两者都压平不可打印字符与多余空白，后者额外做群名限长与尖括号
-    转写，属路由／显示安全的另一层。
-    """
-
-    if not isinstance(raw, str) or not raw:
-        return ""
-    printable = "".join(" " if not character.isprintable() else character for character in raw)
-    return " ".join(printable.split())
+    return mention_display_text(identifier, name)
 
 
 def _build_card(forward_segment: dict[str, Any], *, location: str, depth: int) -> _BuiltCard | UnsupportedContent:

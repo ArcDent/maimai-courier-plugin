@@ -1,0 +1,26 @@
+{
+  // 生产静态检查范围（第 7.5 组扩展）：客户端根模块 + 共享层 + 独立服务端。
+  // - 既有 10 个根模块保持检查（含退役墓碑 host_send.py：已无发送实现，仅保留说明，
+  //   仍列入以守住「不得复活旧发送通道」的检查面）；
+  // - shared/：插件侧与服务端共用的纯类型/账本/协议；service/：独立 SnowLuma 服务
+  //   （使用标准库 tomllib，要求 pythonVersion >= 3.11）；remote_client.py：插件侧
+  //   专用 HTTP 客户端。
+  "include": [
+    "config.py",
+    "plugin.py",
+    "clock.py",
+    "source_binding.py",
+    "send_material.py",
+    "forward_precheck.py",
+    "delivery_ledger.py",
+    "forward_delivery.py",
+    "host_send.py",
+    "auto_entry.py",
+    "remote_client.py",
+    "shared",
+    "service"
+  ],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "standard",
+  "reportMissingImports": "none"
+}

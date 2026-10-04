@@ -14,10 +14,8 @@ from delivery_ledger import (
     LEDGER_FILE_NAME,
     DeliveryKey,
     DeliveryLedger,
-    LedgerUnavailableError,
     open_ledger,
 )
-from forward_delivery import SourceSendResult
 from plugin import (
     PLANNER_AFTER_RESPONSE_HOOK,
     RECEIVE_AFTER_PROCESS_HOOK,
@@ -25,7 +23,7 @@ from plugin import (
     create_plugin,
 )
 
-from tests.fake_maibot_sdk import FakeChatCapability, FakePluginContext
+from tests.fake_maibot_sdk import FakePluginContext
 
 # 测试几何常量：会话、群号、平台与账号由夹具与用例共用。定义必须早于各构造函数，
 # 因为默认参数值在**定义时**求值。
@@ -110,28 +108,30 @@ def make_plugin(
     *,
     config: dict[str, Any] | None = None,
     clock: FakeClock | None = None,
-    send_source: Any = None,
-    open_ledger: Any = None,
+    transport_factory: Any = None,
+    environ: dict[str, str] | None = None,
+    request_timeout_seconds: float | None = None,
     storage_fault: bool = False,
+    ledger_opener: Any = None,
 ) -> tuple[CourierPlugin, FakePluginContext]:
-    """构造绕过 MaiBot 运行时的插件实例：注入可控时钟、替身发送步骤与上下文。
+    """经公开工厂注入直连传输、账本打开函数及受控时钟。
 
-    上下文经 SDK 的 `_set_context()` 注入（Runner 的同款入口，`ctx` 本身只读）；
-    `config` 为 None 时使用模型默认值（默认关闭）；`send_source` 为本组接缝替身
-    （需要替身上下文记录的替身由本函数自动 `bind`）。返回插件与上下文，
-    供用例同时断言插件结果与宿主能力调用。
+    只用 SDK 替身注入宿主上下文；不安装真实 SDK，配置默认保持关闭。
+    传输工厂接收纯连接描述，环境映射里的合成凭证只交给建连入口。
     """
 
-    plugin = create_plugin(
-        clock=clock or FakeClock(),
-        send_source=send_source,
-        open_ledger=open_ledger,
-    )
+    kwargs: dict[str, Any] = {
+        "clock": clock or FakeClock(),
+        "transport_factory": transport_factory,
+        "environ": environ,
+        "ledger_opener": ledger_opener,
+    }
+    if request_timeout_seconds is not None:
+        kwargs["request_timeout_seconds"] = request_timeout_seconds
+    plugin = create_plugin(**kwargs)
     plugin.set_plugin_config(config or {})
     ctx = FakePluginContext(data_dir, storage_fault=storage_fault)
     plugin._set_context(ctx)
-    if send_source is not None and hasattr(send_source, "bind"):
-        send_source.bind(ctx)
     return plugin, ctx
 
 
@@ -148,99 +148,6 @@ def prepare_source(
     ctx.message.store = {
         (SOURCE_SESSION_ID, message_id): source_message(message_id=message_id, raw_message=raw_message),
     }
-
-
-class RecordingSendStep:
-    """替身源发送步骤：经替身 `ctx.send` 记录一次发送，返回可控结果。
-
-    第 4 组不接通真实发送，因此用本替身表达「进入源发送」：按材料种类调用替身的
-    `ctx.send.forward` / `ctx.send.text`（`ctx.send.calls` 就是发送进入次数）。真实
-    通路（含图片、详细回执）在第 5 组替换本替身。
-
-    控制面：`status` / `target_message_id` / `reason` 覆盖返回结果；`on_enter` 在
-    记录发送前执行（供事务纪律用例在「网络等待」期间用第二个连接观察账本）；
-    `ctx.send.hold` 由用例在事件循环内赋值即可让发送悬停在途。
-    """
-
-    def __init__(
-        self,
-        *,
-        status: str = "sent",
-        target_message_id: str = "m-delivered-1",
-        reason: str = "",
-        on_enter: Any = None,
-    ) -> None:
-        self.status = status
-        self.target_message_id = target_message_id
-        self.reason = reason
-        self.on_enter = on_enter
-        self.entries: list[Any] = []
-        self._ctx: Any = None
-
-    def bind(self, ctx: Any) -> "RecordingSendStep":
-        """绑定替身上下文（`make_plugin` 自动调用）。"""
-
-        self._ctx = ctx
-        return self
-
-    async def __call__(self, prepared: Any) -> SourceSendResult:
-        self.entries.append(prepared)
-        if self.on_enter is not None:
-            self.on_enter()
-        if prepared.material.kind == "forward":
-            await self._ctx.send.forward(
-                list(prepared.material.nodes),
-                prepared.target.session_id,
-                return_details=True,
-            )
-        else:
-            await self._ctx.send.text(
-                "源消息",
-                prepared.target.session_id,
-                return_details=True,
-            )
-        return SourceSendResult(
-            status=self.status,
-            target_message_id=self.target_message_id,
-            reason=self.reason,
-        )
-
-
-class FailingLedger:
-    """账本替身：委托真实账本，但 `failing` 里的方法按注入方式「落盘失败」。
-
-    用于模拟「发送成功后状态落盘失败」与「占位未命中」：`failed_calls` 记录被
-    调用过的失败方法，供用例断言编排在落盘失败后没有继续评论段。
-
-    `failure_mode`：
-    - `"raise"`（默认）：抛 `LedgerUnavailableError`，模拟存储故障；
-    - `"false"`：返回 `False`，模拟没有可更新的在途占位。
-    """
-
-    def __init__(
-        self,
-        delegate: Any,
-        *,
-        failing: tuple[str, ...],
-        failure_mode: str = "raise",
-    ) -> None:
-        self._delegate = delegate
-        self._failing = set(failing)
-        self.failure_mode = failure_mode
-        self.failed_calls: list[str] = []
-
-    def __getattr__(self, name: str) -> Any:
-        if name in self._failing:
-
-            def failing_call(*args: Any, **kwargs: Any) -> bool:
-                del args, kwargs
-                self.failed_calls.append(name)
-                if self.failure_mode == "raise":
-                    raise LedgerUnavailableError("注入的状态库写入失败")
-                return False
-
-            return failing_call
-        return getattr(self._delegate, name)
 
 
 def components_of(plugin: Any) -> list[dict[str, Any]]:
@@ -431,17 +338,6 @@ async def apply_config_update(plugin: Any, config: dict[str, Any]) -> None:
     await plugin.on_config_update("self", dict(config), "")
 
 
-def expected_target_session_id(target_group_id: str = TARGET_GROUP_ID) -> str:
-    """替身 `chat.open_session` 为「可信来源账号 + 目标群」派生的目标会话 ID。"""
-
-    return FakeChatCapability._route_key(
-        SOURCE_PLATFORM,
-        target_group_id,
-        SOURCE_ACCOUNT_ID,
-        SOURCE_SCOPE,
-    )
-
-
 def ledger_key(
     *,
     message_id: str = "m-source-1",
@@ -550,7 +446,9 @@ def source_message(
         "message_info": {
             "group_info": {"group_id": group_id, "group_name": "测试源群"},
             "user_info": {"user_id": user_id, "user_nickname": "群友", "user_cardname": ""},
-            "additional_config": {"account_id": SOURCE_ACCOUNT_ID, "platform_io_scope": SOURCE_SCOPE},
+            "additional_config": {"account_id": SOURCE_ACCOUNT_ID, "platform_io_scope": SOURCE_SCOPE,
+                                  "self_id": SOURCE_ACCOUNT_ID, "platform_io_account_id": SOURCE_ACCOUNT_ID,
+                                  "napcat_message_type": "group", "client_type": "napcat"},
         },
         "raw_message": (
             [{"type": "text", "data": "源消息正文"}] if raw_message is None else list(raw_message)
@@ -752,15 +650,16 @@ def run_bound_forward(
 
 
 async def run_with_clock(plugin: Any, clock: FakeClock, arguments: dict[str, Any]) -> dict[str, Any]:
-    """驱动一次工具调用并在其登记等待时推进注入时钟（不真实等待）。"""
-
+    """让即时查询先完成，仅推进真正的短等待，不把动作看门狗当业务延迟。"""
     task = asyncio.create_task(plugin.forward_message(**arguments))
-    advanced = 0
-    for _ in range(1000):
+    advanced = len(clock.sleeps)
+    for index in range(5000):
         if task.done():
             return task.result()
         await asyncio.sleep(0)
-        for seconds in clock.sleeps[advanced:]:
-            clock.advance(seconds)
-        advanced = len(clock.sleeps)
+        if index % 50 == 49:
+            for seconds in clock.sleeps[advanced:]:
+                if seconds <= 0.5:
+                    clock.advance(seconds)
+            advanced = len(clock.sleeps)
     raise AssertionError("工具调用在推进注入时钟后仍未结束")

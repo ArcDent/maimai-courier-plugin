@@ -13,6 +13,12 @@ date: 2026-09-28
 
 用户已授权进入规格编写：新项目使用变更 `introduce-maimai-courier`，旧项目使用 `remove-cross-group-forward` 完整删除转发功能而非保留关闭壳。产品边界已确认；完整规划等待审阅，所以本 ADR 保持 proposed。当前没有业务实现，没有执行 Git 初始化或其他 Git 写操作。
 
+## 后续调整（2026-09-30）
+
+[ADR 0005](0005-separate-snowluma-forward-service.md) 已确认将 `forward_message` 的普通文字、图片、合并转发及评论全部迁移到新增独立服务器／客户端，并不再保证目标群 Maisaka 历史同步；这替代本记录中对应的宿主正常发送与历史保证。自动入口只唤起源群 Planner、由 Maisaka 决定是否调用工具的职责保持不变。
+
+**实现状态（2026-10-02）**：该迁移已在本仓库变更 `move-forwarding-to-snowluma-service` 中实现（插件侧客户端 + 独立服务 + 服务端账本，`host_send.py` 退役且无 fallback）；主规格 Purpose 的正式同步与真实 QQ 发群联验仍属待获准阶段，未执行。
+
 ## 取舍与证据
 
 旧方案的概率门禁、目标群票据和额外注入与新目标冲突，不为兼容旧行为继续保留；现有请求实现中的发送参数与消息归属校验可按需复用，不整包移植其查看资格和多轮恢复机制。

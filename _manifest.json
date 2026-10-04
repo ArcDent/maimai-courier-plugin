@@ -20,15 +20,16 @@
     "min_version": "2.8.0",
     "max_version": "2.99.99"
   },
-  "dependencies": [],
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "aiohttp",
+      "version_spec": ">=3.14.3"
+    }
+  ],
   "capabilities": [
     "message.get_by_id",
     "chat.get_all_streams",
-    "chat.open_session",
-    "send.text",
-    "send.image",
-    "send.hybrid",
-    "send.forward",
     "maisaka.proactive.trigger"
   ],
   "i18n": {

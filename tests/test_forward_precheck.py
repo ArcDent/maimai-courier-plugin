@@ -1,17 +1,20 @@
-"""第 3 组：工具权限与完整内容预检（统一经 `forward_message` 公共入口驱动）。
+"""公开工具权限与完整性预检：可信凭据、宿主归属、材料及目标白名单。
 
-用例只观察宿主能力调用、工具返回与组件声明；来源可信性由宿主
-`maisaka.planner.after_response` 注册 Hook 提供，工具调用参数一律经该 Hook 取得
-（模拟宿主链路，不直接调用私有函数）。
+装配改为直连客户端与本地账本，断言观察固定平台查询和发送，不再依赖旧 HTTP 协议。
+保留全部权限与材料边界，卡片内部不递归清洗，普通消息仍完整预检。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+
+import pytest
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+
+from tests.direct_support import make_direct_plugin
 
 from send_material import SendMaterial, UnsupportedContent, build_send_material
 
@@ -23,17 +26,11 @@ from source_binding import (
 )
 
 from tests.support import (
-    SOURCE_ACCOUNT_ID,
+    enabled_config,
     SOURCE_GROUP_ID,
-    SOURCE_PLATFORM,
-    SOURCE_SCOPE,
     SOURCE_SESSION_ID,
     TARGET_GROUP_ID,
-    FakeClock,
-    RecordingSendStep,
     at_segment,
-    enabled_config,
-    expected_target_session_id,
     find_tool,
     forward_node,
     forward_segment,
@@ -55,9 +52,6 @@ LONG_NUMERIC_ID = "1234567890123456789012345"
 # 生产代码应控制的消息查询键（替身补录的 stream_id 等不参与断言）。
 _MESSAGE_QUERY_KEYS = ("message_id", "chat_id", "include_binary_data")
 
-# 生产代码应控制的路由调用键（替身的 user_id 缺省值不参与断言）。
-_OPEN_SESSION_KEYS = ("capability", "platform", "chat_type", "group_id", "account_id", "scope")
-
 
 def _message_queries(ctx: Any) -> list[dict[str, Any]]:
     """投影消息查询调用，只取生产代码显式传入的键。"""
@@ -65,35 +59,82 @@ def _message_queries(ctx: Any) -> list[dict[str, Any]]:
     return [{key: call[key] for key in _MESSAGE_QUERY_KEYS} for call in ctx.message.calls]
 
 
-def _route_queries(ctx: Any) -> list[dict[str, Any]]:
-    """投影目标路由调用，只取生产代码显式传入的键。"""
+@pytest.fixture(autouse=True)
+def _close_direct_fixtures(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
+    """本模块的公共装配即使提前断言失败，也由 pytest 确定性关闭真实账本。"""
+    import sys
+    factory = make_direct_plugin
 
-    return [
-        {key: call[key] for key in _OPEN_SESSION_KEYS}
-        for call in ctx.chat.calls
-        if call["capability"] == "chat.open_session"
-    ]
+    def managed(*args, **kwargs):
+        fixture = factory(*args, **kwargs)
+        def close_and_verify():
+            import fcntl
+            from delivery_ledger import LedgerUnavailableError, STATE_LOCK_FILE_NAME
+            from tests.support import ledger_key
+            fixture.close()
+            with pytest.raises(LedgerUnavailableError):
+                fixture.ledger.get(ledger_key())
+            # 从文件锁公开边界证明已释放；目录可含本测试新增子目录，不冒充新装重开。
+            with (fixture.data_dir / STATE_LOCK_FILE_NAME).open("rb") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        request.addfinalizer(close_and_verify)
+        return fixture
+
+    monkeypatch.setattr(sys.modules[__name__], "make_direct_plugin", managed)
 
 
-def _plugin_with_step(
-    tmp_path: Path,
-    *,
-    config: dict[str, Any] | None = None,
-) -> tuple[Any, Any, RecordingSendStep]:
-    """构造注入记录替身发送步骤的插件，返回（插件, 上下文, 步骤替身）。
+def _direct_plugin(tmp_path: Path, **kwargs: Any) -> tuple[Any, Any, Any, Any]:
+    """返回真实插件、宿主上下文、固定动作替身与时钟，不启动远端服务。"""
 
-    预检用例用 `step.entries` 断言「请求是否进入发送接缝」：预检通过 → 恰好一次，
-    拒绝 → 零次。这样断言不依赖真实发送是否接通（替身返回成功的详细回执，结果面
-    的成功语义由接缝替身决定，第 5 组再用真实实现复验）。
-    """
+    fixture = make_direct_plugin(tmp_path, **kwargs)
+    return fixture.plugin, fixture.ctx, fixture.onebot, fixture.clock
 
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(
-        tmp_path,
-        config=config if config is not None else enabled_config(),
-        send_source=step,
-    )
-    return plugin, ctx, step
+
+# --------------------------------------------------------------------------- 直连4.1
+
+
+@pytest.mark.parametrize("message_id", ["-12345", "1234567890123456789012345", "platform-test-A"])
+def test_可信入站保留链建立查询标识而不改原消息ID(message_id):
+    from tests.snowluma_client_support import trusted_forward
+    from forward_precheck import PreparedForward
+
+    prepared = asyncio.run(trusted_forward(message_id=message_id))
+    assert isinstance(prepared, PreparedForward)
+    assert prepared.onebot_message_id == message_id
+    assert prepared.arguments.message_id == message_id
+
+
+@pytest.mark.parametrize("fault", ["wrong_id", "missing_session", "wrong_group", "wrong_platform", "missing_self", "wrong_self", "route_conflict", "private", "unknown_chain", "boolean_id"])
+def test_可信源映射不足或冲突在本地拒绝且不泄正文(fault):
+    from tests.snowluma_client_support import host_message, trusted_forward
+    from source_binding import Rejected
+
+    message = host_message()
+    metadata = message["message_info"]["additional_config"]
+    if fault == "wrong_id":
+        message["message_id"] = "-999"
+    elif fault == "missing_session":
+        message.pop("session_id")
+    elif fault == "wrong_group":
+        message["message_info"]["group_info"]["group_id"] = "333"
+    elif fault == "wrong_platform":
+        message["platform"] = "other"
+    elif fault == "missing_self":
+        metadata.pop("self_id")
+    elif fault == "wrong_self":
+        metadata["self_id"] = "99999"
+    elif fault == "route_conflict":
+        metadata["platform_io_account_id"] = "99999"
+    elif fault == "private":
+        metadata["napcat_message_type"] = "private"
+    elif fault == "unknown_chain":
+        message["message_info"]["additional_config"] = {"account_id": "10001"}
+    else:
+        message["message_id"] = True
+    result = asyncio.run(trusted_forward(message, extra={"onebot_message_id": "-12345"}))
+    assert isinstance(result, Rejected)
+    assert "宿主正文" not in result.reason
 
 
 # --------------------------------------------------------------------------- 3.1
@@ -121,7 +162,7 @@ def test_工具声明仅含三个公开字符串参数(tmp_path: Path) -> None:
 
 
 def test_参数缺失非法或类型不符时拒绝且不访问宿主(tmp_path: Path) -> None:
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
+    plugin, ctx, transport, _clock = _direct_plugin(tmp_path)
 
     cases: list[tuple[dict[str, Any], str]] = [
         ({}, "message_id"),
@@ -146,40 +187,33 @@ def test_参数缺失非法或类型不符时拒绝且不访问宿主(tmp_path: 
         assert expected_parameter in reason, (arguments, result)
         assert reason.strip(), (arguments, result)
 
+    assert transport.calls == [], "参数拒绝不得发起任何平台查询或发送"
     assert ctx.send.calls == [], "参数拒绝不得产生发送"
     assert ctx.message.calls == [], "参数拒绝不得查询消息"
     assert ctx.chat.calls == [], "参数拒绝不得访问会话"
 
 
 def test_长数字字符串ID按文本接受不丢精度(tmp_path: Path) -> None:
-    plugin, _ = make_plugin(tmp_path, config=enabled_config())
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
+    prepare_source(ctx, message_id=LONG_NUMERIC_ID)
 
-    result = asyncio.run(plugin.forward_message(message_id=LONG_NUMERIC_ID, target_group_id="20002"))
+    result, _ = run_bound_forward(plugin, message_id=LONG_NUMERIC_ID, clock=clock)
 
-    assert result["success"] is False
     assert "message_id" not in str(result["reason"]), "长数字字符串必须按文本接受，不得判为非法 ID"
+    assert [call["message_id"] for call in ctx.message.calls] == [LONG_NUMERIC_ID], (
+        "长数字字符串 ID 必须原样查询，任何数值转换都会丢精度"
+    )
+    prepare_body = transport.routing_observation()
+    assert prepare_body["source_message_id"] == LONG_NUMERIC_ID, "平台查询或发送必须原样携带长 ID"
 
 
 # --------------------------------------------------------------------------- 3.2
 
 
-def _prepare_source(
-    ctx: Any,
-    *,
-    raw_message: list[dict[str, Any]] | None = None,
-    message_id: str = "m-source-1",
-    **stream_overrides: Any,
-) -> None:
-    """装配一条可信来源会话与其源消息（宿主查询面替身）。"""
-
-    prepare_source(ctx, raw_message=raw_message, message_id=message_id, **stream_overrides)
-
-
 def test_绑定可信来源后按可信会话查询源消息(tmp_path: Path) -> None:
-    plugin, ctx, step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
 
-    _, arguments = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    _, arguments = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
     assert any(
         call["capability"] == "chat.get_all_streams" and call["platform"] == "all_platforms"
@@ -192,25 +226,24 @@ def test_绑定可信来源后按可信会话查询源消息(tmp_path: Path) -> 
             "include_binary_data": True,
         }
     ], "必须按可信会话 ID 限定查询并携带二进制材料"
-    assert len(step.entries) == 1, "预检通过必须恰好进入一次发送接缝（与真实发送实现无关）"
+    assert transport.count("get_group_list") == 1, "预检通过必须恰好发起一次直连准备"
     assert SOURCE_TOKEN_FIELD in arguments, "工具调用应携带 Hook 签发的一次性凭据"
 
 
 def test_长消息ID按字符串原样查询不丢精度(tmp_path: Path) -> None:
-    plugin, ctx, step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx, message_id=LONG_NUMERIC_ID)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
+    prepare_source(ctx, message_id=LONG_NUMERIC_ID)
 
-    run_bound_forward(plugin, message_id=LONG_NUMERIC_ID, target_group_id=TARGET_GROUP_ID)
+    run_bound_forward(plugin, message_id=LONG_NUMERIC_ID, target_group_id=TARGET_GROUP_ID, clock=clock)
 
     assert [call["message_id"] for call in ctx.message.calls] == [LONG_NUMERIC_ID], (
         "长数字字符串 ID 必须原样查询，任何数值转换都会丢精度"
     )
-    assert len(step.entries) == 1
+    assert transport.count("get_group_list") == 1
 
 
 def test_凭据表达到容量上限后淘汰最旧凭据(tmp_path: Path) -> None:
-    plugin, ctx, step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
 
     oldest = issue_source_call(plugin, message_id="m-source-1")
     for _ in range(MAX_PENDING_BINDINGS):
@@ -219,18 +252,16 @@ def test_凭据表达到容量上限后淘汰最旧凭据(tmp_path: Path) -> Non
     stale = asyncio.run(plugin.forward_message(**oldest))
     assert stale["success"] is False, "最旧凭据必须已按容量上限淘汰"
     assert "来源" in str(stale["reason"]), stale
+    assert transport.count("get_group_list") == 0, "被淘汰的凭据不得进入直连准备"
 
     fresh = asyncio.run(plugin.forward_message(**newest))
-    # 「最新凭据仍可用」的证据是它换到了可信来源、通过预检并进入发送接缝一次；
-    # 被淘汰的最旧凭据没有进入接缝（entries 仍为 1）。
     assert fresh.get("material_shape") == ["text"], "容量上限内最新的凭据必须仍可换取可信来源并通过预检"
     assert "来源" not in str(fresh["reason"]), fresh
-    assert len(step.entries) == 1
+    assert transport.count("get_group_list") == 1, "只有最新凭据那一次可以进入直连准备"
 
 
 def test_凭据缺失伪造或错配时拒绝且不查询消息(tmp_path: Path) -> None:
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-    _prepare_source(ctx)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
 
     # 1) 完全没有凭据（模型直接构造调用）
     missing = asyncio.run(
@@ -257,15 +288,16 @@ def test_凭据缺失伪造或错配时拒绝且不查询消息(tmp_path: Path) 
         assert "来源" in str(result["reason"]), (label, result)
     assert ctx.message.calls == [], "缺少可信来源时不得查询源消息"
     assert ctx.send.calls == [], "拒绝路径不得产生任何发送"
+    assert transport.calls == [], "缺少可信来源时不得发起任何平台查询或发送"
 
-    # 4) 一次性凭据被重复消费：中间这次是合法调用（第 5 组起真正走发送链）
-    run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    # 4) 一次性凭据被重复消费：中间这次是合法调用（真正进入直连准备）
+    run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
     replayed = asyncio.run(plugin.forward_message(**arguments))
 
     assert replayed["success"] is False, replayed
     assert "来源" in str(replayed["reason"]), replayed
     assert len(ctx.message.calls) == 1, "只有凭据匹配的那一次调用可以查询源消息"
-    assert len(ctx.send.calls) == 1, "恰好只有那一次合法调用产生发送"
+    assert transport.count("get_group_list") == 1, "恰好只有那一次合法调用进入直连准备"
 
 
 def test_来源会话不可验证时拒绝(tmp_path: Path) -> None:
@@ -275,44 +307,46 @@ def test_来源会话不可验证时拒绝(tmp_path: Path) -> None:
         ("非QQ平台", [source_stream(platform="telegram")], "QQ"),
         ("来源账号缺失", [source_stream(account_id="")], "账号"),
     ]
-    for label, streams, expected in cases:
-        plugin, ctx = make_plugin(tmp_path, config=enabled_config())
+    for index, (label, streams, expected) in enumerate(cases):
+        plugin, ctx, transport, clock = _direct_plugin(tmp_path / f"invalid-source-{index}")
         ctx.chat.streams = streams
         ctx.message.store = {(SOURCE_SESSION_ID, "m-source-1"): source_message()}
 
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
         assert result["success"] is False, (label, result)
         assert expected in str(result["reason"]), (label, result)
         assert ctx.message.calls == [], (label, "来源未通过时不得查询消息")
+        assert transport.calls == [], (label, "来源未通过时不得发起平台查询或发送")
         assert ctx.send.calls == []
 
 
 def test_来源群不在白名单时拒绝且不查询消息(tmp_path: Path) -> None:
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(source_groups=("10555",)))
-    _prepare_source(ctx)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path, source_groups=("10555",))
 
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
     assert result["success"] is False
     assert "白名单" in str(result["reason"])
     assert ctx.message.calls == []
+    assert transport.calls == []
     assert ctx.send.calls == []
 
 
 def test_非QQ平台来源明确拒绝(tmp_path: Path) -> None:
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-    _prepare_source(ctx, platform="telegram")
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
+    prepare_source(ctx, platform="telegram")
 
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
     assert result["success"] is False
     assert "QQ" in str(result["reason"])
     assert ctx.message.calls == []
+    assert transport.calls == []
 
 
 def test_越权源消息被拒绝且不泄露正文(tmp_path: Path) -> None:
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
     ctx.chat.streams = [source_stream()]
     secret = "越权群里的机密正文"
     ctx.message.store = {
@@ -329,29 +363,30 @@ def test_越权源消息被拒绝且不泄露正文(tmp_path: Path) -> None:
         ),
     }
 
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
     assert result["success"] is False
     assert secret not in json.dumps(result, ensure_ascii=False), "拒绝结果不得泄露越权消息正文"
     assert ctx.message.calls[0]["chat_id"] == SOURCE_SESSION_ID, "查询必须限定在可信来源会话"
+    assert transport.calls == []
     assert ctx.send.calls == []
 
 
 def test_不可定位源消息明确拒绝(tmp_path: Path) -> None:
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
     ctx.chat.streams = [source_stream()]
     ctx.message.store = {}
 
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
     assert result["success"] is False
     assert "消息" in str(result["reason"])
+    assert transport.calls == []
     assert ctx.send.calls == []
 
 
 def test_模型伪造的会话平台与账号字段不能覆盖宿主来源(tmp_path: Path) -> None:
-    plugin, ctx, step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
     arguments = issue_source_call(plugin, message_id="m-source-1")
 
     forged = {
@@ -373,7 +408,7 @@ def test_模型伪造的会话平台与账号字段不能覆盖宿主来源(tmp_
             "include_binary_data": True,
         }
     ], "伪造字段不得改变按可信来源会话的查询"
-    assert len(step.entries) == 1, "伪造字段不得阻止合法调用进入发送接缝"
+    assert transport.count("get_group_list") == 1, "伪造字段不得阻止合法调用进入直连准备"
 
 
 # --------------------------------------------------------------------------- 3.3
@@ -381,22 +416,22 @@ def test_模型伪造的会话平台与账号字段不能覆盖宿主来源(tmp_
 
 def test_宿主查询失败时拒绝且不发送(tmp_path: Path) -> None:
     # 会话表读取失败（Runner 侧 RuntimeException 语义）
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-    _prepare_source(ctx)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path / "stream-failed")
     ctx.chat.raise_on_get_all_streams = RuntimeError("会话表不可用")
-    stream_failed, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    stream_failed, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
     assert stream_failed["success"] is False
     assert "来源会话" in str(stream_failed["reason"])
     assert ctx.message.calls == []
+    assert transport.calls == []
     assert ctx.send.calls == []
 
     # 消息读取失败
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-    _prepare_source(ctx)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path / "message-failed")
     ctx.message.raise_on_get_by_id = RuntimeError("消息库不可用")
-    message_failed, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    message_failed, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
     assert message_failed["success"] is False
     assert "源消息" in str(message_failed["reason"])
+    assert transport.calls == []
     assert ctx.send.calls == []
 
 
@@ -405,119 +440,81 @@ def test_目标群白名单与源群自身被拒绝(tmp_path: Path) -> None:
         (SOURCE_GROUP_ID, "源群"),
         ("30003", "白名单"),
     ]
-    for target_group_id, expected in cases:
-        plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-        _prepare_source(ctx)
+    for index, (target_group_id, expected) in enumerate(cases):
+        plugin, ctx, transport, clock = _direct_plugin(tmp_path / f"denied-target-{index}")
 
         result, _ = run_bound_forward(
             plugin,
             message_id="m-source-1",
             target_group_id=target_group_id,
+            clock=clock,
         )
 
         assert result["success"] is False, (target_group_id, result)
         assert expected in str(result["reason"]), (target_group_id, result)
-        assert all(
-            call["capability"] != "chat.open_session" for call in ctx.chat.calls
-        ), (target_group_id, "目标未授权时不得解析路由")
+        assert transport.calls == [], (target_group_id, "目标未授权时不得发起任何平台查询或发送")
         assert ctx.send.calls == []
 
 
-def test_目标路由不可验证时拒绝(tmp_path: Path) -> None:
-    # 1) 宿主返回失败
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-    _prepare_source(ctx)
-    ctx.chat.open_session_result = {"success": False, "error": "路由不可用"}
-    failed, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-    assert failed["success"] is False
-    assert "路由" in str(failed["reason"])
+def test_目标可用性不再依赖宿主发送会话(tmp_path: Path) -> None:
+    """目标平台可用性由认证服务核对；客户端不再解析/要求宿主目标发送会话。"""
+
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
+
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
+
+    assert result["success"] is True, result
+    assert all(call["capability"] != "chat.open_session" for call in ctx.chat.calls), (
+        "客户端不得再解析目标发送会话（目标可用性以直连客户端核验为准）",
+        ctx.chat.calls,
+    )
+    assert transport.count("get_group_list") == 1, "本地预检通过后直接提交直连准备"
+
+
+def test_直连客户端拒绝目标不可用时不产生发送(tmp_path: Path) -> None:
+    """直连客户端按自己的身份与名册上限拒绝目标：客户端如实转达且零发送。"""
+
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
+    transport.groups = []
+
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
+
+    assert result["status"] == "rejected", result
+    assert "target_unavailable" in str(result["reason"]), result
+    assert "本次未发送任何消息" in str(result["reason"]), result
+    assert transport.send_count == 0, "准备被拒绝不得进入源阶段"
     assert ctx.send.calls == []
-
-    # 2) 宿主调用抛异常
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-    _prepare_source(ctx)
-    ctx.chat.raise_on_open_session = RuntimeError("路由调用失败")
-    crashed, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-    assert crashed["success"] is False
-    assert "路由" in str(crashed["reason"])
-    assert ctx.send.calls == []
-
-    # 3) 返回的会话缺少可确认的会话 ID
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-    _prepare_source(ctx)
-    ctx.chat.open_session_stream = {
-        "platform": SOURCE_PLATFORM,
-        "group_id": TARGET_GROUP_ID,
-        "account_id": SOURCE_ACCOUNT_ID,
-        "scope": SOURCE_SCOPE,
-        "is_group_session": True,
-    }
-    missing_id, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-    assert missing_id["success"] is False
-    assert "路由" in str(missing_id["reason"])
-    assert ctx.send.calls == []
-
-
-def test_目标路由账号平台或群号不一致时拒绝(tmp_path: Path) -> None:
-    cases: list[tuple[str, dict[str, Any]]] = [
-        ("平台", {"platform": "telegram"}),
-        ("账号", {"account_id": "99998"}),
-        ("群号", {"group_id": "99999"}),
-    ]
-    for expected, overrides in cases:
-        plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-        _prepare_source(ctx)
-        ctx.chat.open_session_stream = source_stream(
-            **{"session_id": "s-route", "group_id": TARGET_GROUP_ID, **overrides}
-        )
-
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-        assert result["success"] is False, (expected, result)
-        assert expected in str(result["reason"]), (expected, result)
-        assert ctx.send.calls == []
 
 
 def test_合法调用只选择指定目标群且不广播(tmp_path: Path) -> None:
-    plugin, ctx, step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
 
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
-    assert ctx.chat.calls[:1] == [
-        {"capability": "chat.get_all_streams", "platform": "all_platforms"},
-    ], f"应先按全平台会话表解析可信来源: {ctx.chat.calls}"
-    assert _route_queries(ctx) == [
-        {
-            "capability": "chat.open_session",
-            "platform": SOURCE_PLATFORM,
-            "chat_type": "group",
-            "group_id": TARGET_GROUP_ID,
-            "account_id": SOURCE_ACCOUNT_ID,
-            "scope": SOURCE_SCOPE,
-        },
-    ], f"应按可信账号只解析指定目标群，不广播: {ctx.chat.calls}"
-    assert len(step.entries) == 1, "合法调用必须恰好进入一次发送接缝，不广播"
-    assert "路由" not in str(result["reason"]), "合法路由不得判为不可验证"
+    assert result["success"] is True, result
+    prepare_body = transport.routing_observation()
+    assert prepare_body["target_group_id"] == TARGET_GROUP_ID, "只应提交指定目标群，不广播"
+    assert transport.count("get_group_list") == 1, "合法调用恰好提交一次准备"
+    assert transport.send_count == 1, "合法调用恰好进入一次源阶段"
 
 
-def test_陈旧历史会话不会被直接当作当前路由(tmp_path: Path) -> None:
-    plugin, ctx, step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx)
-    # 会话表里存在同群但属于其它账号的历史会话：不得直接拿它当当前路由。
+def test_陈旧历史会话不再参与目标路由(tmp_path: Path) -> None:
+    """会话表里的历史目标会话不再被当作路由依据（目标可用性由直连客户端核对）。"""
+
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
     ctx.chat.streams = [
         source_stream(),
         source_stream(session_id="s-stale-target", group_id=TARGET_GROUP_ID, account_id="99998"),
     ]
 
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
-    route_calls = [call for call in ctx.chat.calls if call["capability"] == "chat.open_session"]
-    assert len(route_calls) == 1, f"只应解析一条目标路由: {ctx.chat.calls}"
-    assert route_calls[0]["account_id"] == SOURCE_ACCOUNT_ID, "必须按可信来源账号构造路由"
-    assert route_calls[0]["group_id"] == TARGET_GROUP_ID
-    assert "账号" not in str(result["reason"]), "不得使用其它账号的历史会话充当路由"
-    assert len(step.entries) == 1, "合法路由必须只进入一次发送接缝"
+    assert result["success"] is True, result
+    assert [call["capability"] for call in ctx.chat.calls] == ["chat.get_all_streams"], (
+        "目标路由不得依赖宿主历史会话",
+        ctx.chat.calls,
+    )
+    assert transport.count("get_group_list") == 1
 
 
 # --------------------------------------------------------------------------- 3.4
@@ -533,14 +530,13 @@ def test_完整文字图片与混合消息预检通过且保持原形态(tmp_pat
     ]
     for index, (raw_message, expected_kind, expected_shape) in enumerate(cases):
         # 每个用例独立 data_dir：注入替身后每次调用都会真正投递，同一账本会跨用例防重。
-        plugin, ctx, step = _plugin_with_step(tmp_path / f"case-{index}")
-        _prepare_source(ctx, raw_message=raw_message)
+        plugin, ctx, transport, clock = _direct_plugin(tmp_path / f"case-{index}", raw_message=raw_message)
 
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
-        # 断言与真实发送是否接通解耦：预检通过 → 恰好进入一次发送接缝（结果面的成功
-        # 语义由接缝替身决定），这里核对的是预检输出的材料原形态。
-        assert len(step.entries) == 1, (expected_kind, "预检通过必须进入发送接缝", step.entries)
+        # 断言与服务是否真正接通解耦：预检通过 → 恰好一次直连准备；这里核对的是
+        # 本地预检输出的材料原形态（逐段类型与顺序一致）。
+        assert transport.count("get_group_list") == 1, (expected_kind, "预检通过必须进入直连准备")
         assert result["send_kind"] == expected_kind, (expected_kind, result)
         assert result["material_shape"] == expected_shape, (
             expected_kind,
@@ -557,17 +553,19 @@ def test_缺失媒体与不支持段在任何发送副作用前整条拒绝(tmp_
         ("视频段", [{"type": "dict", "data": {"type": "video", "data": "视频材料"}}], "video"),
         ("混入不支持段", [text_segment("正常文本"), {"type": "voice", "data": "语音"}], "voice"),
     ]
-    for label, raw_message, expected_type in cases:
-        plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-        _prepare_source(ctx, raw_message=raw_message)
+    for index, (label, raw_message, expected_type) in enumerate(cases):
+        plugin, ctx, transport, clock = _direct_plugin(
+            tmp_path / f"unsupported-{index}", raw_message=raw_message
+        )
 
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
         assert result["success"] is False, (label, result)
         reason = str(result["reason"])
         assert expected_type in reason, (label, result)
         assert "第 2 段" in reason or len(raw_message) == 1, (label, "原因需定位到段序", result)
         assert "material_shape" not in result, (label, "拒绝时不得声称已准备完整材料")
+        assert transport.calls == [], (label, "本地拒绝不得发起任何平台查询或发送")
         assert ctx.send.calls == [], (label, "拒绝不得产生任何发送副作用")
 
 
@@ -577,21 +575,25 @@ def test_空内容或结构异常的消息整条拒绝(tmp_path: Path) -> None:
         ("结构异常", ["不是字典"]),
         ("文本段结构异常", [{"type": "text", "data": 123}]),
     ]
-    for label, raw_message in cases:
-        plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-        _prepare_source(ctx, raw_message=raw_message)
+    for index, (label, raw_message) in enumerate(cases):
+        plugin, ctx, transport, clock = _direct_plugin(
+            tmp_path / f"broken-{index}", raw_message=raw_message
+        )
 
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
         assert result["success"] is False, (label, result)
         assert str(result["reason"]).strip(), (label, result)
+        assert transport.calls == [], (label,)
         assert ctx.send.calls == []
 
 
 # --------------------------------------------------------------------------- 3.5
 
 
-def test_完整合并转发准备完整聊天记录卡片(tmp_path: Path) -> None:
+def test_完整合并转发只准备资源引用形状(tmp_path: Path) -> None:
+    """卡片本地只判顶层形状：资源引用与内部节点都来自可信源消息，不由客户端提交。"""
+
     nodes = (
         forward_node(
             content=[text_segment("节点一正文"), image_segment()],
@@ -607,10 +609,7 @@ def test_完整合并转发准备完整聊天记录卡片(tmp_path: Path) -> Non
             message_id="m-node-2",
         ),
     )
-    clock = FakeClock()
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), clock=clock, send_source=step)
-    _prepare_source(ctx, raw_message=[forward_segment(*nodes)])
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path, raw_message=[forward_segment(*nodes)])
 
     result, _ = run_bound_forward(
         plugin,
@@ -620,107 +619,104 @@ def test_完整合并转发准备完整聊天记录卡片(tmp_path: Path) -> Non
         clock=clock,
     )
 
-    # 断言与真实发送是否接通解耦：预检通过 → 恰好进入一次发送接缝（卡片材料由替身
-    # 发送，评论段属第 5 组）；这里核对的是预检输出的卡片原形态。
-    assert len(step.entries) == 1, "预检通过必须进入发送接缝"
+    assert transport.count("get_group_list") == 1, "预检通过必须进入直连准备"
     assert result["send_kind"] == "forward"
-    assert result["material_shape"] == [{"forward": [["text", "image"], ["text"]]}], (
-        "卡片必须按节点顺序保留全部段，且评论不得塞进任何原作者节点"
+    assert result["material_shape"] == ["forward"], (
+        "卡片材料摘要只表示「一张卡片」，不含节点正文与内部结构（免本地递归）"
     )
+    prepare_body = [transport.calls, transport.sent]
+    rendered = json.dumps(prepare_body, ensure_ascii=False)
+    for internal in ("节点一正文", "节点二正文", "m-node-1", "乙的群名片"):
+        assert internal not in rendered, (
+            "卡片内部节点与作者不得由客户端提交给直连客户端",
+            internal,
+            prepare_body,
+        )
 
 
-def test_合并转发节点占位文本整条拒绝(tmp_path: Path) -> None:
-    """宿主把空节点降级成占位文本（`message_utils.py:312-317`，字面量 `:317`）。
+def test_卡片内部占位与不支持段不再触发本地递归拒绝(tmp_path: Path) -> None:
+    """宿主节点不完整、内部含不支持段/媒体缺失：不是本地拒绝理由（design D3/D9）。"""
 
-    真实链路里插件拿不到空 `content`：宿主在解析期就换成了占位文本，DB 回读也
-    无法还原原文（`message_component_data_model.py:359` 的节点内容非空断言）。
-    因此这种节点必须整条拒绝，不能当作普通文本转发。
-    """
-
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-    _prepare_source(
-        ctx,
-        raw_message=[forward_segment(forward_node(content=[text_segment("[empty forward node]")]))],
-    )
-
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-
-    assert result["success"] is False, result
-    assert "占位" in str(result["reason"]), ("必须说明是宿主占位文本，原文不可恢复", result)
-    assert "material_shape" not in result, "占位文本不是可恢复原文，不得声称已准备完整卡片"
-    assert ctx.send.calls == []
-
-
-def test_合并转发节点含不可用媒体或不支持段时整条拒绝(tmp_path: Path) -> None:
-    cases: list[tuple[str, list[dict[str, Any]], str]] = [
+    cases: list[tuple[str, list[dict[str, Any]]]] = [
+        (
+            "占位文本节点",
+            [forward_segment(forward_node(content=[text_segment("[empty forward node]")]))],
+        ),
         (
             "节点图片缺媒体",
             [forward_segment(forward_node(content=[image_segment(binary_data_base64=None)]))],
-            "图片",
         ),
         (
-            "节点语音段",
-            [forward_segment(forward_node(content=[{"type": "voice", "data": "语音"}]))],
-            "voice",
-        ),
-        (
-            "节点文件段",
-            [forward_segment(forward_node(content=[{"type": "file", "data": {"name": "x.bin"}}]))],
-            "file",
+            "节点语音与文件段",
+            [
+                forward_segment(
+                    forward_node(
+                        content=[
+                            {"type": "voice", "data": "语音"},
+                            {"type": "file", "data": {"name": "x.bin"}},
+                        ]
+                    )
+                )
+            ],
         ),
         (
             "节点混入未知段",
             [forward_segment(forward_node(content=[text_segment("正常"), {"type": "weird", "data": 1}]))],
-            "weird",
         ),
         (
             "节点内容为空",
             [forward_segment(forward_node(content=[]))],
-            "节点",
         ),
     ]
-    for label, raw_message, expected in cases:
-        plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-        _prepare_source(ctx, raw_message=raw_message)
+    for index, (label, raw_message) in enumerate(cases):
+        plugin, _ctx, transport, clock = _direct_plugin(
+            tmp_path / f"card-internal-{index}", raw_message=raw_message
+        )
 
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
-        assert result["success"] is False, (label, result)
-        assert expected in str(result["reason"]), (label, result)
-        assert "material_shape" not in result, (label, "拒绝时不得声称已准备完整卡片")
-        assert ctx.send.calls == [], (label, "拒绝不得产生任何发送副作用")
+        assert result["success"] is True, (label, "卡片内部结构不构成本地拒绝理由", result)
+        assert result["send_kind"] == "forward", (label, result)
+        assert transport.count("get_group_list") == 1, (label, "必须进入直连准备")
+        # 卡片内部内容既不进入发送材料，也不出现在客户端提交里。
+        assert result["material_shape"] == ["forward"], (label, result)
 
 
-def test_合并转发与其它段混排或未展开时整条拒绝(tmp_path: Path) -> None:
-    cases: list[tuple[str, list[dict[str, Any]], str]] = [
-        (
-            "与文本混排",
-            [text_segment("说明"), forward_segment(forward_node())],
-            "混排",
-        ),
-        (
-            "未展开的转发",
-            [{"type": "dict", "data": {"type": "forward", "data": [{"content": []}]}}],
-            "未展开",
-        ),
-        (
-            "没有节点",
-            [forward_segment()],
-            "节点",
-        ),
+def test_顶层卡片混排仍在本地拒绝而未展开卡片按卡片处理(tmp_path: Path) -> None:
+    """顶层混排无法保持卡片形态 → 本地整条拒绝；未展开卡片（dict 包装）仍是卡片。"""
+
+    mixed_cases: list[tuple[str, list[dict[str, Any]]]] = [
+        ("与文本混排", [text_segment("说明"), forward_segment(forward_node())]),
+        ("文本在卡片后", [forward_segment(forward_node()), text_segment("说明")]),
+        ("两张卡片", [forward_segment(forward_node()), forward_segment(forward_node())]),
     ]
-    for label, raw_message, expected in cases:
-        plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-        _prepare_source(ctx, raw_message=raw_message)
+    for index, (label, raw_message) in enumerate(mixed_cases):
+        plugin, ctx, transport, clock = _direct_plugin(
+            tmp_path / f"mixed-{index}", raw_message=raw_message
+        )
 
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
-        assert result["success"] is False, (label, result)
-        assert expected in str(result["reason"]), (label, result)
+        assert result["status"] == "rejected", (label, result)
+        assert "混排" in str(result["reason"]), (label, result)
+        assert "本次未发送任何消息" in str(result["reason"]), (label, result)
+        assert transport.calls == [], (label, "本地拒绝不得发起平台查询或发送")
         assert ctx.send.calls == []
 
+    # 未展开卡片（宿主 `DictComponent` 序列化形态）仍按卡片处理、进入直连准备。
+    plugin, _ctx, transport, clock = _direct_plugin(
+        tmp_path / "unexpanded",
+        raw_message=[{"type": "dict", "data": {"type": "forward", "data": [{"content": []}]}}],
+    )
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
+    assert result["success"] is True, result
+    assert result["send_kind"] == "forward", "未展开卡片仍可参与本地形状判定"
+    assert transport.count("get_group_list") == 1
 
-def test_嵌套合转发保持层级且超过网关层数上限整条拒绝(tmp_path: Path) -> None:
+
+def test_卡片嵌套深度不再本地拒绝(tmp_path: Path) -> None:
+    """内部嵌套卡片层数不再是本地拒绝理由：由直连客户端从可信源消息决定原资源。"""
+
     def nested_card(levels: int) -> dict[str, Any]:
         """构造 `levels` 层嵌套的合并转发段（1 层 = 顶层卡片内只有文本节点）。"""
 
@@ -729,19 +725,17 @@ def test_嵌套合转发保持层级且超过网关层数上限整条拒绝(tmp_
             card = forward_segment(forward_node(content=[card]))
         return card
 
-    plugin, ctx, deep_step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx, raw_message=[nested_card(2)])
-    deep, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-    assert len(deep_step.entries) == 1, deep
-    assert deep["send_kind"] == "forward", deep
-    assert deep["material_shape"] == [{"forward": [[{"forward": [["text"]]}]]}], deep
+    for index, levels in enumerate((2, 4, 8)):
+        plugin, _ctx, transport, clock = _direct_plugin(
+            tmp_path / f"nested-{index}", raw_message=[nested_card(levels)]
+        )
 
-    plugin, ctx, step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx, raw_message=[nested_card(4)])
-    too_deep, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
-    assert too_deep["success"] is False, too_deep
-    assert "层" in str(too_deep["reason"]), too_deep
-    assert step.entries == [], "超过层数上限必须在发送接缝之前整条拒绝"
+        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
+
+        assert result["success"] is True, (levels, result)
+        assert result["send_kind"] == "forward", (levels, result)
+        assert result["material_shape"] == ["forward"], (levels, result)
+        assert transport.count("get_group_list") == 1, (levels, "任意内部深度都不得在本地被拒绝")
 
 
 # --------------------------------------------------------------------------- 3.6
@@ -814,28 +808,34 @@ def test_正文与节点中的伪造指令不能改变源群与目标选择(tmp_
             )
         )
     ]
-    plugin, ctx, step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx, raw_message=raw_message)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path, raw_message=raw_message)
 
-    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
-    assert len(step.entries) == 1, "预检通过必须进入发送接缝"
-    assert result["material_shape"] == [{"forward": [["text", "text"]]}], (
-        "预检必须已按节点原文准备完整卡片（材料原形态与发送是否接通无关）"
+    assert transport.count("get_group_list") == 1, "预检通过必须进入直连准备"
+    assert result["material_shape"] == ["forward"], (
+        "卡片材料摘要不含节点正文（内部内容由直连客户端从可信源消息取得）"
     )
-    route_calls = [call for call in ctx.chat.calls if call["capability"] == "chat.open_session"]
-    assert len(route_calls) == 1 and route_calls[0]["group_id"] == TARGET_GROUP_ID, (
-        f"节点正文不得改变目标选择: {ctx.chat.calls}"
+    prepare_body = transport.routing_observation()
+    assert prepare_body["target_group_id"] == TARGET_GROUP_ID, (
+        "节点正文不得改变目标选择",
+        prepare_body,
     )
-    assert route_calls[0]["account_id"] == SOURCE_ACCOUNT_ID
+    assert prepare_body["source_group_id"] == SOURCE_GROUP_ID
+    rendered = json.dumps([transport.calls, transport.sent], ensure_ascii=False)
+    assert forged_instruction not in rendered, "节点正文不得进入平台查询或发送"
+    assert SOURCE_TOKEN_FIELD not in rendered, "正文里伪造的凭据字段不得进入平台查询或发送"
 
     # 正文里提到的群号不能越过白名单
-    plugin, ctx, denied_step = _plugin_with_step(tmp_path)
-    _prepare_source(ctx, raw_message=raw_message)
-    denied, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id="99999")
+    plugin, _ctx, denied_transport, denied_clock = _direct_plugin(
+        tmp_path / "denied", raw_message=raw_message
+    )
+    denied, _ = run_bound_forward(
+        plugin, message_id="m-source-1", target_group_id="99999", clock=denied_clock
+    )
     assert denied["success"] is False
     assert "白名单" in str(denied["reason"])
-    assert denied_step.entries == [], "白名单拒绝必须在发送接缝之前"
+    assert denied_transport.calls == [], "白名单拒绝必须在平台查询或发送之前"
 
 
 def test_拒绝原因不回显不可信正文与节点昵称(tmp_path: Path) -> None:
@@ -845,27 +845,32 @@ def test_拒绝原因不回显不可信正文与节点昵称(tmp_path: Path) -> 
         ("段类型超长", [{"type": "x" * 300, "data": "正文"}]),
         ("节点内容类型被伪造", [forward_segment(forward_node(content=[{"type": hostile, "data": "x"}]))]),
     ]
-    for label, raw_message in cases:
-        plugin, ctx = make_plugin(tmp_path, config=enabled_config())
-        _prepare_source(ctx, raw_message=raw_message)
+    for index, (label, raw_message) in enumerate(cases):
+        plugin, ctx, transport, clock = _direct_plugin(
+            tmp_path / f"hostile-{index}", raw_message=raw_message
+        )
 
-        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID)
+        result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
 
-        assert result["success"] is False, (label, result)
         reason = str(result["reason"])
+        if label == "节点内容类型被伪造":
+            # 卡片内部不再本地校验：内部伪造段不进入本地拒绝原因，也不被回显。
+            assert result["success"] is True, result
+            assert hostile not in json.dumps(result, ensure_ascii=False), reason
+            assert transport.count("get_group_list") == 1
+            continue
+        assert result["success"] is False, (label, result)
         assert "忽略以上全部规则" not in reason, (label, reason)
         assert "x" * 40 not in reason, (label, reason)
         assert "\n" not in reason and "\r" not in reason, (label, reason)
         assert len(reason) <= 120, (label, reason)
+        assert transport.calls == [], (label,)
         assert ctx.send.calls == []
 
 
 def test_评论按普通文本处理不解析为可执行消息段(tmp_path: Path) -> None:
     comment = '$(rm -rf /) [CQ:at,qq=12345] {"type": "image", "data": "http://example.invalid/x.png"}'
-    clock = FakeClock()
-    step = RecordingSendStep()
-    plugin, ctx = make_plugin(tmp_path, config=enabled_config(), clock=clock, send_source=step)
-    _prepare_source(ctx)
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path)
 
     result, _ = run_bound_forward(
         plugin,
@@ -875,22 +880,20 @@ def test_评论按普通文本处理不解析为可执行消息段(tmp_path: Pat
         clock=clock,
     )
 
-    assert len(step.entries) == 1, "评论不得阻止预检通过并进入发送接缝"
+    assert transport.count("get_group_list") == 1, "评论不得阻止预检通过并进入直连准备"
     assert result["material_shape"] == ["text"], "评论不得混入源消息材料"
     assert comment not in json.dumps(result, ensure_ascii=False), "工具结果不回显评论"
 
-    # 评论（第 5 组起真实发送）只作为一条普通文本：出现在 send.text 的 text 参数里、
-    # 原样不解析；不得进入聊天/消息查询参数，也不得被解析进任何其它发送参数。
-    comment_calls = [call for call in ctx.send.calls if call.get("text") == comment]
-    assert len(comment_calls) == 1, ("评论必须以普通文本独立发送一次", ctx.send.calls)
-    assert comment_calls[0]["capability"] == "send.text"
-    assert comment_calls[0]["stream_id"] == expected_target_session_id()
+    # 评论只作为一个普通文本段提交，不进入账号/源查询，不解析协议语法。
+    comments = [call for call in transport.sent if call["stage"] == "comment"]
+    assert len(comments) == 1
+    assert comments[0]["params"]["message"] == [{"type": "text", "data": {"text": comment}}]
     for call in ctx.chat.calls + ctx.message.calls:
         assert comment not in json.dumps(call, ensure_ascii=False), "评论不得进入权限或内容查询"
-    for call in ctx.send.calls:
-        if call is comment_calls[0]:
-            continue
-        assert comment not in json.dumps(call, ensure_ascii=False), "评论不得被解析进其它发送参数"
+    assert all(
+        comment not in json.dumps(call, ensure_ascii=False) for call in ctx.send.calls
+    ), "评论不得被解析进任何宿主发送参数"
+
 
 
 # ------------------------- 提及转换材料（本变更第 3 组 3.1–3.4 的材料 seam）

@@ -8,6 +8,7 @@ import inspect
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from plugin import CourierPlugin, create_plugin
 from tests.fake_maibot_sdk import SDK_ROOT_EXPORTS
@@ -80,20 +81,16 @@ def test_manifest_声明独立插件与已核实能力() -> None:
     assert manifest["manifest_version"] == 2
     assert manifest["id"] == "arcdent.maimai-courier-plugin"
     assert manifest["version"] == "0.1.0"
-    assert manifest["dependencies"] == []
-    # 能力名逐一在 Host src/plugin_runtime/capabilities/registry.py 核实（第 1 组证据）；
-    # 能力随插件整体声明、由第 3–7 组逐步消费，Hook 名称不是能力，不进本列表。
-    # 第 3 组新增消费 `chat.get_all_streams`（registry.py:50，用于解析可信来源会话）。
-    # 第 5 组新增消费 `send.image` / `send.hybrid`（registry.py:35-36，图片与图文混排
-    # 的发送通路，与 `send.text` / `send.forward` 同属已核实的 send 能力族）。
+    # 直连仍复用 1.5 核实的 aiohttp 下限；插件依赖只经清单声明，
+    # 旧服务项目环境的隔离归第 7 组，不是插件加载的依赖入口。
+    assert manifest["dependencies"] == [
+        {"type": "python_package", "name": "aiohttp", "version_spec": ">=3.14.3"}
+    ]
+    # 直连不增加 api.call、send.*、chat.open_session 或反向监听能力。
+    # 工具声明保持三个公开参数；连接地址和凭证引用均不暴露给模型。
     assert set(manifest["capabilities"]) == {
         "message.get_by_id",
         "chat.get_all_streams",
-        "chat.open_session",
-        "send.text",
-        "send.image",
-        "send.hybrid",
-        "send.forward",
         "maisaka.proactive.trigger",
     }
     assert manifest["sdk"] == {"min_version": "2.8.0", "max_version": "2.99.99"}
@@ -135,3 +132,98 @@ def test_注入可控时钟后总开关关闭不产生等待与发送(tmp_path: 
     assert result["success"] is False
     assert ctx.send.calls == []
     assert clock.sleeps == [], "总开关关闭时不得经注入时钟登记任何等待"
+
+
+def test_全部支持类型与故障路径都不调用宿主旧发送通道(tmp_path: Path) -> None:
+    """所有支持材料、评论及故障均只走直连；宿主旧发送计数始终为零。"""
+
+    from tests.direct_support import make_direct_plugin
+    from tests.support import forward_node, forward_segment, image_segment, run_bound_forward, text_segment
+
+    raw_messages: list[list[dict[str, Any]]] = [
+        [text_segment("普通文字")],
+        [image_segment()],
+        [text_segment("配文"), image_segment()],
+        [forward_segment(forward_node())],
+    ]
+    for index, raw_message in enumerate(raw_messages):
+        fixture = make_direct_plugin(tmp_path / f"type-{index}", raw_message=raw_message)
+        result, _ = run_bound_forward(
+            fixture.plugin, message_id="m-source-1", comment="附带评论", clock=fixture.clock
+        )
+        assert result["status"] == "sent", (index, result)
+        assert fixture.old_send_calls() == [], (index, "新投递路径不得调用宿主旧发送通道")
+        assert {call["capability"] for call in fixture.ctx.chat.calls} <= {"chat.get_all_streams"}, (
+            index,
+            "不得再解析宿主目标发送会话",
+            fixture.ctx.chat.calls,
+        )
+        fixture.close()
+
+    # 故障路径同样零旧通道调用：服务不可达与本地拒绝。
+    unavailable = make_direct_plugin(tmp_path / "unavailable")
+    async def unavailable_action(name, value):
+        raise RuntimeError("合成连接不可达")
+    unavailable.onebot.on_action = unavailable_action
+    rejected, _ = run_bound_forward(unavailable.plugin, message_id="m-source-1")
+    assert rejected["success"] is False
+    assert unavailable.old_send_calls() == []
+    unavailable.close()
+
+    local_reject = make_direct_plugin(tmp_path / "local-reject", raw_message=[{"type": "voice", "data": "v"}])
+    rejected, _ = run_bound_forward(local_reject.plugin, message_id="m-source-1")
+    assert rejected["status"] == "rejected"
+    assert local_reject.old_send_calls() == []
+    local_reject.close()
+
+
+def test_直连默认关闭或缺配置不构造连接且仍注册三组件(tmp_path: Path) -> None:
+    from tests.support import enabled_config, prepare_source, run_bound_forward
+
+    for index, config in enumerate(({}, enabled_config())):
+        constructed = []
+        plugin, ctx = make_plugin(tmp_path / str(index), config=config,
+                                  transport_factory=lambda connection: constructed.append(connection), environ={})
+        asyncio.run(plugin.on_load())
+        asyncio.run(plugin.observe_received_message(**merged_forward_message()))
+        prepare_source(ctx)
+        result, _ = run_bound_forward(plugin)
+        assert result["status"] == "rejected"
+        assert constructed == []
+        assert ctx.send.calls == []
+        assert len(plugin.get_components()) == 3
+        assert set(find_tool(plugin)["metadata"]["parameters_raw"]) == {"type", "properties", "required"}
+        asyncio.run(plugin.on_unload())
+
+
+def test_生产代码不含旧发送或宿主旁路调用() -> None:
+    """6.9：生产代码不直接调用宿主发送、数据库、上下文追加或第二个同路由网关。"""
+
+    forbidden_prefixes = ("ctx.send", "ctx.api", "ctx.database", "ctx.gateway", "ctx.maisaka.context")
+    forbidden_calls = {"send.text", "send.image", "send.hybrid", "send.forward"}
+    offenders: list[str] = []
+
+    def dotted(node: ast.AST) -> str:
+        parts: list[str] = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return ".".join(reversed(parts))
+
+    for path in _production_files():
+        if path.name == "host_send.py":
+            continue  # 旧实现保留但已退出调用图（无 fallback），不算调用点
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            expression = ""
+            if isinstance(node, ast.Call):
+                expression = dotted(node.func)
+            elif isinstance(node, ast.Attribute):
+                expression = dotted(node)
+            if not expression:
+                continue
+            if expression.startswith(forbidden_prefixes) or expression in forbidden_calls:
+                offenders.append(f"{path.name}:{expression}")
+    assert offenders == [], f"生产代码出现旧发送或宿主旁路调用: {sorted(set(offenders))}"

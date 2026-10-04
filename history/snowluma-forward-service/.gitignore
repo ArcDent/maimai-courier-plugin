@@ -1,0 +1,7 @@
+# Python 缓存与测试产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 本地私有手册与运维笔记（含本机信息），不进公开仓库
+.local/

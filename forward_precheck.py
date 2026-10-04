@@ -1,16 +1,19 @@
-"""转发请求的权限与内容预检（不发送任何消息）。
+"""转发请求的权限与内容预检（本地、不发送任何消息，design D2/D9）。
 
-工具入口只负责总开关与结果封装，本模块按固定顺序完成预检：
+工具入口只负责总开关与结果封装，本模块按固定顺序完成**本地**预检：
 
 1. 三参数类型校验（ID 一律按字符串处理，禁止数值换算）；
 2. 用一次性凭据换回可信 Planner 会话（拒绝模型伪造的会话/平台/授权字段）；
-3. 校验来源为 QQ 群聊且在源白名单，并按可信会话查询源消息归属；
-4. 校验目标群白名单、非源群自身，并核对目标路由的账号与平台；
-5. 校验完整发送材料（含合并转发节点递归预检）。
+3. 校验来源为 QQ 群聊且在源白名单，并按可信会话查询源消息归属与可读性；
+4. 校验目标群白名单、不同于源群（**不再要求宿主目标发送会话**：目标平台与账号
+   可用性由认证服务独立核对）；
+5. 构建材料摘要：普通消息继续做完整内容预检（含提及文本化与不支持段拒绝），
+   **合并转发卡片不走本地递归节点校验**（只判形状；内部资源是否可用由服务端从
+   可信源消息取得并决定，design D3/D9）。
 
-任一步失败都在产生发送副作用前整条拒绝，拒绝原因统一经 `Rejected.not_sent`
-补「本次未发送任何消息」定尾；全部通过时返回 `PreparedForward`，由后续实现组
-接通实际发送。
+任一步失败都在产生任何发送副作用前整条拒绝，拒绝原因统一经 `Rejected.not_sent`
+补「本次未发送任何消息」定尾；全部通过时返回 `PreparedForward`，由客户端投递编排
+（`forward_delivery.py`）交给认证服务执行。
 """
 
 from __future__ import annotations
@@ -18,7 +21,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .send_material import SendMaterial, UnsupportedContent, build_send_material
+from .shared.identifiers import verbatim_identifier
+from .send_material import SendMaterial, UnsupportedContent, build_send_material, is_forward_card
 from .source_binding import (
     ForwardArguments,
     Rejected,
@@ -31,6 +35,12 @@ QQ_PLATFORM = "qq"
 
 ALL_PLATFORMS = "all_platforms"
 """宿主 `chat.get_all_streams` 的全平台取值（`data.py:_list_sessions`）。"""
+
+CARD_MATERIAL_KIND = "forward"
+"""合并转发卡片的材料种类（`send_material.SendKind` 的同名字面量）。"""
+
+CARD_MATERIAL_SHAPE: tuple[str, ...] = ("forward",)
+"""卡片材料摘要的结构指纹：只表示「一张卡片」，不含节点正文与内部结构。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,34 +55,34 @@ class SourceSession:
 
 
 @dataclass(frozen=True, slots=True)
-class TargetRoute:
-    """可信目标路由：由来源平台/账号/作用域与白名单目标群构造。"""
+class MaterialDigest:
+    """材料结构摘要：只含种类与结构指纹（不含正文），满足结果渲染的结构面。
 
-    session_id: str
-    group_id: str
-    platform: str
-    account_id: str
-    scope: str
+    普通消息直接用 `send_material.SendMaterial`；合并转发卡片只记形状，避免在
+    本地递归展开节点（design D3）。
+    """
+
+    kind: str
+    shape: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedForward:
-    """预检通过的可发送计划。
+    """预检通过的可发送计划（本地不发送，交由认证服务执行）。
 
-    实际发送（第 5 组）直接复用这里的材料与目标路由：`material.segments` 是普通
-    消息的段序列，`material`（合并转发）含节点卡片，`target.session_id` 是核对过
-    账号与平台的目标会话。
+    `material` 只用于工具结果的 `send_kind` / `material_shape` 展示；源消息正文与
+    资源标识不由客户端提交给服务端（服务端从可信源消息自行取得，design D2）。
     """
 
     arguments: ForwardArguments
     source: SourceSession
-    target: TargetRoute
-    material: SendMaterial
+    material: SendMaterial | MaterialDigest
+    onebot_message_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
 class _StreamFields:
-    """宿主会话字典的归一字段（同一口径供来源与目标路由共用）。"""
+    """宿主会话字典的归一字段（来源会话解析用）。"""
 
     session_id: str
     platform: str
@@ -103,9 +113,10 @@ async def precheck_forward_request(
     bindings: SourceBindingTable,
     arguments: Mapping[str, Any],
 ) -> PreparedForward | Rejected:
-    """按顺序完成权限与内容预检；全部通过时返回 `PreparedForward`。
+    """按顺序完成本地权限与内容预检；全部通过时返回 `PreparedForward`。
 
-    任一步失败都在产生发送副作用前整条拒绝；本函数不发送任何消息。
+    任一步失败都在产生发送副作用前整条拒绝；本函数不发送任何消息，也不访问任何
+    网络服务。
     """
 
     parsed = parse_forward_arguments(arguments)
@@ -135,15 +146,64 @@ async def precheck_forward_request(
     if not target_is_allowed(config, parsed.target_group_id):
         return Rejected.not_sent("目标群不在目标白名单内")
 
-    route = await _open_target_route(ctx, source, parsed.target_group_id)
-    if isinstance(route, Rejected):
-        return route
+    onebot_message_id = _mapped_source_id(message, parsed.message_id, source)
+    if not onebot_message_id:
+        return Rejected.not_sent("源消息归属或 OneBot 入站对应信息不足，无法确认源消息标识")
 
-    material = build_send_material(message.get("raw_message"))
+    material = _material_digest(message.get("raw_message"))
+    if isinstance(material, Rejected):
+        return material
+
+    return PreparedForward(arguments=parsed, source=source, material=material, onebot_message_id=onebot_message_id)
+
+
+def _mapped_source_id(message: Mapping[str, Any], message_id: str, source: SourceSession) -> str:
+    """按核实附件02核对宿主保留链；格式合法本身从不授予身份。"""
+    if (not verbatim_identifier(message_id) or message.get("message_id") != message_id
+            or message.get("session_id") != source.session_id or message.get("platform") != "qq"):
+        return ""
+    info = message.get("message_info")
+    if not isinstance(info, Mapping):
+        return ""
+    group = info.get("group_info")
+    metadata = info.get("additional_config")
+    if not isinstance(group, Mapping) or not isinstance(metadata, Mapping):
+        return ""
+    # 比较平台整数时只转十进制文本；查询 ID 与账本键均不重编码。
+    def identity(value: object) -> str:
+        return verbatim_identifier(str(value)) if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+    if (identity(group.get("group_id")) != source.group_id
+            or identity(metadata.get("self_id")) != source.account_id
+            or metadata.get("napcat_message_type") != "group"
+            or not verbatim_identifier(metadata.get("client_type"))):
+        return ""
+    if any(key in metadata and identity(metadata[key]) != source.account_id
+           for key in ("platform_io_account_id", "account_id", "bot_account")):
+        return ""
+    return message_id
+
+
+def _material_digest(raw_message: Any) -> SendMaterial | MaterialDigest | Rejected:
+    """构建材料摘要：卡片只判顶层形状（免本地递归），普通消息仍做完整内容预检。
+
+    卡片只检查**顶层**形态：唯一一张卡片（含宿主未展开的 `dict` 包装）可以免去本地
+    递归节点校验，内部资源是否可用由服务端从可信源消息决定；但卡片与其它顶层内容
+    混排无法保持卡片形态，在本地即整条拒绝（design D3 的既有规则，不是递归校验）。
+    """
+
+    if not isinstance(raw_message, list) or not raw_message:
+        return Rejected.not_sent("源消息没有可发送的内容段")
+    cards = [segment for segment in raw_message if is_forward_card(segment)]
+    if cards:
+        if len(raw_message) != 1:
+            return Rejected.not_sent(
+                "合并转发卡片与其它顶层内容混排，无法保持卡片形态，整条拒绝"
+            )
+        return MaterialDigest(kind=CARD_MATERIAL_KIND, shape=CARD_MATERIAL_SHAPE)
+    material = build_send_material(raw_message)
     if isinstance(material, UnsupportedContent):
         return Rejected.not_sent(material.reason)
-
-    return PreparedForward(arguments=parsed, source=source, target=route, material=material)
+    return material
 
 
 async def _resolve_source_session(ctx: Any, session_id: str) -> SourceSession | Rejected:
@@ -215,8 +275,8 @@ async def _fetch_source_message(
 def whitelist_entries(values: Any) -> tuple[str, ...]:
     """把配置白名单归一成去空白字符串序列（字符串化、丢弃空值、保持配置顺序）。
 
-    工具侧预检、评论/源发送前的权限复验与自动入口共用本口径：用户可能手工编辑
-    配置文件，判定不得因为一处实现只接受 `str` 而在另一处接受字符串化结果。
+    工具侧预检、权限复验与自动入口共用本口径：用户可能手工编辑配置文件，判定不得
+    因为一处实现只接受 `str` 而在另一处接受字符串化结果。
     """
 
     try:
@@ -235,58 +295,8 @@ def source_group_is_allowed(config: Any, group_id: str) -> bool:
 def target_is_allowed(config: Any, target_group_id: str) -> bool:
     """目标群是否仍在目标白名单内。
 
-    预检、源发送前的权限复验与「评论发送前的权限复验」共用同一口径：复验必须读
-    发送时的最新配置，不得使用调用开始时的旧快照。
+    预检、源阶段授权前的复验与评论阶段授权前的复验共用同一口径：复验必须读提交
+    时的最新配置，不得使用调用开始时的旧快照。
     """
 
     return str(target_group_id).strip() in set(whitelist_entries(config.scope.target_groups))
-
-
-async def _open_target_route(
-    ctx: Any,
-    source: SourceSession,
-    target_group_id: str,
-) -> TargetRoute | Rejected:
-    """打开（或取回）目标群会话，并核对平台、账号与群号一致。
-
-    只按「可信来源账号 + 白名单目标群」构造路由，不按群号遍历历史会话：同群但
-    属于其它账号的既有会话不会被当作当前路由；冷会话由宿主在这里创建，后续发送
-    直接复用该路由。
-    """
-
-    try:
-        response = await ctx.chat.open_session(
-            platform=source.platform,
-            chat_type="group",
-            group_id=target_group_id,
-            account_id=source.account_id,
-            scope=source.scope,
-        )
-    except Exception:
-        return Rejected.not_sent("无法验证目标群路由")
-
-    if not isinstance(response, dict) or not response.get("success"):
-        return Rejected.not_sent("无法验证目标群路由")
-    stream = response.get("stream")
-    if not isinstance(stream, dict):
-        stream = response
-    if not stream.get("is_group_session"):
-        return Rejected.not_sent("目标路由不是群聊会话")
-
-    fields = _stream_fields(stream)
-    if not fields.session_id:
-        return Rejected.not_sent("目标群路由缺少可确认的会话 ID")
-    if fields.platform != source.platform:
-        return Rejected.not_sent("目标路由平台与来源平台不一致")
-    if fields.group_id != target_group_id:
-        return Rejected.not_sent("目标路由群号与指定目标群不一致")
-    if fields.account_id != source.account_id:
-        return Rejected.not_sent("目标路由账号与来源账号不一致")
-
-    return TargetRoute(
-        session_id=fields.session_id,
-        group_id=target_group_id,
-        platform=source.platform,
-        account_id=source.account_id,
-        scope=fields.scope,
-    )

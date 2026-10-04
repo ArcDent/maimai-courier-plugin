@@ -35,6 +35,17 @@ from .forward_precheck import (
     whitelist_entries,
 )
 from .send_material import is_forward_card
+from .shared.identifiers import (
+    IDENTIFIER_FORBIDDEN_CHARACTERS,
+    MAX_IDENTIFIER_LENGTH,
+    safe_identifier,
+)
+
+# 标识符规则的**唯一定义**在共享层 `shared/identifiers.py`：服务端请求校验与
+# 载荷派生 ID（消息 ID / 会话 ID）共用同一实现，本模块不复制规则（design D9）。
+# `safe_identifier` 在本模块实际使用（候选筛选）；`MAX_IDENTIFIER_LENGTH` 与
+# `IDENTIFIER_FORBIDDEN_CHARACTERS` 只随导入保留在本模块名字面上（全仓无其他
+# 引用），属既有兼容面，不是本模块的二次定义。
 
 ACCOUNT_ID_KEYS: Final[tuple[str, ...]] = (
     "platform_io_account_id",
@@ -93,17 +104,6 @@ DEFAULT_SHARE_CRITERIA: Final[str] = CourierConfig().auto.share_criteria
 
 MAX_DISPLAY_NAME_LENGTH: Final[int] = 80
 """群名显示文本的长度上限：超长名称截断，避免不可信文本无界膨胀意图。"""
-
-MAX_IDENTIFIER_LENGTH: Final[int] = 128
-"""载荷派生标识符（消息 ID / 会话 ID）的长度上限：超出即放弃候选。"""
-
-IDENTIFIER_FORBIDDEN_CHARACTERS: Final[frozenset[str]] = frozenset('<>"`')
-"""载荷派生标识符禁止出现的字符（尖括号、双引号、反引号）。
-
-这些字符串会原样进入主动任务意图（模型上下文的一段文本），尖括号能闭合宿主的
-`<plugin_proactive_task>` 包装、引号能破坏「参数=值」的写法。遇到这类形态直接
-放弃候选，而不是净化成另一个字符串：否则模型拿到的 ID 与真实消息对不上。
-"""
 
 CandidateType = MessageType
 """自动候选类型：直接复用配置的同一词汇别名（design D2/D3 单一来源）。
@@ -164,24 +164,6 @@ def _text(value: Any) -> str:
     """取字符串值并去掉首尾空白（其余类型一律视为空）。"""
 
     return value.strip() if isinstance(value, str) else ""
-
-
-def safe_identifier(raw: Any) -> str:
-    """校验载荷派生的标识符（消息 ID / 会话 ID）：安全可引用时返回原文，否则空串。
-
-    只接受非空、限长、无空白与控制字符、且不含 `IDENTIFIER_FORBIDDEN_CHARACTERS`
-    的字符串；不合格一律返回空串，由调用方放弃候选——标识符必须原样可用（既进
-    意图，也进宿主查询），不能悄悄替换成别的字符串。
-    """
-
-    text = _text(raw)
-    if not text or len(text) > MAX_IDENTIFIER_LENGTH:
-        return ""
-    if any(character.isspace() or ord(character) < 32 for character in text):
-        return ""
-    if IDENTIFIER_FORBIDDEN_CHARACTERS.intersection(text):
-        return ""
-    return text
 
 
 def _pick_account_id(*mappings: Any) -> str:
