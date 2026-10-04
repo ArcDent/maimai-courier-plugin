@@ -569,6 +569,50 @@ def test_缺失媒体与不支持段在任何发送副作用前整条拒绝(tmp_
         assert ctx.send.calls == [], (label, "拒绝不得产生任何发送副作用")
 
 
+@pytest.mark.parametrize(
+    "label,raw_message",
+    [
+        ("纯引用被引用的卡片", [{"type": "reply", "data": {"id": "m-card-quoted"}}]),
+        ("引用加正文", [{"type": "reply", "data": {"id": "m-card-quoted"}}, text_segment("看看这个")]),
+        ("引用加非卡片形状", [{"type": "reply", "data": {"id": "m-card-quoted"}},
+                        {"type": "dict", "data": {"type": "json", "data": "卡片材料"}}]),
+    ],
+)
+def test_引用段消息拒绝并指向被引用卡片自身的消息ID(tmp_path: Path, label: str, raw_message: list) -> None:
+    """群里「回复聊天记录卡片」的消息宿主侧只有 reply 段：整条拒绝且不泄露正文。
+
+    真实现场最常见的误用形态：气泡里显示被引用卡片的预览，模型把这条回复消息的 ID
+    当成卡片消息 ID 传进来。拒绝原因必须可定位（reply 段序）并说明下一步（改用被
+    引用卡片自身的消息 ID），零平台查询、零发送。
+    """
+
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path / label, raw_message=raw_message)
+
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
+
+    reason = str(result["reason"])
+    assert result["status"] == "rejected", (label, result)
+    assert "reply" in reason and "引用" in reason and "第 1 段" in reason, (label, reason)
+    assert "卡片自身的消息 ID" in reason, (label, reason)
+    assert "本次未发送任何消息" in reason, (label, reason)
+    assert "看看这个" not in reason and "卡片材料" not in reason, (label, "拒绝原因不得回显正文")
+    assert transport.calls == [], (label, "本地拒绝不得发起任何平台查询或发送")
+    assert ctx.send.calls == [], (label, "拒绝不得产生任何发送副作用")
+
+
+def test_引用后面的真卡片仍按顶层混排拒绝(tmp_path: Path) -> None:
+    """对照：卡片段本身出现在顶层时走既有混排口径，不被引用分支抢先解释。"""
+
+    raw_message = [{"type": "reply", "data": {"id": "m-quoted"}}, forward_segment(forward_node())]
+    plugin, ctx, transport, clock = _direct_plugin(tmp_path / "reply-card", raw_message=raw_message)
+
+    result, _ = run_bound_forward(plugin, message_id="m-source-1", target_group_id=TARGET_GROUP_ID, clock=clock)
+
+    assert result["status"] == "rejected", result
+    assert "混排" in str(result["reason"]), result
+    assert transport.calls == []
+
+
 def test_空内容或结构异常的消息整条拒绝(tmp_path: Path) -> None:
     cases: list[tuple[str, list[Any]]] = [
         ("没有内容段", []),

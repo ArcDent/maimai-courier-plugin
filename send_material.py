@@ -133,6 +133,9 @@ _SAFE_SEGMENT_LABEL = re.compile(r"[a-z0-9_]{1,16}\Z")
 _AT_SEGMENT_TYPE = "at"
 """宿主提及段的类型名（`message_utils.py:134-142` 的唯一序列化出口）。"""
 
+_REPLY_SEGMENT_TYPE = "reply"
+"""宿主引用（回复）段的类型名：只作消息装饰，不能随消息整体转发。"""
+
 # 提及格式与压平规则只定义在 shared/mentions.py；本模块分别映射宿主和 OneBot 字段。
 
 SendKind = Literal["text", "image", "mixed", "forward"]
@@ -301,6 +304,16 @@ def _build_segments(
             continue
         if _is_unexpanded_forward(item):
             return UnsupportedContent(f"{segment_location}是未展开的合并转发（宿主未能恢复节点）")
+
+        if segment_type == _REPLY_SEGMENT_TYPE:
+            # 引用段是消息装饰，不是可随消息整体转发的内容：群里「回复聊天记录卡片」
+            # 的那条消息在气泡里显示被引用卡片的预览，宿主侧却只有 reply 段。这里给出
+            # 可定位原因与下一步（改用被引用卡片自身的消息 ID），不读取或回显被引用内容。
+            return UnsupportedContent(
+                f"{segment_location}是引用（{_REPLY_SEGMENT_TYPE}）消息段，不支持随消息整体转发"
+                + ("；要转发被引用的合并转发卡片，请使用该卡片自身的消息 ID" if depth == 0 else "")
+                + "，无法完整转发"
+            )
 
         return UnsupportedContent(f"{segment_location}类型 {_segment_label(item)} 无法完整发送")
     return _assemble_segments(pieces)
