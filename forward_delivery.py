@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from typing import Callable
 
-from .clock import Clock
+from .shared.clock import Clock
 from .delivery_ledger import DeliveryLedger, DeliveryRecord, LedgerUnavailable, LedgerUnavailableError
 from .forward_precheck import PreparedForward
 from .shared.delivery import (DeliveryKey, LedgerStatus, SendStatus,

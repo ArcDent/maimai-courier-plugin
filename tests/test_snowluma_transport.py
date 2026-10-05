@@ -1,997 +1,556 @@
-"""第3组：仅经公开传输方法与本地合成 WebSocket 验收。"""
+"""固定动作 HTTP 传输：安全闸门、错误分类与关闭语义。
+
+断言面只经公开导出（`OneBotTransport` / `OneBotUnresolved` / `OneBotUnavailable` /
+`AiohttpOneBotTransport`）与注入点（`session_factory` / `resolver` / `clock` /
+`environ`），不访问传输内部状态，不触真实网络。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
+from typing import Any
 
 import pytest
 
 pytest.importorskip("aiohttp")
-from aiohttp import WSMsgType, web
+import aiohttp
+from aiohttp import web
 
 from maimai_courier_plugin import snowluma_transport as transport
-from tests.snowluma_transport_support import CancellationGate, MemorySession, MemorySocket, endpoint, reply, spin_until
-from tests.support import FakeClock
+from tests.snowluma_transport_support import (
+    HangingSession, MemoryResponse, MemorySession, RecordingFactory, http_endpoint,
+)
+from tests.support import FakeClock, envelope, spin_until
+
+ENDPOINT = "http://127.0.0.1:3000"
+"""替身固定回环地址；连接由回环端点或会话替身承担，不触公网。"""
+
+CONNECTION_TOKEN = "synthetic-config-token"
+"""合成配置令牌；真实凭证绝不进入测试或仓库。"""
 
 
-def client(url, **kwargs):
-    return transport.AiohttpOneBotTransport(
-        transport.OneBotConnection(url, "TEST_ONEBOT_TOKEN"),
-        environ={"TEST_ONEBOT_TOKEN": "synthetic-not-a-production-token"},
-        **kwargs,
+def memory_transport(
+    session: MemorySession, *, connection: transport.OneBotConnection | None = None,
+    clock: FakeClock | None = None, resolver: Any = None, environ: dict[str, str] | None = None,
+) -> tuple[transport.AiohttpOneBotTransport, RecordingFactory]:
+
+    factory = RecordingFactory(session)
+    client = transport.AiohttpOneBotTransport(
+        connection or transport.OneBotConnection(ENDPOINT, "TEST_ONEBOT_TOKEN", CONNECTION_TOKEN),
+        clock=clock, environ=environ if environ is not None else {},
+        session_factory=factory, resolver=resolver,
     )
+    return client, factory
 
 
-@pytest.mark.parametrize("token, reference, environ, expected", [
-    ("synthetic-config-token", "", {}, "synthetic-config-token"),
-    ("synthetic-config-token", "TEST_ONEBOT_TOKEN", {"TEST_ONEBOT_TOKEN": "unused"}, "synthetic-config-token"),
-    ("", "TEST_ONEBOT_TOKEN", {"TEST_ONEBOT_TOKEN": "synthetic-env-token"}, "synthetic-env-token"),
+def test_解析只读受控配置() -> None:
+
+    empty = transport.resolve_onebot_connection({"snowluma": {"http_url": ""}}, {})
+    assert isinstance(empty, transport.OneBotUnresolved) and not empty.config_failure
+
+    wrong_scheme = transport.resolve_onebot_connection({"snowluma": {"http_url": "ws://127.0.0.1:3001/onebot"}}, {})
+    assert isinstance(wrong_scheme, transport.OneBotUnresolved) and wrong_scheme.config_failure
+
+    public = transport.resolve_onebot_connection({"snowluma": {"http_url": "http://8.8.8.8:3000"}}, {})
+    assert isinstance(public, transport.OneBotUnresolved) and public.config_failure
+
+    missing = transport.resolve_onebot_connection(
+        {"snowluma": {"http_url": "http://127.0.0.1:3000", "token": "", "token_env_var": "TEST_ONEBOT_TOKEN"}}, {},
+    )
+    assert isinstance(missing, transport.OneBotUnresolved) and missing.config_failure
+
+    resolved = transport.resolve_onebot_connection(
+        {"snowluma": {"http_url": "http://127.0.0.1:3000", "token": CONNECTION_TOKEN, "token_env_var": ""}}, {},
+    )
+    assert isinstance(resolved, transport.OneBotConnection)
+    assert resolved.endpoint == "http://127.0.0.1:3000" and resolved.token == CONNECTION_TOKEN
+    assert CONNECTION_TOKEN not in repr(resolved), "连接描述不得回显令牌"
+
+    from_env = transport.resolve_onebot_connection(
+        {"snowluma": {"http_url": "http://127.0.0.1:3000", "token": " \t\n", "token_env_var": "TEST_ONEBOT_TOKEN"}},
+        {"TEST_ONEBOT_TOKEN": "synthetic-env-token"},
+    )
+    assert isinstance(from_env, transport.OneBotConnection)
+    assert from_env.token == "" and from_env.token_env_var == "TEST_ONEBOT_TOKEN"
+
+
+@pytest.mark.parametrize("token, env_var, environ, expected", [
+    (CONNECTION_TOKEN, "", {}, CONNECTION_TOKEN),
+    (CONNECTION_TOKEN, "TEST_ONEBOT_TOKEN", {"TEST_ONEBOT_TOKEN": "synthetic-env-secret"}, CONNECTION_TOKEN),
     (" \t\n", "TEST_ONEBOT_TOKEN", {"TEST_ONEBOT_TOKEN": "synthetic-env-token"}, "synthetic-env-token"),
+    ("", "TEST_ONEBOT_TOKEN", {"TEST_ONEBOT_TOKEN": "synthetic-env-token"}, "synthetic-env-token"),
 ])
-def test_配置令牌与环境变量按优先级用于真实握手(token, reference, environ, expected):
-    async def scenario():
-        received = []
-        async def handler(request):
+def test_配置令牌优先且空白仅在请求前回退环境变量(token, env_var, environ, expected) -> None:
+
+    async def scenario() -> None:
+        received: list[str | None] = []
+
+        async def handler(request: web.Request) -> web.Response:
             received.append(request.headers.get("Authorization"))
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            async for frame in ws:
-                await reply(ws, json.loads(frame.data), {"user_id": "10000"})
-            return ws
-        async with endpoint(handler) as url:
-            connection = transport.resolve_onebot_connection({"snowluma": {
-                "websocket_url": url, "token": token, "token_env_var": reference,
-            }}, environ)
-            assert isinstance(connection, transport.OneBotConnection)
-            t = transport.AiohttpOneBotTransport(connection, environ=environ)
+            return web.json_response(envelope({"user_id": "10000"}))
+
+        async with http_endpoint(handler) as url:
+            client = transport.AiohttpOneBotTransport(
+                transport.OneBotConnection(url, env_var, token), environ=environ,
+            )
             try:
-                assert (await t.get_login_info())["data"] == {"user_id": "10000"}
+                assert (await client.get_login_info())["data"] == {"user_id": "10000"}
             finally:
-                await t.close()
+                await client.close()
         assert received == [f"Bearer {expected}"]
+
     asyncio.run(scenario())
 
 
-def test_配置令牌认证失败不回显也不改用环境凭证(caplog):
-    async def scenario():
-        seen = []
-        async def handler(request):
-            seen.append(request.headers.get("Authorization"))
-            return web.Response(status=401, text="synthetic-config-secret")
-        async with endpoint(handler) as url:
-            t = transport.AiohttpOneBotTransport(
-                transport.OneBotConnection(url, "TEST_ONEBOT_TOKEN", "synthetic-config-secret"),
+@pytest.mark.parametrize("token, env_var, category", [
+    (" \t", "TEST_ONEBOT_TOKEN", "credentials"),
+    (" \t", "1INVALID", "configuration"),
+])
+def test_凭证缺失或环境变量名非法在发出请求前拒绝(token, env_var, category) -> None:
+    async def scenario() -> None:
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200))
+        client, _ = memory_transport(
+            session, connection=transport.OneBotConnection(ENDPOINT, env_var, token), environ={},
+        )
+        with pytest.raises(transport.OneBotUnavailable) as caught:
+            await client.get_login_info()
+        assert caught.value.category == category and not caught.value.submitted
+        assert session.posts == [], "凭证未就绪不得发出任何请求"
+
+    asyncio.run(scenario())
+
+
+def _raising_gate() -> bool:
+    raise RuntimeError("synthetic-recheck-failure")
+
+
+@pytest.mark.parametrize("gate", [lambda: False, _raising_gate])
+def test_提交前许可复验失败则明确未发送(gate) -> None:
+
+    async def scenario() -> None:
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200))
+        client, _ = memory_transport(session)
+        with pytest.raises(transport.OneBotUnavailable) as caught:
+            await client.send_msg(target_group_id="20002", message=[{"type": "text", "data": {"text": "synthetic-body"}}],
+                                  before_submit=gate)
+        assert caught.value.category == "permission" and not caught.value.submitted
+        assert session.posts == [], "许可复验失败不得写出任何请求"
+
+    asyncio.run(scenario())
+
+
+def test_固定七动作逐动作经HTTP调用且信封与令牌仅经认证头() -> None:
+
+    async def scenario() -> None:
+        seen: list[dict[str, Any]] = []
+        card_node = {"type": "node", "data": {"sender": "10000", "name": "synthetic-sender",
+                                              "content": [{"type": "text", "data": {"text": "synthetic-card-node"}}]}}
+
+        async def handler(request: web.Request) -> web.Response:
+            body = await request.json()
+            seen.append({
+                "method": request.method,
+                "path": request.path,
+                "query": request.query_string,
+                "body": body,
+                "authorization": request.headers.get("Authorization"),
+            })
+            return web.json_response(envelope({"action": body["action"]}))
+
+        async with http_endpoint(handler) as url:
+            client = transport.AiohttpOneBotTransport(
+                transport.OneBotConnection(url, "TEST_ONEBOT_TOKEN", CONNECTION_TOKEN),
                 environ={"TEST_ONEBOT_TOKEN": "synthetic-env-secret"},
             )
             try:
-                with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await t.get_login_info()
-                assert caught.value.category == "authentication" and not caught.value.submitted
-                assert "synthetic-config-secret" not in repr(caught.value) + caplog.text
-                assert "synthetic-env-secret" not in repr(caught.value) + caplog.text
+                assert isinstance(client, transport.OneBotTransport)
+                assert (await client.get_login_info())["data"] == {"action": "get_login_info"}
+                assert (await client.get_group_list())["data"] == {"action": "get_group_list"}
+                assert (await client.get_msg("source-123"))["data"] == {"action": "get_msg"}
+                assert (await client.get_forward_msg("forward-res-123"))["data"] == {"action": "get_forward_msg"}
+                assert (await client.send_msg(
+                    target_group_id="20002",
+                    message=[{"type": "text", "data": {"text": "synthetic-body"}}],
+                    before_submit=lambda: True,
+                ))["data"] == {"action": "send_msg"}
+                assert (await client.send_group_forward_msg(
+                    target_group_id="20002", messages=[card_node], before_submit=lambda: True,
+                ))["data"] == {"action": "send_group_forward_msg"}
+                assert (await client.send_forward_msg(
+                    target_group_id="20002",
+                    messages=[{"type": "node", "data": {"uin": "10000", "name": "synthetic-sender",
+                                                        "content": [{"type": "text", "data": {"text": "synthetic-body"}}]}}],
+                    before_submit=lambda: True,
+                ))["data"] == {"action": "send_forward_msg"}
             finally:
-                await t.close()
-        assert seen == ["Bearer synthetic-config-secret"]
+                await client.close()
+
+        assert [item["path"] for item in seen] == [
+            "/get_login_info", "/get_group_list", "/get_msg", "/get_forward_msg",
+            "/send_msg", "/send_group_forward_msg", "/send_forward_msg",
+        ]
+        assert all(item["method"] == "POST" for item in seen)
+        assert [item["body"] for item in seen] == [
+            {"action": "get_login_info", "params": {}},
+            {"action": "get_group_list", "params": {}},
+            {"action": "get_msg", "params": {"message_id": "source-123"}},
+            {"action": "get_forward_msg", "params": {"id": "forward-res-123"}},
+            {"action": "send_msg", "params": {"message_type": "group", "group_id": "20002",
+                                              "message": [{"type": "text", "data": {"text": "synthetic-body"}}]}},
+            {"action": "send_group_forward_msg", "params": {"group_id": "20002", "messages": [card_node]}},
+            {"action": "send_forward_msg", "params": {"group_id": "20002", "messages": [
+                {"type": "node", "data": {"uin": "10000", "name": "synthetic-sender",
+                                          "content": [{"type": "text", "data": {"text": "synthetic-body"}}]}}]}},
+        ]
+        assert all(item["authorization"] == f"Bearer {CONNECTION_TOKEN}" for item in seen)
+        assert all(item["query"] == "" for item in seen)
+        assert all(CONNECTION_TOKEN not in item["path"] + item["query"] for item in seen)
+
     asyncio.run(scenario())
 
 
-def test_3_1_无SDK导入且构造不联网并完成固定只读动作():
+def test_只读展开查询get_forward_msg经内存替身调用() -> None:
+    """卡片展开查询：`id` 参数只读信封，应答节点序列原样上交。"""
+
+    async def scenario() -> None:
+        nodes = [{"sender": {"user_id": "10000"},
+                  "message": [{"type": "text", "data": {"text": "synthetic-card-node"}}]}]
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(
+            200, body=envelope({"messages": nodes})))
+        client, _ = memory_transport(session)
+        response = await client.get_forward_msg("synthetic-card-res-id")
+        assert response["data"] == {"messages": nodes}, "展开节点序列原样上交，不做改写"
+        post = session.posts[0]
+        assert post["url"].endswith("/get_forward_msg")
+        assert json.loads(post["data"]) == {"action": "get_forward_msg", "params": {"id": "synthetic-card-res-id"}}
+        assert post["headers"]["Authorization"] == f"Bearer {CONNECTION_TOKEN}"
+        assert post["kwargs"]["allow_redirects"] is False
+
+    asyncio.run(scenario())
+
+
+def test_卡片发送send_group_forward_msg提交节点信封且许可复验拦截() -> None:
+    """卡片重组投递：节点数组原样进信封、不设预览参数、提交前许可复验。"""
+
+    async def scenario() -> None:
+        node = {"type": "node", "data": {"uin": "10000", "name": "synthetic-sender",
+                                         "content": [{"type": "text", "data": {"text": "synthetic-card-node"}}]}}
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(
+            200, body=envelope({"message_id": -1489176197, "res_id": "synthetic-res-id",
+                                "forward_id": "synthetic-forward-id"})))
+        client, _ = memory_transport(session)
+        response = await client.send_group_forward_msg(
+            target_group_id="20002", messages=[node], before_submit=lambda: True)
+        assert response["data"]["message_id"] == -1489176197
+        post = session.posts[0]
+        assert post["url"].endswith("/send_group_forward_msg")
+        body = json.loads(post["data"])
+        assert body == {"action": "send_group_forward_msg",
+                        "params": {"group_id": "20002", "messages": [node]}}
+        assert set(body["params"]) == {"group_id", "messages"}, "不得设置 summary/news/prompt/source 预览类参数"
+
+        with pytest.raises(transport.OneBotUnavailable) as caught:
+            await client.send_group_forward_msg(
+                target_group_id="20002", messages=[node], before_submit=lambda: False)
+        assert caught.value.category == "permission" and not caught.value.submitted
+        assert len(session.posts) == 1, "许可复验失败不得写出任何请求"
+
+    asyncio.run(scenario())
+
+
+def test_会话惰性创建且禁代理禁重定向旗标随请求发出() -> None:
+
+    async def scenario() -> None:
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200, body=envelope({"user_id": "10000"})))
+        client, factory = memory_transport(session)
+        assert factory.calls == [], "构造与首个动作前不得创建会话"
+        assert (await client.get_login_info())["data"] == {"user_id": "10000"}
+        assert factory.calls == [{"trust_env": False}]
+        assert session.posts[0]["kwargs"]["allow_redirects"] is False
+        await client.get_group_list()
+        assert factory.calls == [{"trust_env": False}], "会话惰性复用，不逐请求新建"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_3xx重定向显式拒绝且不向下一跳发出请求或凭证(status) -> None:
+
+    async def scenario() -> None:
+        seen: list[dict[str, Any]] = []
+
+        async def handler(request: web.Request) -> web.Response:
+            seen.append({"path": request.path, "authorization": request.headers.get("Authorization")})
+            if request.path == "/get_login_info":
+                return web.Response(status=status, headers={"Location": "/redirect-leak"})
+            return web.json_response(envelope({"leaked": True}))
+
+        async with http_endpoint(handler) as url:
+            client = transport.AiohttpOneBotTransport(
+                transport.OneBotConnection(url, "TEST_ONEBOT_TOKEN", CONNECTION_TOKEN), environ={},
+            )
+            try:
+                with pytest.raises(transport.OneBotUnavailable) as caught:
+                    await client.get_login_info()
+                assert caught.value.category == "insecure_endpoint" and not caught.value.submitted
+            finally:
+                await client.close()
+        assert [item["path"] for item in seen] == ["/get_login_info"], "不得向重定向下一跳发出请求"
+        assert CONNECTION_TOKEN not in "/redirect-leak"
+
+    asyncio.run(scenario())
+
+
+def test_请求体超过自设上限在发出前拒绝() -> None:
+
+    async def scenario() -> None:
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200))
+        client, factory = memory_transport(session)
+        overhead = len(json.dumps(
+            {"action": "send_msg", "params": {"message_type": "group", "group_id": "20002",
+                                              "message": [{"type": "text", "data": {"text": ""}}]}},
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8"))
+        pad = transport.ONEBOT_MAX_REQUEST_BYTES - overhead
+        message = [{"type": "text", "data": {"text": "x" * pad}}]
+        assert (await client.send_msg(
+            target_group_id="20002", message=message, before_submit=lambda: True,
+        ))["status"] == "ok"
+        assert len(session.posts) == 1
+        assert len(session.posts[0]["data"]) == transport.ONEBOT_MAX_REQUEST_BYTES
+
+        with pytest.raises(transport.OneBotUnavailable) as caught:
+            await client.send_msg(
+                target_group_id="20002",
+                message=[{"type": "text", "data": {"text": "x" * (pad + 1)}}],
+                before_submit=lambda: True,
+            )
+        assert caught.value.category == "request_too_large" and not caught.value.submitted
+        assert len(session.posts) == 1, "超限请求体不得发出"
+        assert factory.calls == [{"trust_env": False}], "超限拒绝不得为此新建会话"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("host, outcome, expect, resolver_called", [
+    ("8.8.8.8", None, "configuration", False),
+    ("snowluma.example", ["8.8.8.8"], "insecure_endpoint", True),
+    ("snowluma.example", ["10.1.2.3"], None, True),
+    ("snowluma.example", ["127.0.0.1", "10.1.2.3"], None, True),
+    ("snowluma.example", ["192.168.1.5", "8.8.8.8"], "insecure_endpoint", True),
+    ("snowluma.example", [], "insecure_endpoint", True),
+    ("snowluma.example", "raise", "insecure_endpoint", True),
+    ("127.0.0.1", "forbid", None, False),
+    ("10.0.0.5", "forbid", None, False),
+])
+def test_明文http目标建连前解析判定(host, outcome, expect, resolver_called) -> None:
+
+    async def scenario() -> None:
+        calls: list[tuple[str, int]] = []
+
+        async def resolver(name: str, port: int) -> list[str]:
+            calls.append((name, port))
+            if outcome == "raise":
+                raise OSError("synthetic-resolution-failure")
+            return list(outcome)
+
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200))
+        client, _ = memory_transport(
+            session, connection=transport.OneBotConnection(f"http://{host}:3000", "TEST_ONEBOT_TOKEN", CONNECTION_TOKEN),
+            resolver=resolver,
+        )
+        if expect is None:
+            await client.get_login_info()
+            assert len(session.posts) == 1
+        else:
+            with pytest.raises(transport.OneBotUnavailable) as caught:
+                await client.get_login_info()
+            assert caught.value.category == expect
+            assert session.posts == [], "判定失败不得发出任何请求"
+        assert bool(calls) is resolver_called
+        assert calls == ([(host, 3000)] if resolver_called else [])
+
+    asyncio.run(scenario())
+
+
+def test_加密端点不执行明文解析判定() -> None:
+    async def scenario() -> None:
+        async def resolver(name: str, port: int) -> list[str]:
+            raise AssertionError("https 目标不做明文网络判定")
+
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200))
+        client, _ = memory_transport(
+            session,
+            connection=transport.OneBotConnection("https://snowluma.example:3000", "TEST_ONEBOT_TOKEN", CONNECTION_TOKEN),
+            resolver=resolver,
+        )
+        assert (await client.get_login_info())["status"] == "ok"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status, failure, category, submitted", [
+    (401, None, "authentication", False),
+    (403, None, "authentication", False),
+    (429, None, "transport_unavailable", True),
+    (500, None, "transport_unavailable", True),
+    (200, "post-disconnect", "transport_unavailable", True),
+    (200, "post-reset", "transport_unavailable", True),
+    (200, "read-payload", "transport_unavailable", True),
+])
+def test_状态与连接失败按安全类别分类(status, failure, category, submitted) -> None:
+
+    async def scenario() -> None:
+        def responder(url: str, body: bytes, headers: dict[str, str], kwargs: dict[str, Any]) -> Any:
+            if failure == "post-disconnect":
+                raise aiohttp.ServerDisconnectedError()
+            if failure == "post-reset":
+                raise ConnectionResetError("synthetic-reset")
+            if failure == "read-payload":
+                return MemoryResponse(status, raises=aiohttp.ClientPayloadError())
+            return MemoryResponse(status)
+
+        session = MemorySession(responder)
+        client, _ = memory_transport(session)
+        with pytest.raises(transport.OneBotUnavailable) as caught:
+            await client.get_msg("source-1")
+        assert caught.value.category == category
+        assert caught.value.submitted is submitted
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("retcode", [100, 1400, 1404])
+def test_业务失败信封原样交上层结构化处理(retcode) -> None:
+
+    async def scenario() -> None:
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(
+            200, body=envelope(None, status="failed", retcode=retcode, message="message not found"),
+        ))
+        client, _ = memory_transport(session)
+        response = await client.get_msg("missing-1")
+        assert response["status"] == "failed" and response["retcode"] == retcode
+        assert len(session.posts) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("body, raises", [
+    ({"hello": "synthetic"}, None),
+    ({"post_type": "message", "message_type": "group", "status": "ok", "retcode": 0, "data": {}}, None),
+    ({"status": "ok", "retcode": 0, "data": "synthetic-scalar"}, None),
+    ({"status": "partial", "retcode": 0, "data": {}}, None),
+    (None, ValueError("synthetic-not-json")),
+])
+def test_非信封响应不构成动作结果(body, raises) -> None:
+
+    async def scenario() -> None:
+        session = MemorySession(lambda url, url_body, headers, kwargs: MemoryResponse(200, body=body, raises=raises))
+        client, _ = memory_transport(session)
+        with pytest.raises(transport.OneBotUnavailable) as caught:
+            await client.get_msg("source-1")
+        assert caught.value.category == "unexpected_response"
+        assert caught.value.submitted is True, "请求已写入，结果只能保守对待"
+
+    asyncio.run(scenario())
+
+
+def test_动作期限到期归类超时且不重发() -> None:
+
+    async def scenario() -> None:
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200, hang=True))
+        clock = FakeClock()
+        client, _ = memory_transport(session, clock=clock)
+        call = asyncio.create_task(client.get_login_info())
+        await spin_until(lambda: len(session.posts) == 1)
+        assert clock.sleeps, "期限必须走注入时钟登记"
+        clock.advance(transport.ONEBOT_ACTION_TIMEOUT_SECONDS + 0.5)
+        with pytest.raises(transport.OneBotUnavailable) as caught:
+            await call
+        assert caught.value.category == "timeout" and caught.value.submitted
+        assert len(session.posts) == 1, "超时不重发同一动作"
+
+    asyncio.run(scenario())
+
+
+def test_关闭幂等且重复调用不重复关闭会话() -> None:
+    async def scenario() -> None:
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200))
+        client, _ = memory_transport(session)
+        await client.get_login_info()
+        await client.close()
+        assert session.close_calls == 1 and session.closed
+        await client.close()
+        assert session.close_calls == 1, "重复关闭不得重复关闭会话"
+
+    asyncio.run(scenario())
+
+
+def test_关闭预算内未完成如实报告且第二次立即返回() -> None:
+
+    async def scenario() -> None:
+        session = HangingSession(lambda url, body, headers, kwargs: MemoryResponse(200))
+        clock = FakeClock()
+        client, _ = memory_transport(session, clock=clock)
+        await client.get_login_info()
+        closer = asyncio.create_task(client.close())
+        await spin_until(lambda: session.close_calls == 1)
+        clock.advance(transport.ONEBOT_CLOSE_TIMEOUT_SECONDS + 1.0)
+        with pytest.raises(transport.OneBotUnavailable) as caught:
+            await closer
+        assert caught.value.category == "close_incomplete"
+        assert await asyncio.wait_for(client.close(), timeout=1.0) is None, "第二次关闭必须立即返回"
+
+    asyncio.run(scenario())
+
+
+def test_关闭取消在途请求且之后不再提交() -> None:
+    async def scenario() -> None:
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200, hang=True))
+        client, _ = memory_transport(session)
+        call = asyncio.create_task(client.get_login_info())
+        await spin_until(lambda: len(session.posts) == 1)
+        await client.close()
+        with pytest.raises(transport.OneBotUnavailable) as caught:
+            await call
+        assert caught.value.category == "cancelled" and caught.value.submitted
+        with pytest.raises(transport.OneBotUnavailable) as after:
+            await client.get_login_info()
+        assert after.value.category == "closed" and not after.value.submitted
+        assert len(session.posts) == 1, "关闭后不得发出新请求"
+
+    asyncio.run(scenario())
+
+
+def test_公开动作面只有固定七动作与关闭() -> None:
+
+    public = {name for name in dir(transport.AiohttpOneBotTransport) if not name.startswith("_")}
+    assert {"get_login_info", "get_group_list", "get_msg", "get_forward_msg", "send_msg",
+            "send_group_forward_msg", "send_forward_msg", "close"} <= public
+    assert "forward_group_single_msg" not in public, "旧卡片按标识重建动作已移除，不得残留"
+    assert not any(name in public for name in (
+        "delete_msg", "send_group_msg", "send_private_msg", "upload_forward_msg", "get_status", "set_group_ban",
+    ))
+
+
+def test_隔离子进程无SDK与网络库导入且构造不联网() -> None:
     program = '''
 import importlib, sys, types
 pkg = types.ModuleType("isolated_courier")
 pkg.__path__ = [sys.argv[1]]
 sys.modules[pkg.__name__] = pkg
 m = importlib.import_module("isolated_courier.snowluma_transport")
-t = m.AiohttpOneBotTransport(m.OneBotConnection("ws://127.0.0.1:1/onebot", "FAKE_TOKEN"), environ={})
+t = m.AiohttpOneBotTransport(m.OneBotConnection("http://127.0.0.1:3000", "FAKE_TOKEN"), environ={})
 assert "maibot_sdk" not in sys.modules
 assert "aiohttp" not in sys.modules
 assert not any(n.startswith(("service", "history")) for n in sys.modules)
 '''
-    result = subprocess.run([sys.executable, "-I", "-c", program, str(Path(__file__).resolve().parents[1])], capture_output=True, text=True)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", program, str(Path(__file__).resolve().parents[1])],
+        capture_output=True, text=True,
+    )
     assert result.returncode == 0, result.stderr
-
-    async def scenario():
-        actions = []
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            async for frame in ws:
-                body = json.loads(frame.data)
-                actions.append((body["action"], body["params"]))
-                await reply(ws, body, {"sample": body["action"]})
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url)
-            assert actions == []
-            try:
-                assert isinstance(t, transport.OneBotTransport)
-                assert (await t.get_login_info())["data"] == {"sample": "get_login_info"}
-                assert (await t.get_msg("source-123"))["data"] == {"sample": "get_msg"}
-                assert (await t.get_group_list())["data"] == {"sample": "get_group_list"}
-            finally:
-                await t.close()
-        assert actions == [("get_login_info", {}), ("get_msg", {"message_id": "source-123"}), ("get_group_list", {})]
-    asyncio.run(scenario())
-
-
-def test_3_3_伪装事件和非法响应不能完成动作且空闲消费心跳():
-    async def scenario():
-        bad_sent, release, pong = asyncio.Event(), asyncio.Event(), asyncio.Event()
-        registered, actions = [], []
-        async def handler(request):
-            ws = web.WebSocketResponse(autoping=False)
-            await ws.prepare(request)
-            body = json.loads((await ws.receive()).data)
-            actions.append(body)
-            good = {"status": "ok", "retcode": 0, "data": {"user_id": "10000"}, "echo": body["echo"]}
-            for payload in [
-                {**good, "post_type": "message", "message_type": "group"},
-                {**good, "post_type": "meta_event", "meta_event_type": "heartbeat"},
-                {**good, "post_type": "message_sent"},
-                {**good, "echo": "other-client"},
-                {"status": "ok", "retcode": 0, "data": {}},
-                {"echo": body["echo"]},
-                {**good, "retcode": True}, {**good, "status": []},
-                {**good, "data": "not-a-response-object"}, [],
-            ]:
-                await ws.send_json(payload)
-            await ws.send_str("not-json")
-            bad_sent.set()
-            await release.wait()
-            await ws.send_json(good)
-            await ws.ping(b"idle-heartbeat")
-            async for frame in ws:
-                if frame.type == WSMsgType.PONG:
-                    pong.set()
-                else:
-                    actions.append(frame.data)
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url, register_task=lambda task, description: registered.append((task, description)))
-            task = asyncio.create_task(t.get_login_info())
-            try:
-                await bad_sent.wait()
-                for _ in range(30):
-                    await asyncio.sleep(0)
-                assert not task.done()
-                release.set()
-                assert (await task)["data"] == {"user_id": "10000"}
-                await spin_until(pong.is_set)
-                assert len(actions) == 1
-                assert len([task for task, _ in registered if not task.done()]) == 1
-            finally:
-                release.set()
-                await t.close()
-            assert all(task.done() for task, _ in registered)
-    asyncio.run(scenario())
-
-
-def test_3_4_双客户端广播和过期响应隔离且关闭互不影响():
-    async def scenario():
-        clock = FakeClock()
-        sockets, requests = [], []
-        release = asyncio.Event()
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            sockets.append(ws)
-            async for frame in ws:
-                body = json.loads(frame.data)
-                requests.append((ws, body))
-                if body["action"] == "get_login_info":
-                    await reply(ws, body, {"client": len(sockets)})
-                elif body["action"] == "get_msg":
-                    continue
-                else:
-                    # 服务器广播其他实例及旧动作响应；这些载荷不能完成本次动作。
-                    for _, previous in requests[:-1]:
-                        await reply(ws, previous, {"wrong": True})
-                    await release.wait()
-                    await reply(ws, body, {"groups": "current"})
-            return ws
-        async with endpoint(handler) as url:
-            a, b = client(url, clock=clock), client(url)
-            try:
-                assert (await a.get_login_info())["data"] == {"client": 1}
-                assert (await b.get_login_info())["data"] == {"client": 2}
-                old_generation = a.connection_generation
-                stale = asyncio.create_task(a.get_msg("timeout-source"))
-                await spin_until(lambda: len(requests) == 3)
-                clock.advance(10)
-                with pytest.raises(transport.OneBotUnavailable):
-                    await stale
-                await sockets[0].close()
-                await spin_until(lambda: a.connection_generation != old_generation)
-                assert (await a.get_login_info())["data"] == {"client": 3}
-                current = asyncio.create_task(a.get_group_list())
-                await spin_until(lambda: len(requests) == 5)
-                for _ in range(30):
-                    await asyncio.sleep(0)
-                assert not current.done()
-                release.set()
-                assert (await current)["data"] == {"groups": "current"}
-                await a.close()
-                assert (await b.get_group_list())["data"] == {"groups": "current"}
-                echoes = [body["echo"] for _, body in requests]
-                assert len(set(echoes)) == len(echoes)
-                assert {body["action"] for _, body in requests} == {"get_login_info", "get_msg", "get_group_list"}
-            finally:
-                release.set()
-                await a.close()
-                await b.close()
-    asyncio.run(scenario())
-
-
-def test_3_5_握手排队响应共用十秒绝对期限():
-    async def scenario():
-        clock = FakeClock()
-        handshake, open_handshake = asyncio.Event(), asyncio.Event()
-        actions = []
-        async def handler(request):
-            handshake.set()
-            await open_handshake.wait()
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            async for frame in ws:
-                actions.append(json.loads(frame.data))
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url, clock=clock)
-            first = asyncio.create_task(t.get_login_info())
-            await handshake.wait()
-            second = asyncio.create_task(t.get_group_list())
-            try:
-                await spin_until(lambda: len(clock.sleeps) >= 2)
-                clock.advance(9)
-                open_handshake.set()
-                await spin_until(lambda: len(actions) == 1)
-                clock.advance(1)
-                await spin_until(lambda: first.done() and second.done())
-                for task, submitted in [(first, True), (second, False)]:
-                    with pytest.raises(transport.OneBotUnavailable) as caught:
-                        await task
-                    assert caught.value.category == "timeout"
-                    assert caught.value.submitted is submitted
-                assert len(actions) == 1
-            finally:
-                open_handshake.set()
-                first.cancel()
-                second.cancel()
-                await t.close()
-                await asyncio.gather(first, second, return_exceptions=True)
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("phase", ["handshake", "events"])
-def test_3_5_握手阻塞及持续事件均不能延长期限(phase):
-    async def scenario():
-        clock = FakeClock()
-        entered, release = asyncio.Event(), asyncio.Event()
-        requests = []
-        async def handler(request):
-            entered.set()
-            if phase == "handshake":
-                await release.wait()
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            async for frame in ws:
-                requests.append(json.loads(frame.data))
-                for _ in range(100):
-                    await ws.send_json({"post_type": "meta_event", "meta_event_type": "heartbeat"})
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url, clock=clock)
-            task = asyncio.create_task(t.get_login_info())
-            try:
-                await entered.wait()
-                if phase == "events":
-                    await spin_until(lambda: bool(requests))
-                clock.advance(10)
-                await spin_until(task.done)
-                with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await task
-                assert caught.value.category == "timeout"
-                assert caught.value.submitted is (phase == "events")
-            finally:
-                release.set()
-                await t.close()
-    asyncio.run(scenario())
-
-
-def test_3_6_缓冲事件洪泛公平让出且不扩张后台任务():
-    async def scenario():
-        clock = FakeClock()
-        observed, registered = [], []
-        def progress():
-            observed.append(socket.events_read)
-            clock.advance(10)
-        socket = MemorySocket(buffered_events=5000, on_first_event=progress)
-        session = MemorySession(socket)
-        t = client("ws://127.0.0.1:1/onebot", clock=clock,
-                   session_factory=lambda **kwargs: session,
-                   register_task=lambda task, desc: registered.append(task))
-        try:
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await t.get_login_info()
-            assert caught.value.category == "timeout"
-            assert 0 < observed[0] < 5000
-            assert len(registered) <= 4
-            assert len(socket.sent) == 1
-        finally:
-            await t.close()
-    asyncio.run(scenario())
-
-
-def test_3_6_并发调用仅有一个待决动作():
-    async def scenario():
-        requests = []
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            async for frame in ws:
-                requests.append((ws, json.loads(frame.data)))
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url)
-            tasks = [asyncio.create_task(t.get_msg(str(index))) for index in range(8)]
-            try:
-                for index in range(8):
-                    await spin_until(lambda: len(requests) >= index + 1)
-                    for _ in range(20):
-                        await asyncio.sleep(0)
-                    assert len(requests) == index + 1
-                    ws, body = requests[index]
-                    await reply(ws, body, {"message_id": body["params"]["message_id"]})
-                results = await asyncio.gather(*tasks)
-                assert [r["data"]["message_id"] for r in results] == [str(i) for i in range(8)]
-            finally:
-                await t.close()
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("fragmented", [False, True])
-def test_3_6_完整消息超过四MiB关闭且提交事实不丢失(fragmented):
-    async def scenario():
-        closed = asyncio.Event()
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            await ws.receive()
-            if fragmented:
-                # RFC 6455 文本首片与 continuation 尾片；每片未超限，合计超过4MiB。
-                import struct
-                for opcode, size in [(0x01, 2097152), (0x80, 2097153)]:
-                    request.transport.write(bytes([opcode, 127]) + struct.pack("!Q", size) + b"x" * size)
-            else:
-                try:
-                    await ws.send_str("x" * 4194305)
-                except ConnectionError:
-                    # 对端可在读到超限消息头后立即关闭，不必接收完整载荷。
-                    closed.set()
-                    return ws
-            async for _ in ws:
-                pass
-            closed.set()
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url)
-            try:
-                with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await t.get_login_info()
-                assert caught.value.submitted is True
-                await spin_until(closed.is_set)
-            finally:
-                await t.close()
-    asyncio.run(scenario())
-
-
-def test_3_7_排队后的许可复验拒绝且固定连接不重连():
-    async def scenario():
-        actions, sockets = [], []
-        held, release = asyncio.Event(), asyncio.Event()
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            sockets.append(ws)
-            async for frame in ws:
-                body = json.loads(frame.data)
-                actions.append(body)
-                if body["action"] == "get_msg":
-                    held.set()
-                    await release.wait()
-                await reply(ws, body, {"user_id": "10000"})
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url)
-            await t.get_login_info()
-            generation = t.connection_generation
-            permitted = True
-            checks = []
-            def allowed():
-                checks.append(permitted)
-                return permitted
-            blocker = asyncio.create_task(t.get_msg("held"))
-            await held.wait()
-            send = asyncio.create_task(t.send_msg(target_group_id="20000", message=[], expected_generation=generation, before_submit=allowed))
-            try:
-                for _ in range(20):
-                    await asyncio.sleep(0)
-                assert checks == []
-                permitted = False
-                release.set()
-                await blocker
-                with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await send
-                assert caught.value.submitted is False
-                assert checks == [False]
-                assert all(body["action"] != "send_msg" for body in actions)
-                await sockets[0].close()
-                await spin_until(lambda: t.connection_generation != generation)
-                with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await t.get_group_list(expected_generation=generation)
-                assert caught.value.submitted is False
-                assert len(sockets) == 1
-                await t.get_login_info()
-                assert len(sockets) == 2
-                assert t.connection_generation != generation
-            finally:
-                release.set()
-                await t.close()
-                await asyncio.gather(blocker, send, return_exceptions=True)
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("stage", ["source", "comment"])
-@pytest.mark.parametrize("failure", ["disconnect", "timeout", "cancel"])
-def test_3_7_提交后故障保留证据且后续只读不重放(stage, failure):
-    async def scenario():
-        clock = FakeClock()
-        sockets, actions, descriptions = [], [], []
-        received = asyncio.Event()
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            sockets.append(ws)
-            async for frame in ws:
-                body = json.loads(frame.data)
-                actions.append(body)
-                if body["action"] == "send_msg":
-                    received.set()
-                    if failure == "disconnect":
-                        request.transport.abort()
-                else:
-                    await reply(ws, body, {"user_id": "10000"})
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url, clock=clock, register_task=lambda task, description: descriptions.append(description))
-            try:
-                await t.get_login_info()
-                generation = t.connection_generation
-                task = asyncio.create_task(t.send_msg(
-                    target_group_id="20000", message=[{"type": "text", "data": {"text": "合成内容"}}],
-                    expected_generation=generation, before_submit=lambda: True, stage=stage))
-                await received.wait()
-                if failure == "timeout":
-                    clock.advance(10)
-                elif failure == "cancel":
-                    task.cancel()
-                with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await task
-                assert caught.value.submitted is True
-                await sockets[0].close()
-                await spin_until(lambda: t.connection_generation != generation)
-                await t.get_login_info()
-                assert len(sockets) == 2
-                sends = [body for body in actions if body["action"] == "send_msg"]
-                assert len(sends) == 1
-                assert sends[0]["params"] == {"message_type": "group", "group_id": "20000", "message": [{"type": "text", "data": {"text": "合成内容"}}]}
-                assert "stage" not in sends[0]
-                assert {"source": "SnowLuma 源消息", "comment": "SnowLuma 评论"}[stage] in descriptions
-            finally:
-                await t.close()
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("failure", ["queued_cancel", "callback_error"])
-def test_3_7_排队取消或许可异常证明未提交且不泄露(failure):
-    async def scenario():
-        actions = []
-        held, release = asyncio.Event(), asyncio.Event()
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            async for frame in ws:
-                body = json.loads(frame.data)
-                actions.append(body)
-                if body["action"] == "get_msg":
-                    held.set()
-                    await release.wait()
-                await reply(ws, body, {})
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url)
-            try:
-                await t.get_login_info()
-                blocker = asyncio.create_task(t.get_msg("held"))
-                await held.wait()
-                def denied():
-                    raise RuntimeError("synthetic-secret-source-content")
-                task = asyncio.create_task(t.send_msg(target_group_id="20000", message=[],
-                    expected_generation=t.connection_generation, before_submit=denied))
-                for _ in range(10):
-                    await asyncio.sleep(0)
-                if failure == "queued_cancel":
-                    task.cancel()
-                release.set()
-                await blocker
-                with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await task
-                assert caught.value.submitted is False
-                assert "synthetic-secret-source-content" not in str(caught.value)
-                assert [body["action"] for body in actions] == ["get_login_info", "get_msg"]
-            finally:
-                release.set()
-                await t.close()
-    asyncio.run(scenario())
-
-
-def test_3_8_关闭终止待决且幂等并永久禁止新动作():
-    async def scenario():
-        requests, connections, registered = [], [], []
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            connections.append(ws)
-            async for frame in ws:
-                requests.append(json.loads(frame.data))
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url, register_task=lambda task, description: registered.append(task))
-            task = asyncio.create_task(t.get_login_info())
-            try:
-                await spin_until(lambda: bool(requests))
-                await t.close()
-                await spin_until(task.done)
-                with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await task
-                assert caught.value.submitted is True
-                await t.close()
-                with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await t.get_login_info()
-                assert caught.value.submitted is False
-                assert len(connections) == 1
-                assert len(requests) == 1
-                assert all(task.done() for task in registered)
-            finally:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-                await t.close()
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("blocked", ["receive", "socket_close", "session_close"])
-def test_3_8_不合作清理共享五秒上界且如实报告残留(blocked, caplog):
-    async def scenario():
-        clock, gate = FakeClock(), CancellationGate()
-        registered = []
-        class Socket(MemorySocket):
-            async def receive(self):
-                if blocked == "receive":
-                    await gate.wait()
-                return await super().receive()
-            async def close(self):
-                if blocked == "socket_close":
-                    await gate.wait()
-                await super().close()
-        class Session(MemorySession):
-            async def close(self):
-                if blocked == "session_close":
-                    await gate.wait()
-                await super().close()
-        socket = Socket()
-        t = client("ws://127.0.0.1:1/onebot", clock=clock,
-                   session_factory=lambda **kwargs: Session(socket),
-                   register_task=lambda task, description: registered.append(task))
-        action = asyncio.create_task(t.get_login_info())
-        await spin_until(lambda: bool(socket.sent))
-        closing = asyncio.create_task(t.close())
-        try:
-            await gate.entered.wait()
-            # 让关闭预算登记；不是把真实网络库的 ws_close 当作全部预算。
-            for _ in range(20):
-                await asyncio.sleep(0)
-            clock.advance(5)
-            await spin_until(closing.done)
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await closing
-            assert caught.value.category == "close_incomplete"
-            await spin_until(action.done)
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await action
-            assert caught.value.submitted is True
-            assert any(not task.done() for task in registered)
-            before = len(socket.sent)
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await t.get_group_list()
-            assert caught.value.submitted is False
-            assert len(socket.sent) == before
-        finally:
-            gate.release.set()
-            await asyncio.gather(action, closing, return_exceptions=True)
-            await spin_until(lambda: all(task.done() for task in registered))
-            await t.close()
-        assert all(task.done() for task in registered)
-    asyncio.run(scenario())
-    assert "synthetic-not-a-production-token" not in caplog.text
-
-
-@pytest.mark.parametrize("blocked", ["handshake", "write"])
-def test_3_8_不合作握手或写入取消后保持证据且迟到资源关闭(blocked, caplog):
-    async def scenario():
-        from types import SimpleNamespace
-        clock, gate = FakeClock(), CancellationGate()
-        registered, loop_errors = [], []
-        asyncio.get_running_loop().set_exception_handler(lambda loop, context: loop_errors.append(context))
-        class Socket(MemorySocket):
-            async def send_json(self, body):
-                await super().send_json(body)
-                if body["action"] == "send_msg":
-                    await gate.wait()
-                    raise RuntimeError("synthetic-sensitive-late-write")
-                self.frames.put_nowait(SimpleNamespace(type=WSMsgType.TEXT, data=json.dumps(
-                    {"status": "ok", "retcode": 0, "data": {}, "echo": body["echo"]})))
-        class Session(MemorySession):
-            async def ws_connect(self, url, **kwargs):
-                if blocked == "handshake":
-                    await gate.wait()
-                return await super().ws_connect(url, **kwargs)
-        socket = Socket()
-        session = Session(socket)
-        t = client("ws://127.0.0.1:1/onebot", clock=clock,
-                   session_factory=lambda **kwargs: session,
-                   register_task=lambda task, description: registered.append(task))
-        if blocked == "write":
-            await t.get_login_info()
-            action = asyncio.create_task(t.send_msg(target_group_id="20000", message=[],
-                expected_generation=t.connection_generation, before_submit=lambda: True))
-        else:
-            action = asyncio.create_task(t.get_login_info())
-        await gate.entered.wait()
-        closing = asyncio.create_task(t.close())
-        try:
-            for _ in range(20):
-                await asyncio.sleep(0)
-            clock.advance(5)
-            await spin_until(closing.done)
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await closing
-            assert caught.value.category == "close_incomplete"
-            await spin_until(action.done)
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await action
-            assert caught.value.submitted is (blocked == "write")
-            assert any(not task.done() for task in registered)
-        finally:
-            gate.release.set()
-            clock.advance(10)
-            await asyncio.gather(action, closing, return_exceptions=True)
-            await spin_until(lambda: all(task.done() for task in registered))
-            await t.close()
-        assert socket.closed and session.closed
-        assert len([body for body in socket.sent if body["action"] == "send_msg"]) == (1 if blocked == "write" else 0)
-        assert loop_errors == []
-    asyncio.run(scenario())
-    assert "synthetic-sensitive-late-write" not in caplog.text
-
-
-def test_3_8_非法帧失效后独立只读重连并关闭旧连接():
-    async def scenario():
-        sockets, actions = [], []
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            sockets.append(ws)
-            async for frame in ws:
-                body = json.loads(frame.data)
-                actions.append(body)
-                if len(sockets) == 1:
-                    await ws.send_bytes(b"illegal-response")
-                else:
-                    await reply(ws, body, {"user_id": "10000"})
-            return ws
-        async with endpoint(handler) as url:
-            t = client(url)
-            second = None
-            try:
-                with pytest.raises(transport.OneBotUnavailable):
-                    await t.get_login_info()
-                second = asyncio.create_task(t.get_login_info())
-                await spin_until(lambda: len(actions) == 2)
-                assert len(sockets) == 2
-                assert (await second)["data"] == {"user_id": "10000"}
-                await spin_until(lambda: sockets[0].closed)
-            finally:
-                await t.close()
-                if second is not None:
-                    await asyncio.gather(second, return_exceptions=True)
-    asyncio.run(scenario())
-
-
-def test_3_8_旧清理未退出不建立新会话或积压关闭任务():
-    async def scenario():
-        clock, gate = FakeClock(), CancellationGate()
-        sessions, registered = [], []
-        class Session(MemorySession):
-            async def ws_connect(self, url, **kwargs):
-                raise RuntimeError("synthetic-handshake-detail")
-            async def close(self):
-                await gate.wait()
-                await super().close()
-        def factory(**kwargs):
-            session = Session(MemorySocket())
-            sessions.append(session)
-            return session
-        t = client("ws://127.0.0.1:1/onebot", clock=clock, session_factory=factory,
-                   register_task=lambda task, description: registered.append(task))
-        second = None
-        try:
-            with pytest.raises(transport.OneBotUnavailable):
-                await t.get_login_info()
-            await gate.entered.wait()
-            second = asyncio.create_task(t.get_login_info())
-            for _ in range(20):
-                await asyncio.sleep(0)
-            assert len(sessions) == 1
-            clock.advance(10)
-            await spin_until(second.done)
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await second
-            assert caught.value.submitted is False
-            assert len(sessions) == 1
-        finally:
-            gate.release.set()
-            clock.advance(10)
-            if second is not None:
-                await asyncio.gather(second, return_exceptions=True)
-            await spin_until(lambda: all(task.done() for task in registered))
-            await t.close()
-    asyncio.run(scenario())
-
-
-def test_3_8_外层提前取消关闭不重置预算或伪称资源已释放():
-    async def scenario():
-        entered, release = asyncio.Event(), asyncio.Event()
-        class Socket(MemorySocket):
-            async def close(self):
-                entered.set()
-                await release.wait()
-                await super().close()
-        socket = Socket()
-        t = client("ws://127.0.0.1:1/onebot", session_factory=lambda **kwargs: MemorySession(socket))
-        action = asyncio.create_task(t.get_login_info())
-        await spin_until(lambda: bool(socket.sent))
-        closing = asyncio.create_task(t.close())
-        try:
-            await entered.wait()
-            closing.cancel()
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await closing
-            assert caught.value.category == "close_incomplete"
-            await asyncio.gather(action, return_exceptions=True)
-            with pytest.raises(transport.OneBotUnavailable):
-                await t.close()
-            assert not socket.closed
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await t.get_login_info()
-            assert caught.value.submitted is False
-        finally:
-            release.set()
-            await socket.close()
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("failure", ["missing", "empty", "auth", "tls", "redirect", "exception"])
-def test_3_2_握手失败安全分类且重定向零请求(failure, tmp_path):
-    async def scenario():
-        seen, redirected = [], []
-        async def destination(request):
-            redirected.append(dict(request.headers))
-            return web.Response(status=403)
-        async with endpoint(destination) as other:
-            async def handler(request):
-                seen.append(request.headers.get("Authorization"))
-                if failure == "redirect":
-                    raise web.HTTPFound(location=other.replace("ws://", "http://"))
-                if failure == "auth":
-                    return web.Response(status=401, text="Authorization: Bearer synthetic-not-a-production-token")
-                ws = web.WebSocketResponse()
-                await ws.prepare(request)
-                async for frame in ws:
-                    await reply(ws, json.loads(frame.data), {})
-                return ws
-            tls = None
-            if failure == "tls":
-                import ssl
-                key, cert = tmp_path / "synthetic.key", tmp_path / "synthetic.crt"
-                subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", "/CN=localhost"], check=True, capture_output=True)
-                tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                tls.load_cert_chain(cert, key)
-            async with endpoint(handler, ssl_context=tls) as url:
-                env = {} if failure == "missing" else {"TEST_ONEBOT_TOKEN": "   " if failure == "empty" else "synthetic-not-a-production-token"}
-                def broken_factory(**kwargs):
-                    raise RuntimeError("Authorization: Bearer synthetic-not-a-production-token " + url)
-                t = transport.AiohttpOneBotTransport(transport.OneBotConnection(url, "TEST_ONEBOT_TOKEN"), environ=env, session_factory=broken_factory if failure == "exception" else None)
-                try:
-                    with pytest.raises(transport.OneBotUnavailable) as caught:
-                        await t.get_login_info()
-                    assert caught.value.submitted is False
-                    assert caught.value.category == {"missing": "credentials", "empty": "credentials", "auth": "authentication", "tls": "certificate", "redirect": "redirect", "exception": "handshake"}[failure]
-                    assert "synthetic-not-a-production-token" not in str(caught.value)
-                    assert url not in str(caught.value)
-                    assert caught.value.__cause__ is None
-                    assert redirected == []
-                    if failure in {"missing", "empty", "tls", "exception"}:
-                        assert seen == []
-                finally:
-                    await t.close()
-    asyncio.run(scenario())
-
-
-# --------------------------------------------------------------------------- 9.2
-# 明文端点只允许回环字面量与解析为回环/私有/链路本地的目标（design D11）；
-# 名字在建连前解析，解析失败或含公网地址一律拒绝且不建立连接。
-
-
-async def _no_dns(host, port):
-    raise AssertionError("该路径不得查询解析器")
-
-
-def test_9_2_容器名解析为私有时允许明文建连且连接原地址():
-    async def scenario():
-        socket, resolved = MemorySocket(), []
-        session = MemorySession(socket)
-
-        async def resolver(host, port):
-            resolved.append((host, port))
-            return ["10.20.30.40"]
-
-        t = client("ws://maimai-snowluma:3001/onebot", resolver=resolver,
-                   session_factory=lambda **kwargs: session)
-        task = asyncio.create_task(t.get_login_info())
-        try:
-            await spin_until(lambda: bool(socket.sent))
-            assert resolved == [("maimai-snowluma", 3001)]
-            assert [body["action"] for body in socket.sent] == ["get_login_info"]
-            assert [url for url, _ in session.connections] == ["ws://maimai-snowluma:3001/onebot"]
-        finally:
-            await t.close()
-            await asyncio.gather(task, return_exceptions=True)
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("address", ["127.0.0.1", "10.20.30.40", "fe80::1%en0"])
-def test_9_2_名字解析结果全为可信网络时才放行(address):
-    async def scenario():
-        socket = MemorySocket()
-        session = MemorySession(socket)
-
-        async def resolver(host, port):
-            return [address]
-
-        t = client("ws://maimai-snowluma:3001/onebot", resolver=resolver,
-                   session_factory=lambda **kwargs: session)
-        task = asyncio.create_task(t.get_group_list())
-        try:
-            await spin_until(lambda: bool(socket.sent))
-            assert len(session.connections) == 1
-        finally:
-            await t.close()
-            await asyncio.gather(task, return_exceptions=True)
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("outcome", ["public", "mixed", "failure", "empty"])
-def test_9_2_公网混合或解析失败拒绝且无连接无发送帧(outcome):
-    async def scenario():
-        created = []
-
-        def factory(**kwargs):
-            created.append(kwargs)
-            raise AssertionError("解析未通过时不得创建网络会话")
-
-        async def resolver(host, port):
-            if outcome == "failure":
-                raise OSError("synthetic-resolution-sensitive-detail")
-            if outcome == "public":
-                return ["93.184.216.34"]
-            if outcome == "mixed":
-                return ["10.20.30.40", "93.184.216.34"]
-            return []
-
-        t = client("ws://maimai-snowluma:3001/onebot", resolver=resolver, session_factory=factory)
-        try:
-            with pytest.raises(transport.OneBotUnavailable) as caught:
-                await t.get_login_info()
-            assert caught.value.category == "insecure_endpoint"
-            assert caught.value.submitted is False
-            assert caught.value.__cause__ is None
-            assert "synthetic-resolution-sensitive-detail" not in str(caught.value)
-            assert created == []
-            assert t.connection_generation == 0
-        finally:
-            await t.close()
-    asyncio.run(scenario())
-
-
-def test_9_2_回环明文不查询解析器且真实线路可用():
-    async def scenario():
-        async def handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            async for frame in ws:
-                await reply(ws, json.loads(frame.data), {"user_id": "10000"})
-            return ws
-
-        async with endpoint(handler) as url:
-            t = client(url, resolver=_no_dns)
-            try:
-                assert (await t.get_login_info())["data"] == {"user_id": "10000"}
-            finally:
-                await t.close()
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("url", ["ws://10.11.12.13:3001/onebot", "ws://[fd00::1]:3001/onebot",
-                                "ws://[fe80::1]:3001/onebot"])
-def test_9_2_私有字面量明文不查询解析器(url):
-    async def scenario():
-        socket = MemorySocket()
-        session = MemorySession(socket)
-        t = client(url, resolver=_no_dns, session_factory=lambda **kwargs: session)
-        task = asyncio.create_task(t.get_group_list())
-        try:
-            await spin_until(lambda: bool(socket.sent))
-            assert len(session.connections) == 1
-        finally:
-            await t.close()
-            await asyncio.gather(task, return_exceptions=True)
-    asyncio.run(scenario())
-
-
-def test_9_2_wss不受明文目标判定影响():
-    async def scenario():
-        socket = MemorySocket()
-        session = MemorySession(socket)
-        t = client("wss://snowluma.example/onebot", resolver=_no_dns,
-                   session_factory=lambda **kwargs: session)
-        task = asyncio.create_task(t.get_login_info())
-        try:
-            await spin_until(lambda: bool(socket.sent))
-            assert len(session.connections) == 1
-        finally:
-            await t.close()
-            await asyncio.gather(task, return_exceptions=True)
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("url", ["ws://8.8.8.8:3001/onebot", "ws://[::ffff:8.8.8.8]:3001/onebot"])
-def test_9_2_公网字面量明文在传输层也不建连(url):
-    async def scenario():
-        created = []
-
-        def factory(**kwargs):
-            created.append(kwargs)
-            raise AssertionError("公网明文不得创建网络会话")
-
-        t = client(url, resolver=_no_dns, session_factory=factory)
-        with pytest.raises(transport.OneBotUnavailable) as caught:
-            await t.get_login_info()
-        assert caught.value.submitted is False
-        assert created == []
-        assert t.connection_generation == 0
-        await t.close()
-    asyncio.run(scenario())

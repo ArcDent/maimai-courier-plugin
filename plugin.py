@@ -1,4 +1,4 @@
-"""插件组合根：宿主可信入口、本地账本及自己的 SnowLuma 连接。"""
+"""插件组合根：宿主可信入口、本地账本及自己的 SnowLuma HTTP 客户端。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from maibot_sdk import HookHandler, MaiBotPlugin, Tool
 
 from .auto_entry import (AutoEntryDedup, ForwardCandidate, NotACandidate,
                          auto_entry_invalid_reason, run_auto_entry, screen_forward_candidate)
-from .clock import Clock, SystemClock
+from .shared.clock import Clock, SystemClock
 from .config import CourierConfig
 from .delivery_ledger import LEDGER_FILE_NAME, DeliveryLedger, LedgerUnavailable, open_ledger
 from .forward_delivery import deliver_forward
@@ -31,14 +31,14 @@ from .source_binding import (
 )
 
 RECEIVE_AFTER_PROCESS_HOOK = "chat.receive.after_process"
-"""观察已处理入站消息的命名 Hook（第 1 组核实的宿主 Hook 名）。"""
+"""观察已处理入站消息的宿主 Hook 名。"""
 
 PLANNER_AFTER_RESPONSE_HOOK = "maisaka.planner.after_response"
-"""签发一次性来源凭据的宿主 Hook（第 1 组核实：`chat_loop_service.py:231-288`）。
+"""签发一次性来源凭据的宿主 Hook。
 
-该 Hook 在模型输出工具调用后触发且允许改写 `output_items`（`allow_kwargs_mutation`
-为 True），是工具侧唯一不可被模型伪造的来源：载荷由宿主构造，模型写不到
-`session_id`。
+该 Hook 在模型输出工具调用后触发且允许改写 `output_items`
+（`allow_kwargs_mutation` 为 True），是工具侧唯一不可被模型伪造的来源：载荷由
+宿主构造，模型写不到 `session_id`。
 """
 
 BIND_FORWARD_SOURCE_HANDLER = "forward_message_source_binding"
@@ -102,14 +102,11 @@ class CourierPlugin(MaiBotPlugin):
         return not self._closed and bool(self.config.plugin.enabled)
 
     def _aiohttp_transport(self, connection: OneBotConnection) -> OneBotTransport:
-        return AiohttpOneBotTransport(connection, clock=self._clock, environ=self._environ,
-                                     register_task=self._register_task)
+        # 无连接 HTTP 传输不再登记后台任务：动作各自有界，卸载只等组合根自己的任务。
+        return AiohttpOneBotTransport(connection, clock=self._clock, environ=self._environ)
 
     def _register_task(self, task: asyncio.Future[Any], description: str) -> None:
-        if description in ("SnowLuma 接收", "SnowLuma 关闭连接", "SnowLuma 关闭会话"):
-            # 连接资源服务多条投递，不能归给恰好触发建连的单一来源。
-            description += "（源消息/目标群=共享连接，阶段=连接管理）"
-        elif origin := self._task_origin.get():
+        if origin := self._task_origin.get():
             description += f"：{origin}"
         self._tasks[task] = description
         task.add_done_callback(self._forget_task)
@@ -118,9 +115,8 @@ class CourierPlugin(MaiBotPlugin):
         """把转发 Tool 的 `chat_scope` 提到组件声明**顶层**（承载性修正）。
 
         Runner 只读组件声明顶层的 `chat_scope`（缺省回落 `"all"`），而
-        `@Tool(chat_scope=…)` 经 SDK 只会落进组件 metadata；第 1 组已核实该
-        metadata 回退分支不可达。不覆写这一层，群聊专用的转发工具会在私聊会话中
-        同样可见（可见性过滤失效）。
+        `@Tool(chat_scope=…)` 经 SDK 只会落进组件 metadata。不覆写这一层，群聊
+        专用的转发工具会在私聊会话中同样可见（可见性过滤失效）。
         """
         components = super().get_components()
         for component in components:
@@ -149,24 +145,19 @@ class CourierPlugin(MaiBotPlugin):
         await asyncio.shield(self._shutdown_task)
 
     async def _shutdown(self, deadline: float) -> None:
+        """只取消并有界等待本插件自己的任务；HTTP 无连接，卸载不关连接、只结束在途请求。"""
         current = asyncio.current_task()
         pending = {task for task in self._tasks
-                   if task is not current and task is not self._client_close_task and not task.done()}
+                   if task is not current and not task.done()}
         labels = {task: self._tasks[task] for task in pending}
         for task in pending:
             task.cancel()
-        close_task = None
-        if self._client is not None:
-            label = "直连关闭：" + "；".join(labels.values())
-            close_task = self._start_client_close(label)
-            labels[close_task] = self._tasks.get(close_task, label)
-            pending.add(close_task)
         timer = asyncio.create_task(self._clock.sleep(max(0.0, deadline - self._clock.now())))
         try:
             while pending and self._clock.now() < deadline:
                 done, _ = await asyncio.wait(pending | {timer}, return_when=asyncio.FIRST_COMPLETED)
                 pending.difference_update(done)
-                # 关闭动作可继续登记资源收尾，每项仍须独立等待、定位，不能只保留父任务。
+                # 收尾协程自身可能继续登记资源收尾，每项仍须独立等待、定位，不能只保留父任务。
                 pending.update(task for task in self._tasks if task is not current and not task.done())
                 labels.update({task: self._tasks[task] for task in pending})
                 if timer in done:
@@ -175,10 +166,6 @@ class CourierPlugin(MaiBotPlugin):
             for task in pending:
                 task.cancel()
                 self.ctx.logger.warning(f"插件卸载：五秒预算内未退出：{labels[task]}；保持发送关闭及账本独占")
-            if close_task is not None and close_task.done():
-                if close_task.cancelled() or close_task.exception() is not None:
-                    incomplete = True
-                    self.ctx.logger.warning(f"插件卸载：直连内部工作未退出或关闭未确认：{labels[close_task]}；保持账本独占")
             if not incomplete and self._ledger is not None and not isinstance(self._ledger, LedgerUnavailable):
                 label = "账本关闭（源消息/目标群=本插件账本，阶段=存储关闭）"
                 if self._clock.now() >= deadline:
@@ -225,7 +212,7 @@ class CourierPlugin(MaiBotPlugin):
         self._seen_connection = signature
 
     def _start_client_close(self, label: str) -> asyncio.Task[None]:
-        """每个客户端只创建一个关闭任务，配置替换与卸载共用。"""
+        """每个客户端只创建一个关闭任务，只由连接替换路径触发（卸载不再关闭连接）。"""
         if self._client_close_task is None:
             assert self._client is not None
             self._client_close_task = asyncio.create_task(self._client.close())
@@ -233,7 +220,7 @@ class CourierPlugin(MaiBotPlugin):
         return self._client_close_task
 
     def _connection_signature(self) -> tuple[str, str, str]:
-        return (self.config.snowluma.websocket_url, self.config.snowluma.token_env_var,
+        return (self.config.snowluma.http_url, self.config.snowluma.token_env_var,
                 self.config.snowluma.token)
 
     def _forget_task(self, task: asyncio.Future[Any]) -> None:
@@ -411,8 +398,8 @@ class CourierPlugin(MaiBotPlugin):
         """在本轮 Planner 输出上签发来源凭据（模型参数里带不进可信会话）。
 
         载荷由宿主构造（`session_id` + `output_items`），处理器只把转发调用改写为
-        「公开参数 + 本次一次性凭据」；`modified_kwargs` 随后成为工具调用的参数
-        （`runner_main.py:2214`）。插件关闭或已卸载时不改写、不签发，工具调用自然拒绝。
+        「公开参数 + 本次一次性凭据」；`modified_kwargs` 随后成为工具调用的参数。
+        插件关闭或已卸载时不改写、不签发，工具调用自然拒绝。
         """
         if not self._is_live():
             return {"action": "continue", "modified_kwargs": kwargs}
@@ -433,10 +420,10 @@ class CourierPlugin(MaiBotPlugin):
     async def observe_received_message(self, **kwargs: Any) -> None:
         """观察已处理入站消息：筛选自动入口候选并在后台给出一次判断机会。
 
-        观察模式由宿主后台分发（`hook_dispatcher.py:632-662`），返回值不参与聚合，
-        因此这里既不拦截也不改写原消息处理。默认关闭或自动入口关闭时直接返回，
-        不产生任何宿主调用；候选筛选与去重登记都在本协程内同步完成，随后把
-        「确认可读取 → 唤起源群判断」交给本插件自己的后台任务（design D2）。
+        观察模式由宿主后台分发，返回值不参与聚合，因此这里既不拦截也不改写原
+        消息处理。默认关闭或自动入口关闭时直接返回，不产生任何宿主调用；候选
+        筛选与去重登记都在本协程内同步完成，随后把「确认可读取 → 唤起源群判断」
+        交给本插件自己的后台任务。
         """
         if self._auto_entry_config() is None:
             return

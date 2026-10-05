@@ -3,7 +3,6 @@
 `[snowluma]` 保存地址、可选令牌与凭证环境变量名，默认空；模型不能覆盖连接配置。
 `plugin.config_version` 是宿主要求的数字点分版本，新增字段时提升。
 评论延迟、概率与超时均不进入配置；默认值与 config.toml 保持一致。
-旧服务节只保留退役诊断，不提供活跃配置模型或备用通道。
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from maibot_sdk import Field, PluginConfigBase
 from .shared.config_rules import onebot_endpoint_rejection, valid_env_var_name
 
 MessageType = Literal["text", "image", "forward"]
-"""自动候选消息类型的唯一词汇来源（design D3）。
+"""自动候选消息类型的唯一词汇来源。
 
 配置枚举 `auto.message_types` 与自动入口的候选分类共用本别名；宿主 Schema 生成器
 识别 `list[Literal[...]]` 形态，因此别名必须在这两个消费方之一的被依赖方（本模块）
@@ -39,7 +38,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.4.0",
+        default="1.5.0",
         description="配置版本号；新增字段时提升（数字点分），宿主据此把新字段写回配置文件。",
         json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "order": 99},
     )
@@ -114,17 +113,21 @@ class ScopeSection(PluginConfigBase):
 
 
 class SnowLumaSection(PluginConfigBase):
-    """`[snowluma]` 节：固定正向连接地址、令牌与可选凭证引用。"""
+    """`[snowluma]` 节：固定正向 HTTP API 地址、令牌与可选凭证引用。"""
 
     __ui_label__: ClassVar[str] = "SnowLuma 直连"
     __ui_order__: ClassVar[int] = 3
 
-    websocket_url: str = Field(
+    http_url: str = Field(
         default="",
-        description="SnowLuma 已有正向 WebSocket 地址；回环、私有或链路本地目标可用 ws，公网目标必须 wss。",
+        description="SnowLuma 已有正向 HTTP API 地址；回环、私有或链路本地目标可用 http，公网目标必须 https。",
         json_schema_extra={
-            "hint": "默认未配置；明文 ws 只允许回环、私有或链路本地目标，主机名在建连前解析确认，解析出公网或失败即拒绝；禁止在地址中填写凭证、查询串或片段，不自动发现端点。",
-            "label": "WebSocket 地址",
+            "hint": (
+                "默认未配置；明文 http 只允许回环、私有或链路本地目标，主机名在建连前解析确认，"
+                "解析出公网或失败即拒绝；禁止在地址中填写用户信息、查询串或片段，不自动发现端点；"
+                "只按固定动作 POST /{action} 访问，认证令牌只经请求头传递。"
+            ),
+            "label": "HTTP 地址",
             "order": 0,
         },
     )
@@ -142,18 +145,23 @@ class SnowLumaSection(PluginConfigBase):
         default="",
         description="保存 SnowLuma 凭证的环境变量名；只填变量名，不填凭证值。",
         json_schema_extra={
-            "hint": "未填写令牌时，建连才按名取凭证；变量缺失或为空时拒绝连接。",
+            "hint": "未填写令牌时，仅在发出请求前按名读取凭证；变量缺失或为空时拒绝请求。",
             "label": "凭证环境变量名",
             "order": 2,
         },
     )
 
-
     def __init__(self, **data: Any) -> None:
-        """在 SDK 字段校验前拒绝危险地址，避免错误携带输入。"""
+        """在 SDK 字段校验前拒绝危险地址，避免错误携带输入。
 
-        endpoint = data.get("websocket_url", "")
+        地址只接受 http/https，协议内安全规则（明文公网、用户信息、查询串、片段、
+        未指定监听地址）复用 `onebot_endpoint_rejection` 的单一定义处。
+        """
+
+        endpoint = data.get("http_url", "")
         if endpoint != "":
+            if not isinstance(endpoint, str):
+                raise ValueError("SnowLuma 直连地址必须为字符串")
             reason = onebot_endpoint_rejection(endpoint)
             if reason:
                 raise ValueError(reason)

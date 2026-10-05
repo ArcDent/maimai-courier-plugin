@@ -1,19 +1,19 @@
-"""转发请求的权限与内容预检（本地、不发送任何消息，design D2/D9）。
+"""转发请求的权限与内容预检（本地、不发送任何消息）。
 
 工具入口只负责总开关与结果封装，本模块按固定顺序完成**本地**预检：
 
 1. 三参数类型校验（ID 一律按字符串处理，禁止数值换算）；
 2. 用一次性凭据换回可信 Planner 会话（拒绝模型伪造的会话/平台/授权字段）；
 3. 校验来源为 QQ 群聊且在源白名单，并按可信会话查询源消息归属与可读性；
-4. 校验目标群白名单、不同于源群（**不再要求宿主目标发送会话**：目标平台与账号
-   可用性由认证服务独立核对）；
+4. 校验目标群白名单、不同于源群（目标平台与账号可用性由直连准备阶段核对）；
 5. 构建材料摘要：普通消息继续做完整内容预检（含提及文本化与不支持段拒绝），
-   **合并转发卡片不走本地递归节点校验**（只判形状；内部资源是否可用由服务端从
-   可信源消息取得并决定，design D3/D9）。
+   **合并转发卡片只取标识与归属核验**（顶层唯一形状，混排拒绝）：与客户端
+   `SnowLumaClient.prepare_source` 的判定口径一致，不在本地重复构造卡片材料
+   （卡片发送材料由客户端按源消息卡片标识展开查询构造，平台按目标群上下文重建）。
 
 任一步失败都在产生任何发送副作用前整条拒绝，拒绝原因统一经 `Rejected.not_sent`
 补「本次未发送任何消息」定尾；全部通过时返回 `PreparedForward`，由客户端投递编排
-（`forward_delivery.py`）交给认证服务执行。
+（`forward_delivery.py`）交给直连客户端执行。
 """
 
 from __future__ import annotations
@@ -21,8 +21,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .send_material import SendMaterial, UnsupportedContent, build_send_material, classify_top_level_shape
 from .shared.identifiers import verbatim_identifier
-from .send_material import SendMaterial, UnsupportedContent, build_send_material, is_forward_card
+from .shared.send_steps import SourceKind
 from .source_binding import (
     ForwardArguments,
     Rejected,
@@ -31,16 +32,10 @@ from .source_binding import (
 )
 
 QQ_PLATFORM = "qq"
-"""宿主 QQ 平台名：来源会话必须属于该平台（spec 的 QQ 范围）。"""
+"""宿主 QQ 平台名：来源会话必须属于该平台。"""
 
 ALL_PLATFORMS = "all_platforms"
-"""宿主 `chat.get_all_streams` 的全平台取值（`data.py:_list_sessions`）。"""
-
-CARD_MATERIAL_KIND = "forward"
-"""合并转发卡片的材料种类（`send_material.SendKind` 的同名字面量）。"""
-
-CARD_MATERIAL_SHAPE: tuple[str, ...] = ("forward",)
-"""卡片材料摘要的结构指纹：只表示「一张卡片」，不含节点正文与内部结构。"""
+"""宿主 `chat.get_all_streams` 的全平台取值。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,20 +53,21 @@ class SourceSession:
 class MaterialDigest:
     """材料结构摘要：只含种类与结构指纹（不含正文），满足结果渲染的结构面。
 
-    普通消息直接用 `send_material.SendMaterial`；合并转发卡片只记形状，避免在
-    本地递归展开节点（design D3）。
+    普通消息直接用 `send_material.SendMaterial`；合并转发卡片只记发送路径种类
+    （`SourceKind` 的 `forward`，与客户端 `prepare_source` 的判定口径一致）与结构
+    指纹，避免在本地递归展开节点或重复构造卡片材料（卡片发送材料由客户端按源
+    消息卡片标识展开查询构造）。
     """
-
-    kind: str
+    kind: SourceKind
     shape: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedForward:
-    """预检通过的可发送计划（本地不发送，交由认证服务执行）。
+    """预检通过的可发送计划（本地不发送）。
 
-    `material` 只用于工具结果的 `send_kind` / `material_shape` 展示；源消息正文与
-    资源标识不由客户端提交给服务端（服务端从可信源消息自行取得，design D2）。
+    `material` 只用于工具结果的 `send_kind` / `material_shape` 展示；资源标识不离开
+    插件，卡片发送材料由客户端按展开查询构造。
     """
 
     arguments: ForwardArguments
@@ -158,7 +154,7 @@ async def precheck_forward_request(
 
 
 def _mapped_source_id(message: Mapping[str, Any], message_id: str, source: SourceSession) -> str:
-    """按核实附件02核对宿主保留链；格式合法本身从不授予身份。"""
+    """按宿主保留链核对源消息归属；格式合法本身从不授予身份。"""
     if (not verbatim_identifier(message_id) or message.get("message_id") != message_id
             or message.get("session_id") != source.session_id or message.get("platform") != "qq"):
         return ""
@@ -184,22 +180,26 @@ def _mapped_source_id(message: Mapping[str, Any], message_id: str, source: Sourc
 
 
 def _material_digest(raw_message: Any) -> SendMaterial | MaterialDigest | Rejected:
-    """构建材料摘要：卡片只判顶层形状（免本地递归），普通消息仍做完整内容预检。
+    """构建材料摘要：卡片只取标识与归属核验，普通消息仍做完整内容预检。
 
-    卡片只检查**顶层**形态：唯一一张卡片（含宿主未展开的 `dict` 包装）可以免去本地
-    递归节点校验，内部资源是否可用由服务端从可信源消息决定；但卡片与其它顶层内容
-    混排无法保持卡片形态，在本地即整条拒绝（design D3 的既有规则，不是递归校验）。
+    卡片只检查**顶层**形态：唯一一张卡片（含宿主未展开的 `dict` 包装）走「标识 +
+    归属」核验，与客户端 `SnowLumaClient.prepare_source` 的判定口径一致（卡片发送
+    材料由客户端按源消息卡片标识展开查询构造，本地不重复构造）；但卡片与其它顶层
+    内容混排无法保持卡片形态，在本地即整条拒绝（顶层唯一判定是既有规则，不是递归
+    校验）。
     """
 
     if not isinstance(raw_message, list) or not raw_message:
         return Rejected.not_sent("源消息没有可发送的内容段")
-    cards = [segment for segment in raw_message if is_forward_card(segment)]
-    if cards:
-        if len(raw_message) != 1:
-            return Rejected.not_sent(
-                "合并转发卡片与其它顶层内容混排，无法保持卡片形态，整条拒绝"
-            )
-        return MaterialDigest(kind=CARD_MATERIAL_KIND, shape=CARD_MATERIAL_SHAPE)
+    shape = classify_top_level_shape(raw_message)
+    if shape == "mixed":
+        return Rejected.not_sent(
+            "合并转发卡片与其它顶层内容混排，无法保持卡片形态，整条拒绝"
+        )
+    if shape == "forward":
+        # 卡片只取标识与归属核验（客户端 prepare 同口径）：kind 走共享发送路径
+        # 三值，shape 只表示「一张卡片」，不持有资源 ID、不展开内部节点。
+        return MaterialDigest(kind="forward", shape=("forward",))
     material = build_send_material(raw_message)
     if isinstance(material, UnsupportedContent):
         return Rejected.not_sent(material.reason)
@@ -209,8 +209,8 @@ def _material_digest(raw_message: Any) -> SendMaterial | MaterialDigest | Reject
 async def _resolve_source_session(ctx: Any, session_id: str) -> SourceSession | Rejected:
     """按可信会话 ID 在宿主会话表里解析平台、账号、作用域与群号。
 
-    SDK 已把 `chat.get_all_streams` 归一为会话列表（`context.py:34-…`
-    `_CAPABILITY_RESULT_KEYS`），宿主异常在 Runner 侧表现为异常。
+    SDK 已把 `chat.get_all_streams` 归一为会话列表；宿主异常在 Runner 侧表现为
+    异常。
     """
 
     try:

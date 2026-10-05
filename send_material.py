@@ -1,12 +1,17 @@
 """宿主与 OneBot 源材料转换：共享提及呈现，只输出材料与结构指纹，不发送或落盘。
 
-`build_send_material` 保留宿主材料的公开兼容接口，包括递归节点校验；普通图片须有
-`binary_data_base64`，错误定位到段或节点。实际工具预检先以 `is_forward_card` 识别
-唯一顶层卡片并绕过递归校验，卡片内部内容不因此被拒绝或改写。
+两个输入面分别映射：宿主 `build_send_material` 校验并重建宿主消息材料（普通图片
+须有 `binary_data_base64`，错误定位到段或节点）；OneBot `build_source_material` /
+`source_outbound_segments` 只使用可信 OneBot 源材料：普通消息校验图片引用并按
+`verbatim_mentions` 分流：图片路径把提及文本化，文字路径原样保留 at。相邻文本
+归并不跨越原有分段、不新增换行；对象不明或材料不可完整发送时整条拒绝。
 
-`build_source_material` / `source_outbound_segments` 只使用可信 OneBot 源材料：
-原卡片保留资源引用，普通消息校验图片引用并将提及文本化。相邻文本归并不跨越原有
-分段、不新增换行；对象不明或材料不可完整发送时整条拒绝。
+顶层合并转发卡片由 `classify_top_level_shape` 判定唯一形状后交给
+`build_card_nodes`：从 `get_forward_msg` 展开查询结果构造 `send_group_forward_msg`
+节点数组——节点 `uin` 取平台的 sender `user_id`、显示名取 `card` 优先回退
+`nickname` 并压平限长、内容段原样深拷贝，嵌套 forward 段原样保留（不递归展开、
+不重建、不因嵌套拒绝）；节点材料只来自展开查询，不接受调用者提交的资源 ID、
+正文或媒体地址。
 
 「本次未发送任何消息」定尾由工具入口的 `Rejected.not_sent` 统一补齐。
 """
@@ -18,28 +23,52 @@ import ipaddress
 import socket
 from urllib.parse import urlsplit
 from copy import deepcopy
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .shared.identifiers import verbatim_identifier
 from .shared.mentions import flatten_mention_text, mention_display_text
-from .shared.send_steps import PrepareRejected, PreparedSource, SourceMaterial
+from .shared.send_steps import PrepareRejected, SourceKind, SourceMaterial
 
 
-def build_source_material(message: object) -> SourceMaterial | PrepareRejected:
-    """OneBot 源记录的纯转换入口，与宿主序列化形状分开处理。"""
+def classify_top_level_shape(raw_message: list[Any]) -> Literal["forward", "mixed", "plain"]:
+    """顶层形态判定的单一口径（预检、自动入口与客户端三处共用）。
+
+    - `forward`：恰好一张合并转发卡片（含未展开 `dict` 包装）——卡片发送材料
+      由 `build_card_nodes` 从展开查询构造，插件不提取资源 ID；
+    - `mixed`：卡片与其它顶层内容混排——无法保持卡片形态，整条拒绝；
+    - `plain`：无卡片——按普通消息段口径继续（`build_source_material` 或宿主
+      `build_send_material`，两种输入面各自的材料构造）。
+
+    只判顶层、不递归卡片内部；卡片唯一形状判据是 `is_forward_card`。
+    """
+
+    cards = [segment for segment in raw_message if is_forward_card(segment)]
+    if not cards:
+        return "plain"
+    return "forward" if len(raw_message) == 1 else "mixed"
+
+
+def build_source_material(message: object, *, verbatim_mentions: bool = False) -> SourceMaterial | PrepareRejected:
+    """OneBot 源记录的纯转换入口（普通消息），与宿主序列化形状分开处理。
+
+    `verbatim_mentions=False`（默认）服务普通图片直发路径：个人与全体成员提及
+    文本化成不触发提醒的普通文本；`verbatim_mentions=True` 服务单节点卡片的文字
+    路径：at 段按源消息原样保留，不文本化、不改写。两种口径共用同一套段校验
+    （顺序保留、不支持段/缺媒体/回复段整条拒绝、提及对象可确认）。
+
+    顶层合并转发卡片不走本函数（卡片发送路径由 `build_card_nodes` 从展开查询
+    构造节点）；进入本函数的卡片段一律整条拒绝。
+    """
+
     if not isinstance(message, list) or not message:
         return PrepareRejected("source_empty", "源消息没有可发送的内容段，发送前拒绝")
-    cards = [segment for segment in message if isinstance(segment, dict) and segment.get("type") == "forward"]
-    if cards:
-        if len(message) != 1:
-            return PrepareRejected("source_shape_unsupported", "顶层卡片与其它内容混排，整条拒绝")
-        data = cards[0].get("data")
-        raw_id = data.get("id") if isinstance(data, dict) else None
-        resource_id = verbatim_identifier(str(raw_id)) if isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool) else ""
-        if not resource_id:
-            return PrepareRejected("source_resource_missing", "原卡片资源缺失，不能以源消息 ID 代替，整条拒绝")
-        return SourceMaterial(kind="forward", forward_resource_id=resource_id)
+    shape = classify_top_level_shape(message)
+    if shape == "mixed":
+        return PrepareRejected("source_shape_unsupported", "顶层卡片与其它内容混排，整条拒绝")
+    if shape == "forward":
+        return PrepareRejected("source_shape_unsupported", "卡片发送路径不走段材料构造，整条拒绝")
     pieces: list[_TextPiece | _SegmentPiece] = []
     for segment in message:
         if not isinstance(segment, dict):
@@ -53,6 +82,9 @@ def build_source_material(message: object) -> SourceMaterial | PrepareRejected:
             if (isinstance(raw, bool) or not identifier or
                     (identifier != "all" and not (identifier.isascii() and identifier.isdigit() and any(c != "0" for c in identifier)))):
                 return PrepareRejected("source_mention_unconfirmed", "提及对象不可确认，整条拒绝")
+            if verbatim_mentions:
+                pieces.append(_SegmentPiece(deepcopy(segment), "at"))
+                continue
             name = next((value for field in ("card", "nickname", "name")
                          if (value := flatten_mention_text(data.get(field)))), "")
             text = mention_display_text(identifier, name)
@@ -67,10 +99,16 @@ def build_source_material(message: object) -> SourceMaterial | PrepareRejected:
         pieces.append(_TextPiece(text, kind == "at", {"type": "text", "data": text}))
     built = _assemble_segments(pieces)
     segments = tuple({"type": "text", "data": {"text": s["data"]}} if s["type"] == "text" else s for s in built.segments)
-    return SourceMaterial(kind=_segments_kind(segments), segments=segments)
+    return SourceMaterial(kind=_dispatch_kind(segments), segments=segments)
+
+
+def _dispatch_kind(segments: tuple[dict[str, Any], ...]) -> SourceKind:
+    """普通消息的发送路径取值：含图片段 → image，否则 → text。"""
+
+    return "image" if any(str(segment.get("type") or "") == "image" for segment in segments) else "text"
 
 def _safe_media_url(raw: object) -> str:
-    """附件03的媒体字面量边界；DNS及重定向安全仍是上线门槛U5，不在本机下载。"""
+    """媒体字面量边界：只放行可安全重放的 HTTPS 地址；本机不下载、不请求该地址。"""
     if not isinstance(raw, str) or not raw or "\\" in raw or any(not 0x21 <= ord(c) <= 0x7e for c in raw):
         return ""
     try:
@@ -104,23 +142,106 @@ def _safe_media_url(raw: object) -> str:
 
 
 def source_outbound_segments(material: SourceMaterial) -> tuple[dict[str, Any], ...] | PrepareRejected:
-    """只重建冻结的输出字段；卡片内部从不读取、不展开或上传。"""
+    """冻结材料的输出段：卡片发送路径不走段重建（发送动作按展开查询构造的节点提交）。
+
+    普通路径的输出段已在 `build_source_material` 一次构造完成（图片路径 at 已
+    文本化；文字路径的材料已是单节点卡片数组=平台载荷终点，content 含 at 原样）；
+    本函数只做深拷贝隔离后续改动，不再二次校验或重建（材料是冻结产物，出口唯一）。
+    """
+
     if material.kind == "forward":
-        resource_id = verbatim_identifier(material.forward_resource_id)
-        if not resource_id:
-            return PrepareRejected("source_resource_missing", "卡片资源不可用，未进入平台调用")
-        return ({"type": "forward", "data": {"id": resource_id}},)
-    checked = build_source_material(list(material.segments))
-    if isinstance(checked, PrepareRejected):
-        return checked
-    return checked.segments
+        return PrepareRejected("source_shape_unsupported", "卡片发送路径不重建段材料，未进入平台调用")
+    return tuple(deepcopy(segment) for segment in material.segments)
+
+
+SENDER_NAME_MAX_LENGTH = 128
+"""卡片节点署名显示名上限：压平控制字符后截断，不引入省略号。"""
+
+
+def build_card_nodes(expanded: object) -> tuple[dict[str, Any], ...] | PrepareRejected:
+    """从 `get_forward_msg` 展开查询结果构造 `send_group_forward_msg` 节点数组。
+
+    输入是展开查询的 `data`（含 `messages` 键）或 `messages` 节点列表本身。每个
+    节点只取平台返回的三个字段：`uin` 取 sender 对象 `user_id`（压平后逐字校验，
+    不可确认整条拒绝），显示名取 `card` 优先、回退 `nickname`（压平并限长），
+    内容段为 `message` 段数组原样深拷贝。
+
+    字段名是 `uin` 而非 `sender`：平台 OneBot 层自定义节点分支只读
+    `user_id ?? uin` 与 `nickname ?? name`（源码
+    `packages/onebot/src/modules/message-actions.ts` `parseForwardNodes`），
+    `sender` 只被元数据标量校验放行、解析时静默丢弃，uin 回退登录账号自身。
+    2026-10-06 对运行实例的对照实测证实：`sender` 标量 + `name` 投递后节点发送者
+    是 bot 自己，`uin` + `name` 与 `user_id` + `nickname` 均保留原发送者。
+    文字路径 `snowluma_client._text_card_node` 同口径使用 `uin`/`name`。
+
+    嵌套 forward 段随内容原样保留：不递归展开、不重建节点、不因嵌套拒绝（实测
+    外层投递正常、内层展示不作保证）。不设置 `summary`/`news`/`prompt`/`source`
+    预览参数；节点材料只来自本次展开查询，不接受调用者提交的资源 ID、消息正文
+    或媒体地址。
+    """
+
+    messages = expanded.get("messages") if isinstance(expanded, Mapping) else expanded
+    if not isinstance(messages, list) or not messages:
+        return PrepareRejected("forward_expand_unavailable", "展开查询没有可用的卡片节点，发送前拒绝")
+    nodes: list[dict[str, Any]] = []
+    for index, item in enumerate(messages, start=1):
+        if not isinstance(item, Mapping):
+            return PrepareRejected("forward_node_invalid", f"展开查询第 {index} 个节点结构无效，发送前拒绝")
+        sender = card_node_sender(item.get("sender"))
+        if not sender:
+            return PrepareRejected("sender_unconfirmed", f"展开查询第 {index} 个节点发送者标识不可确认，整条拒绝")
+        name = card_node_name(item.get("sender"))
+        if not name:
+            return PrepareRejected("sender_name_unconfirmed", f"展开查询第 {index} 个节点发送者显示名不可确认，整条拒绝")
+        content = item.get("message")
+        if (not isinstance(content, list) or not content
+                or not all(isinstance(segment, dict) for segment in content)):
+            return PrepareRejected("forward_node_invalid", f"展开查询第 {index} 个节点内容不是可用的段数组，整条拒绝")
+        nodes.append({"type": "node", "data": {
+            "uin": sender,
+            "name": name,
+            "content": [deepcopy(segment) for segment in content],
+        }})
+    return tuple(nodes)
+
+
+def card_node_sender(sender: object) -> str:
+    """卡片节点 `uin` 标量：只取 sender 对象的 `user_id`，压平后逐字校验。
+
+    卡片展开重组与文字单节点卡片两条路径共用本口径：含空白/控制字符/过长一律
+    视为不可确认（不净化成另一个字符串），由调用方拒绝。平台解析自定义节点时
+    只读 `user_id`/`uin`（实测与源码一致）；`sender` 字段被平台静默丢弃、uin
+    回退 bot 自身，因此节点署名字段用 `uin`。
+    """
+
+    raw = sender.get("user_id") if isinstance(sender, Mapping) else None
+    if isinstance(raw, (str, int)) and not isinstance(raw, bool):
+        return verbatim_identifier(flatten_mention_text(str(raw)))
+    return ""
+
+
+def card_node_name(sender: object) -> str:
+    """卡片节点 `name` 显示名：`card` 优先、回退 `nickname`，压平并限长。
+
+    卡片展开重组与文字单节点卡片两条路径共用本口径（不查询目标群成员补全）。
+    空名分支按路径分流：文字路径留空、由平台决定展示；卡片展开路径
+    （`build_card_nodes`）整条拒绝——卡片节点署名必须可确认，不用空名称蒙混过
+    平台校验。
+    """
+
+    if isinstance(sender, Mapping):
+        for field_name in ("card", "nickname"):
+            name = flatten_mention_text(sender.get(field_name))
+            if name:
+                return name[:SENDER_NAME_MAX_LENGTH]
+    return ""
 
 
 MAX_FORWARD_DEPTH = 3
-"""合并转发卡片最大层数：与网关递归深度上限一致，超出即整条拒绝。"""
+"""合并转发卡片最大层数（宿主消息递归预检上限）：超出即整条拒绝。"""
 
 EMPTY_FORWARD_NODE_PLACEHOLDER = "[empty forward node]"
-"""宿主对空转发节点的占位文本（`message_utils.py:312-317`，字面量在 `:317`）。
+"""宿主对空转发节点的占位文本。
 
 宿主在解析期就把内容为空的节点换成这段文本，插件拿不到原文。节点内的这段文本
 因此必须视为不可恢复节点整条拒绝，不能当作普通正文转发；顶层消息里的同名字符串
@@ -131,7 +252,7 @@ _SAFE_SEGMENT_LABEL = re.compile(r"[a-z0-9_]{1,16}\Z")
 """可安全回显的段类型词法：短小、纯 ASCII 小写；其余一律显示为「未知」。"""
 
 _AT_SEGMENT_TYPE = "at"
-"""宿主提及段的类型名（`message_utils.py:134-142` 的唯一序列化出口）。"""
+"""宿主提及段的类型名。"""
 
 _REPLY_SEGMENT_TYPE = "reply"
 """宿主引用（回复）段的类型名：只作消息装饰，不能随消息整体转发。"""
@@ -139,7 +260,12 @@ _REPLY_SEGMENT_TYPE = "reply"
 # 提及格式与压平规则只定义在 shared/mentions.py；本模块分别映射宿主和 OneBot 字段。
 
 SendKind = Literal["text", "image", "mixed", "forward"]
-"""发送材料种类：纯文本、纯图片、混合，或合并转发卡片。"""
+"""宿主材料种类：纯文本、纯图片、混合，或合并转发卡片。
+
+与 `shared.send_steps.SourceKind`（可信 OneBot 源材料的分派三值）分工不同：本词汇
+只描述宿主入站形状（图文混排是 `mixed`），分派词汇按平台动作收敛（含图片即
+`image`）。两者服务不同输入面，互不替换；不要合并成一个 Literal。
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,7 +277,7 @@ class UnsupportedContent:
 
 @dataclass(frozen=True, slots=True)
 class SendMaterial:
-    """宿主材料的兼容结果：普通段 `segments`、卡片节点 `nodes` 与无正文的 `shape`。
+    """宿主消息的校验结果：普通段 `segments`、卡片节点 `nodes` 与无正文的 `shape`。
 
     实际投递只发送可信 OneBot 源材料，不把此处节点交给宿主发送或重建原卡片。
     """
@@ -196,9 +322,9 @@ def is_forward_card(segment: Any) -> bool:
     """该段是否为合并转发卡片（含宿主未展开的 `dict` 包装形态）。
 
     展开形态是 `{"type": "forward", "data": [节点…]}`；宿主无法恢复节点材料时会
-    收成 `DictComponent`（`message_utils.py:327-338`），序列化后是
-    `{"type": "dict", "data": {"type": "forward", …}}`。自动入口（只需消息 ID 就能
-    给判断机会）与工具预检共用本形状判据；实际卡片只检查顶层，不递归处理节点。
+    收成 `DictComponent`，序列化后是 `{"type": "dict", "data": {"type": "forward", …}}`。
+    自动入口（只需消息 ID 就能给判断机会）与工具预检共用本形状判据；实际卡片只
+    检查顶层，不递归处理节点。
     """
 
     if not isinstance(segment, dict):
@@ -206,6 +332,26 @@ def is_forward_card(segment: Any) -> bool:
     if str(segment.get("type") or "").strip() == "forward":
         return True
     return _is_unexpanded_forward(segment)
+
+
+def forward_card_id(segment: Any) -> str:
+    """顶层卡片段的平台卡片标识：`get_forward_msg` 展开查询只按该标识进行。
+
+    与 `is_forward_card` 同一形状口径：OneBot `{"type": "forward", "data": {"id": …}}`
+    与未展开 `dict` 包装都取 `data.id`。标识逐字校验（含空白/控制字符/过长即不可
+    确认），取不到由调用方拒绝：不用正文、资源引用或源消息 ID 猜造。
+    """
+
+    if not is_forward_card(segment):
+        return ""
+    card = segment
+    if str(card.get("type") or "").strip() == "dict":
+        card = card.get("data")
+    data = card.get("data") if isinstance(card, Mapping) else None
+    raw = data.get("id") if isinstance(data, Mapping) else None
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        return ""
+    return verbatim_identifier(str(raw))
 
 
 def build_send_material(raw_message: Any) -> SendMaterial | UnsupportedContent:

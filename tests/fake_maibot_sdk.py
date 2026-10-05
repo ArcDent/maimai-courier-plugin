@@ -60,7 +60,7 @@ class _FakeFieldInfo:
     `description`、`json_schema_extra`（宿主 Schema 生成器读取的封闭元数据键集合）
     与 pydantic 字符串约束 `max_length`；不复制 pydantic 的完整 `FieldInfo`。
     `max_length` 是唯一的约束面：只写 `json_schema_extra["max_length"]` 不会拦下
-    超长输入，真实宿主同样由 pydantic 约束（tasks 1.3 已核实）。
+    超长输入，真实宿主同样由 pydantic 约束。
     """
 
     __slots__ = ("default", "default_factory", "description", "json_schema_extra", "max_length")

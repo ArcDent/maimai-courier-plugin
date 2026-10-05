@@ -1,24 +1,21 @@
 {
   // 活跃生产模块与共享纯逻辑；历史服务完整保留，但不参与类型检查。
-  // 三个退役墓碑仍受检查，两个直连模块显式纳入；插件依赖仅由清单声明。
+  // 两个直连模块显式纳入；插件依赖仅由清单声明。时钟等纯逻辑只在 shared/ 子模块
+  // 单点定义（0 兼容层：无根 clock.py 重导出、无 ledger 顶层重导出）。
   "include": [
     "config.py",
     "plugin.py",
-    "clock.py",
     "source_binding.py",
     "send_material.py",
     "forward_precheck.py",
     "delivery_ledger.py",
     "forward_delivery.py",
-    "host_send.py",
     "auto_entry.py",
-    "remote_client.py",
     "snowluma_client.py",
     "snowluma_transport.py",
     "shared",
-    "service/__init__.py"
   ],
-  "exclude": ["history", "tests", "**/__pycache__"],
+  "exclude": ["history", "**/__pycache__"],
   "pythonVersion": "3.11",
   "typeCheckingMode": "standard",
   "reportMissingImports": "none"

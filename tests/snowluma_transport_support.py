@@ -1,100 +1,114 @@
-"""直连传输的本地合成线路；不连接 QQ。"""
+"""直连 HTTP 传输的本地合成替身：可编程应答、内存会话与回环 HTTP 端点。
+
+全部替身只经传输的公开注入点（`session_factory` / `resolver` / `clock` / `environ`）
+进入，不访问传输内部状态，不连接真实 SnowLuma、不触公网。
+"""
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
-from types import SimpleNamespace
+from aiohttp import web
 
-from aiohttp import WSMsgType, web
-
-
-class CancellationGate:
-    """可以拒绝取消的合成网络等待；测试结束后显式释放。"""
-
-    def __init__(self):
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-        self.cancelled = asyncio.Event()
-
-    async def wait(self):
-        self.entered.set()
-        while not self.release.is_set():
-            try:
-                await self.release.wait()
-            except asyncio.CancelledError:
-                self.cancelled.set()
+from tests.support import envelope
 
 
-class MemorySocket:
-    """合成网络库接缝；预缓冲事件用于确定性观测公平调度。"""
+class MemoryResponse:
+    """可编程动作应答：状态、应答体、读取异常与挂起均可指定。"""
 
-    def __init__(self, *, buffered_events=0, on_first_event=None):
-        self.buffered_events = buffered_events
-        self.events_read = 0
-        self.on_first_event = on_first_event
-        self.frames = asyncio.Queue()
-        self.sent = []
-        self.closed = False
+    def __init__(
+        self, status: int = 200, *, body: Any = None,
+        raises: BaseException | None = None, hang: bool = False,
+    ) -> None:
+        self.status = status
+        self._body = envelope({}) if body is None else body
+        self._raises = raises
+        self._hang = hang
+        self.released = False
 
-    async def receive(self):
-        if self.events_read < self.buffered_events:
-            self.events_read += 1
-            if self.events_read == 1 and self.on_first_event is not None:
-                asyncio.get_running_loop().call_soon(self.on_first_event)
-            return SimpleNamespace(type=WSMsgType.TEXT, data='{"post_type":"message"}')
-        return await self.frames.get()
+    async def __aenter__(self) -> "MemoryResponse":
+        return self
 
-    async def send_json(self, body):
-        self.sent.append(body)
+    async def __aexit__(self, *exc_info: object) -> bool:
+        self.released = True
+        return False
 
-    async def close(self):
-        self.closed = True
-        self.frames.put_nowait(SimpleNamespace(type=WSMsgType.CLOSED, data=None))
+    async def json(self, *, content_type: Any = None) -> Any:
+        if self._hang:
+            await asyncio.Event().wait()
+        if self._raises is not None:
+            raise self._raises
+        return self._body
+
+
+Responder = Callable[[str, bytes, dict[str, str], dict[str, Any]], Any]
+"""替身应答入口：收到 URL、请求体、认证头与请求旗标，返回应答或抛出异常。"""
 
 
 class MemorySession:
-    """仅实现网络库公开调用面，不访问传输内部状态。"""
+    """仅实现传输用到的网络库公开调用面；记录每个 POST 的 URL、体、头与旗标。
 
-    def __init__(self, socket):
-        self.socket = socket
-        self.connections = []
+    `post` 与 aiohttp 同名方法一致地**同步**返回可作 `async with` 的应答对象
+    （真实会话返回的是既可等待又是异步上下文管理器的请求上下文），替身因此
+    不需要被 await 就能进入 `async with`。
+    """
+
+    def __init__(self, responder: Responder) -> None:
+        self._responder = responder
         self.closed = False
+        self.close_calls = 0
+        self.posts: list[dict[str, Any]] = []
 
-    async def ws_connect(self, url, **kwargs):
-        self.connections.append((url, kwargs))
-        return self.socket
+    def post(
+        self, url: str, *, data: bytes | None = None, json: Any = None,
+        headers: dict[str, str] | None = None, **kwargs: Any,
+    ) -> Any:
+        record: dict[str, Any] = {"url": url, "data": data, "headers": dict(headers or {}), "kwargs": dict(kwargs)}
+        self.posts.append(record)
+        outcome = self._responder(url, data or b"", record["headers"], record["kwargs"])
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
-    async def close(self):
+    async def close(self) -> None:
+        self.close_calls += 1
         self.closed = True
 
 
-async def spin_until(predicate):
-    """只让出调度，有限轮询本地测试事件，不作真实长等待。"""
-    for _ in range(4000):
-        if predicate():
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("本地测试事件未就绪")
+class HangingSession(MemorySession):
+    """`close()` 永不返回；验证关闭预算与幂等（取消时正常退出）。"""
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        await asyncio.Event().wait()
+
+
+class RecordingFactory:
+    """记录传输对惰性会话的构造参数；只经公开注入点进入。"""
+
+    def __init__(self, session: MemorySession) -> None:
+        self.session = session
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, **kwargs: Any) -> MemorySession:
+        self.calls.append(kwargs)
+        return self.session
 
 
 @asynccontextmanager
-async def endpoint(handler, *, ssl_context=None):
-    """本机临时端口；处理函数与可观察线路由测试提供。"""
+async def http_endpoint(handler: Callable[[web.Request], Any]):
+    """本机临时回环 HTTP 端点；处理函数与记录由测试提供，零外部网络。"""
+
     app = web.Application()
-    app.router.add_get("/onebot", handler)
+    app.router.add_route("*", "/{tail:.*}", handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0, ssl_context=ssl_context)
+    site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
-    scheme = "wss" if ssl_context else "ws"
-    port = runner.addresses[0][1]
     try:
-        yield f"{scheme}://127.0.0.1:{port}/onebot"
+        yield f"http://127.0.0.1:{runner.addresses[0][1]}"
     finally:
         await runner.cleanup()
-
-
-async def reply(ws, request, data):
-    await ws.send_json({"status": "ok", "retcode": 0, "data": data, "echo": request["echo"]})

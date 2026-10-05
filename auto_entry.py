@@ -1,23 +1,23 @@
 """源群自动判断入口：候选筛选、可读性确认、有界去重与分享判断意图。
 
 本模块只负责「给源群 Maisaka 一次自主判断机会」，不发送任何消息：真正的转发仍
-必须经 `forward_message` 工具与同一投递链（design D2）。契约与取舍：
+必须经 `forward_message` 工具与同一投递链。契约与取舍：
 
-- **唯一可信来源是宿主的入站 Hook 载荷**（`chat.receive.after_process`，
-  `bot.py:88-103` 定义、`:812-815` 分发）：载荷由宿主构造、不经模型，因此会话、
-  平台、群号与消息 ID 都按载荷取值；模型伪造不了，也无需额外授权票据。
+- **唯一可信来源是宿主的入站 Hook 载荷**（`chat.receive.after_process`）：载荷由
+  宿主构造、不经模型，因此会话、平台、群号与消息 ID 都按载荷取值；模型伪造不了，
+  也无需额外授权票据。
 - **候选口径**：白名单源群里的、非机器人自身、非通知的 QQ 消息，且其内容能分类成
   配置 `auto.message_types` 已选中的候选类型（默认仅合并转发；文字与图片须显式选中）。
   只含空白、只含提及、含不支持段或段结构非法的普通消息都不唤起；非 QQ 平台、
-  非白名单来源与自己发的消息也一样（spec「自动入口由源群决定」/「可配置的自动
-  候选类型」）。未展开的合并转发（宿主没能恢复节点、被收成 `DictComponent`）同样
-  进入判断：判断只需要消息 ID，实际发送仍由工具侧做完整内容校验。
+  非白名单来源与自己发的消息也一样。未展开的合并转发（宿主没能恢复节点、被收成
+  `DictComponent`）同样进入判断：判断只需要消息 ID，实际发送仍由工具侧做完整
+  内容校验。
 - **不掷骰、不签目标群决策票、不强制续轮**：意图只给源消息的实际类型、源消息 ID、
   合法目标群、工具用法与「值得分享才调用工具、可以沉默」的边界说明，外加单独标注的
   用户配置分享标准原文；不伪造聊天内容，也不对目标群唤起。
 - 群名（源群与目标群）只是不可信显示文本，一律不参与路由判断。
 
-等待上限、去重窗口与容量都是代码常量（design D1/D2），不做成配置项。
+等待上限、去重窗口与容量都是代码常量，不做成配置项。
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, Final, Mapping
 
-from .clock import Clock
+from .shared.clock import Clock
 from .config import CourierConfig, MessageType
 from .forward_precheck import (
     QQ_PLATFORM,
@@ -36,16 +36,10 @@ from .forward_precheck import (
 )
 from .send_material import is_forward_card
 from .shared.identifiers import (
-    IDENTIFIER_FORBIDDEN_CHARACTERS,
-    MAX_IDENTIFIER_LENGTH,
     safe_identifier,
 )
 
-# 标识符规则的**唯一定义**在共享层 `shared/identifiers.py`：服务端请求校验与
-# 载荷派生 ID（消息 ID / 会话 ID）共用同一实现，本模块不复制规则（design D9）。
-# `safe_identifier` 在本模块实际使用（候选筛选）；`MAX_IDENTIFIER_LENGTH` 与
-# `IDENTIFIER_FORBIDDEN_CHARACTERS` 只随导入保留在本模块名字面上（全仓无其他
-# 引用），属既有兼容面，不是本模块的二次定义。
+# 标识符规则的**唯一定义**在共享层 `shared/identifiers.py`：候选筛选按同一实现校验。
 
 ACCOUNT_ID_KEYS: Final[tuple[str, ...]] = (
     "platform_io_account_id",
@@ -53,11 +47,10 @@ ACCOUNT_ID_KEYS: Final[tuple[str, ...]] = (
     "self_id",
     "bot_account",
 )
-"""机器人账号在消息里的候选键名（宿主 `route_key_factory.py:28-33` 同款别名）。
+"""机器人账号在消息里的候选键名（与宿主同款别名）。
 
-用于排除机器人自身消息（出站消息的 `user_info.user_id` 就是机器人账号，
-`send_service.py:575-578`），同时兼容消息顶层、`message_info` 与 `additional_config`
-三个层级——宿主自己的提取口径见 `route_key_factory.py:75-99`。
+用于排除机器人自身消息（出站消息的 `user_info.user_id` 就是机器人账号），同时
+覆盖消息顶层、`message_info` 与 `additional_config` 三个层级。
 """
 
 WAKE_REASON: Final[str] = "源群自动分享判断"
@@ -69,20 +62,20 @@ WAKE_REASON: Final[str] = "源群自动分享判断"
 AUTO_READINESS_TIMEOUT_SECONDS: Final[float] = 10.0
 """确认源消息可读取的内部等待上限（秒，代码常量，不做成配置项）。
 
-design D2 建议最多 10 秒：入站 Hook 触发时消息可能尚未落库，超时即放弃本次判断。
+入站 Hook 触发时消息可能尚未落库，超时即放弃本次判断。
 """
 
 AUTO_READINESS_POLL_INTERVAL_SECONDS: Final[float] = 0.5
 """就绪确认的轮询间隔（秒，代码常量）：短间隔重试、总时长受上限约束。"""
 
 AUTO_DEDUP_WINDOW_SECONDS: Final[float] = 600.0
-"""自动入口上报去重的时间窗（秒，代码常量，design D2 建议 10 分钟）。
+"""自动入口上报去重的时间窗（秒，代码常量）。
 
 只抑制窗口内重复/并发的自动上报，不引入概率冷却，也不影响持久投递记录。
 """
 
 AUTO_DEDUP_MAX_ENTRIES: Final[int] = 4096
-"""自动入口去重状态的容量上限（条，代码常量，design D2 建议 4096）。
+"""自动入口去重状态的容量上限（条，代码常量）。
 
 超出时逐出最早登记项；去重状态只存在于内存，不是持久账本的一部分。
 """
@@ -96,7 +89,7 @@ AUTO_ENTRY_UNAVAILABLE_REASON: Final[str] = "等待期间插件已卸载，或�
 """
 
 DEFAULT_SHARE_CRITERIA: Final[str] = CourierConfig().auto.share_criteria
-"""设计 D2 的默认分享标准原文（直接从配置模型字段默认值派生，单一来源不漂移）。
+"""自动分享标准的默认原文（从配置模型字段默认值派生，单一来源不漂移）。
 
 `config.auto.share_criteria` 为空串或全空白时自动链路回退到本值；config.py 始终是
 唯一来源，本模块不另持一份原文。
@@ -106,7 +99,7 @@ MAX_DISPLAY_NAME_LENGTH: Final[int] = 80
 """群名显示文本的长度上限：超长名称截断，避免不可信文本无界膨胀意图。"""
 
 CandidateType = MessageType
-"""自动候选类型：直接复用配置的同一词汇别名（design D2/D3 单一来源）。
+"""自动候选类型：直接复用配置的同一词汇别名（单一来源）。
 
 分类只产出这三种类型；`screen_forward_candidate` 再按配置核对本次是否选中。
 """
@@ -116,7 +109,7 @@ CANDIDATE_TYPE_LABELS: Final[Mapping[CandidateType, str]] = {
     "image": "图片消息",
     "forward": "合并转发消息",
 }
-"""候选类型在判断意图里的中性表述（design D4）。
+"""候选类型在判断意图里的中性表述。
 
 普通消息不得被称为合并转发：意图必须说明实际候选类型，模型据此理解自己面对的是
 文字、图片还是聊天记录卡片。
@@ -138,7 +131,7 @@ class ForwardCandidate:
     `session_id` 与 `source_message_id` 在筛选时已过 `safe_identifier` 的字符集与
     长度关口，因此可以原样进入主动任务意图与宿主查询。`message_type` 是本次已确认
     的候选类型（与配置枚举同一词汇），供判断意图与热更新复验使用；分类成功只表示
-    「值得给一次判断机会」，不承诺内容可完整发送（design D3）。
+    「值得给一次判断机会」，不承诺内容可完整发送。
     """
 
     source_message_id: str
@@ -180,7 +173,7 @@ def _pick_account_id(*mappings: Any) -> str:
 
 
 def _classify_candidate(raw_message: Any) -> CandidateType | None:
-    """按段结构给出候选类型；不构成候选内容时返回 `None`（design D3）。
+    """按段结构给出候选类型；不构成候选内容时返回 `None`。
 
     合并转发优先：只要既有 `is_forward_card` 判据命中就归 `forward`（含宿主未展开
     的 `dict` 包装形态），不另写一份卡片形状规则——自动入口（只需消息 ID 就能给
@@ -259,7 +252,7 @@ def auto_entry_invalid_reason(
     「仍存在合法且不同于源群的目标群」五项合一：热更新时的失效取消（组合根只把它当
     布尔用）与等待结束后的重验共用本谓词，判定口径只有一处；原因措辞按「等待结束后
     重验」的语境给出。只变更标准不在这里判定——仍合法的候选继续等待，等待结束后用
-    最新标准提交（design D5）。
+    最新标准提交。
     """
 
     if not config.plugin.enabled or not config.auto.enabled:
@@ -372,7 +365,7 @@ def screen_forward_candidate(payload: Any, config: CourierConfig) -> ForwardCand
 
 
 def effective_share_criteria(config: CourierConfig) -> str:
-    """解析本次判断使用的有效分享标准（design D2）：空或全空白回退默认原文。
+    """解析本次判断使用的有效分享标准：空或全空白回退默认原文。
 
     非空内容（含换行与首尾空白）原样返回，不压平也不改写；标准只按文字参与意图
     拼接，不做模板展开、不调用 `format`／`eval`，花括号、协议语法与命令样式都只是
@@ -387,9 +380,9 @@ def display_name(raw: Any) -> str:
     """把不可信群名规整成安全的显示文本。
 
     群名可能含宿主主动任务标签的闭合串、换行或超长内容，而宿主会把意图原文包进
-    `<plugin_proactive_task>`（`runtime.py:680-695`）。这里把尖括号转成全角、压平
-    空白并限长：保留了「是什么名字」，但不再能闭合宿主结构或伪造多行指令。名称始终
-    只是显示文本，路由只认白名单群号。
+    `<plugin_proactive_task>`。这里把尖括号转成全角、压平空白并限长：保留了
+    「是什么名字」，但不再能闭合宿主结构或伪造多行指令。名称始终只是显示文本，
+    路由只认白名单群号。
     """
 
     text = _text(raw)
@@ -414,8 +407,8 @@ def build_share_intent(
     依据，且只来自白名单（`share_target_groups`）。
 
     标准只按文字拼接：它是用户配置的自然语言偏好，位于明确标注的用户配置区域，
-    不做模板展开、不参与路由与权限判定（design D4）。固定部分不夹带任何主题或
-    广告偏好，模型始终可以选择沉默。
+    不做模板展开、不参与路由与权限判定。固定部分不夹带任何主题或广告偏好，模型
+    始终可以选择沉默。
 
     这里出现的源消息 ID 与目标群号都已在候选筛选（`safe_identifier`）与白名单阶段
     校验过形态与长度，意图本身不再拼入任何未经验证的载荷字符串。
@@ -518,7 +511,7 @@ async def run_auto_entry(
     查询结束后**再次**读取最新配置、重验候选（含候选类型）、重建合法目标集合并解析
     最新标准，然后直接进入 `maisaka.proactive.trigger` 调用——中间不再插入其它异步
     查询。因此查询期间的标准、白名单与开关变更全部对本次提交生效；新增目标没有名称
-    时只列群号，已移除的目标不会从名称快照重新混入（design D5）。
+    时只列群号，已移除的目标不会从名称快照重新混入。
     """
 
     if not await confirm_readable(ctx, candidate, clock):
@@ -589,9 +582,9 @@ async def wake_share_judgement(
 ) -> WakeOutcome:
     """向源群唤起一次主动判断（只调用一次 `maisaka.proactive.trigger`）。
 
-    宿主侧要求会话已存在（`core.py:260-289` 用 `get_existing_session_by_session_id`
-    找流）——载荷里的 `session_id` 正是刚处理完的消息所属会话，因此直接复用。
-    没唤起成功也只记录原因，不重试（不做后台自动重试）；目标群绝不唤起。
+    宿主侧要求会话已存在（用 `get_existing_session_by_session_id` 找流）——载荷里的
+    `session_id` 正是刚处理完的消息所属会话，因此直接复用。没唤起成功也只记录原因，
+    不重试（不做后台自动重试）；目标群绝不唤起。
     """
 
     try:

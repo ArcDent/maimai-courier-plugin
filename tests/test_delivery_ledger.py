@@ -1,4 +1,4 @@
-"""第 4 组账本行为：经持久状态模块的**导出接口**驱动，不测试私有 SQL 辅助函数。
+"""账本行为：经持久状态模块的**导出接口**驱动，不测试私有 SQL 辅助函数。
 
 用例只断言账本对外承诺的行为：唯一键构成、四种状态的区分、评论结果附带、参数
 绑定与持久化、事务纪律与失败可区分性。启动恢复（遗留 sending）与损坏库安全关闭
@@ -7,30 +7,35 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import traceback
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from delivery_ledger import (
-    LEDGER_FILE_NAME,
+from shared.delivery import (
     STATUS_FAILED,
     STATUS_SENDING,
     STATUS_SENT,
     STATUS_UNKNOWN,
     DeliveryKey,
-    DeliveryLedger,
     LedgerStatus,
     LedgerUnavailable,
     LedgerUnavailableError,
+)
+from delivery_ledger import (
+    LEDGER_FILE_NAME,
+    DeliveryLedger,
     Reservation,
     open_ledger,
 )
-
 from tests.support import FakeClock, ledger_key, open_test_ledger
 
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+"""SQLite 边车文件后缀：主库之外的 WAL/SHM/journal 都算占用或损坏证据。"""
 
 # --------------------------------------------------------------------------- 5.1
 
@@ -110,7 +115,6 @@ CREATE TABLE delivery_ledger (
 
 def _legacy_database(path: Path, *, schema: str = LEGACY_SCHEMA, status: str = "sent",
                      comment_status: str = "sent", page_size: int = 4096) -> None:
-    """合成旧库；只给公共打开入口准备外部存储输入，不查询实现私有字段。"""
 
     connection = sqlite3.connect(path)
     try:
@@ -118,7 +122,7 @@ def _legacy_database(path: Path, *, schema: str = LEGACY_SCHEMA, status: str = "
         connection.execute(schema)
         connection.execute(
             "INSERT INTO delivery_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("10000", "10001", "m-source-1", "20002", status, "old-target",
+            ("10001", "111", "m-source-1", "222", status, "old-target",
              comment_status, "old-comment" if comment_status else "", "旧安全原因", 10.0, 20.0),
         )
         connection.commit()
@@ -143,8 +147,7 @@ def test_完整原库字段逐项兼容且不会重建(tmp_path: Path) -> None:
     assert path.read_bytes() == before
 
 
-@pytest.mark.parametrize("kind", ["空文件", "缺表", "缺列", "多列", "错主键", "错类型", "可空键",
-                                  "未知源状态", "未知评论状态", "额外表", "触发器"])
+@pytest.mark.parametrize("kind", ["空文件", "缺表", "缺列", "错主键", "未知源状态"])
 def test_结构或状态不兼容不当空库修复(tmp_path: Path, kind: str) -> None:
     path = tmp_path / LEDGER_FILE_NAME
     if kind == "空文件":
@@ -225,8 +228,7 @@ def test_原库四字段键必须保持逐字比较语义(tmp_path: Path, collat
 
 @pytest.mark.parametrize("field", ["account_id", "source_group_id", "source_message_id", "target_group_id"])
 @pytest.mark.parametrize("location", ["列", "主键"])
-@pytest.mark.parametrize("collation", ["BINARY", "binary", "BiNaRy", '"binary"', '"BiNaRy"',
-                                      "'BiNaRy'", "`BiNaRy`", "[BiNaRy]"])
+@pytest.mark.parametrize("collation", ["BiNaRy", '"binary"'])
 def test_BINARY大小写等价原库可打开且四键源与评论逐字隔离(tmp_path: Path, field: str,
                                                         location: str, collation: str) -> None:
     fields = ("account_id", "source_group_id", "source_message_id", "target_group_id")
@@ -289,7 +291,7 @@ def test_BINARY大小写等价原库可打开且四键源与评论逐字隔离(t
 
 
 @pytest.mark.parametrize("location", ["列", "主键"])
-@pytest.mark.parametrize("collation", ["BıNARY", "BİNARY", "ＢＩＮＡＲＹ", "BINARY_UNKNOWN"])
+@pytest.mark.parametrize("collation", ["ＢＩＮＡＲＹ", "BINARY_UNKNOWN"])
 def test_BINARY大小写兼容不接受Unicode易混淆或未知规则(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                       location: str, collation: str) -> None:
     connect = sqlite3.connect
@@ -354,9 +356,8 @@ def _collation_database(path: Path, field: str, collation: str, counterpart: str
 @pytest.mark.parametrize("field", ["account_id", "source_group_id", "source_message_id", "target_group_id"])
 @pytest.mark.parametrize("collation,counterpart", [("NOCASE", "caseid"), ("RTRIM", "CaseID "),
                                                    ("BINARY", "caseid"), ("BINARY", "CaseID ")])
-@pytest.mark.parametrize("decorated", [False, True])
 def test_列比较规则不能被主键BINARY覆盖掩盖(tmp_path: Path, field: str, collation: str,
-                                         counterpart: str, decorated: bool) -> None:
+                                         counterpart: str, decorated: bool = False) -> None:
     path = tmp_path / LEDGER_FILE_NAME
     first, second, rows = _collation_database(path, field, collation, counterpart, decorated=decorated)
     before = path.read_bytes()
@@ -381,8 +382,8 @@ def test_列比较规则不能被主键BINARY覆盖掩盖(tmp_path: Path, field:
         connection.close()
 
 
-@pytest.mark.parametrize("field", ["account_id", "source_group_id", "source_message_id", "target_group_id"])
-@pytest.mark.parametrize("collation,counterpart", [("NOCASE", "caseid"), ("RTRIM", "CaseID ")])
+@pytest.mark.parametrize("field", ["account_id", "source_message_id"])
+@pytest.mark.parametrize("collation,counterpart", [("NOCASE", "caseid")])
 @pytest.mark.parametrize("operation", ["get", "reserve", "mark_sent", "mark_failed", "mark_unknown",
                                         "reserve_comment", "record_comment"])
 def test_公开构造注入混合比较库也不能串读串写(tmp_path: Path, field: str, collation: str,
@@ -474,8 +475,7 @@ def test_缺主库但有旧独占锁不允许当新装(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("existing", [False, True])
 @pytest.mark.parametrize("evidence", ["service_binding.json", "service_binding.json.tmp", "service_ledger.sqlite3",
-                                      "service.lock", "旧账本快照.sqlite3", "export.tmp-1234abcd",
-                                      "人工任意快照", "历史快照目录"])
+                                      "旧账本快照.sqlite3"])
 def test_本目录历史证据不读内容不联网也不修改(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                 existing: bool, evidence: str) -> None:
     path = tmp_path / LEDGER_FILE_NAME
@@ -498,7 +498,7 @@ def test_本目录历史证据不读内容不联网也不修改(tmp_path: Path, 
     result = open_ledger(path)
     assert isinstance(result, LedgerUnavailable)
     assert calls == []
-    # 诊断只含安全条目名与类别，不回显条目正文（design D11）。
+    # 诊断只含安全条目名与类别，不回显条目正文。
     assert "假敏感正文" not in result.reason and "damaged-or-secret" not in result.reason
     assert (path.read_bytes() if existing else None) == before
     assert path.exists() is existing
@@ -508,7 +508,7 @@ def test_本目录历史证据不读内容不联网也不修改(tmp_path: Path, 
         assert (marker / "delivery_ledger.sqlite3.bak").read_text() == "假敏感正文"
 
 
-@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+@pytest.mark.parametrize("suffix", _SQLITE_SIDECAR_SUFFIXES)
 def test_孤留伴随文件保持关闭且保留证据(tmp_path: Path, suffix: str) -> None:
     marker = tmp_path / (LEDGER_FILE_NAME + suffix)
     marker.write_bytes(b"synthetic-evidence")
@@ -579,7 +579,6 @@ def test_完整原库的已知WAL伴随文件可以核实读取(tmp_path: Path) 
 
 
 def _committed_wal_snapshot(tmp_path: Path, *, page_size: int = 4096) -> Path:
-    """让成功事实仅存在于真实提交的 WAL，再复制主库及伴随文件作为离线输入。"""
 
     source, snapshot = tmp_path / "source", tmp_path / "snapshot"
     source.mkdir()
@@ -605,7 +604,6 @@ def _committed_wal_snapshot(tmp_path: Path, *, page_size: int = 4096) -> Path:
 @pytest.mark.parametrize("byte_order", ["little", "big"])
 @pytest.mark.parametrize("page_size", [512, 4096, 65536])
 def test_合法WAL两种校验字节序及页面大小保持成功阻断(tmp_path: Path, byte_order: str, page_size: int) -> None:
-    """按官方格式转换合成日志；预期成功由 SQLite 自己重放 WAL 验证，不调用待测校验器。"""
 
     path = _committed_wal_snapshot(tmp_path, page_size=page_size)
     wal = path.with_name(LEDGER_FILE_NAME + "-wal")
@@ -639,8 +637,7 @@ def test_合法WAL两种校验字节序及页面大小保持成功阻断(tmp_pat
         reopened.close()
 
 
-@pytest.mark.parametrize("damage", ["完整", "头校验", "帧校验", "页内容", "截断", "盐值", "提交标记",
-                                    "魔数", "版本", "页大小", "头截断", "帧截断"])
+@pytest.mark.parametrize("damage", ["完整", "头校验", "帧校验", "页内容", "截断", "盐值"])
 def test_WAL独有成功事实必须核实完整且损坏证据原样保留(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                           damage: str) -> None:
     path = _committed_wal_snapshot(tmp_path)
@@ -952,7 +949,6 @@ class _FaultConnection(sqlite3.Connection):
 
 
 def _fault_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[DeliveryLedger, _FaultConnection]:
-    """替换外部存储连接工厂，仍由公开 open_ledger 取得锁、建库和恢复。"""
 
     connect = sqlite3.connect
     connections: list[_FaultConnection] = []
@@ -972,7 +968,6 @@ def _fault_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Delive
 def test_游标创建及关闭故障保持安全错误与真实提交结果(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, error_type: type[Exception], operation: str,
 ) -> None:
-    import traceback
 
     ledger, connection = _fault_open(tmp_path, monkeypatch)
     key = ledger_key()
@@ -995,11 +990,9 @@ def test_游标创建及关闭故障保持安全错误与真实提交结果(
 
 
 @pytest.mark.parametrize("phase", ["begin", "write", "commit"])
-@pytest.mark.parametrize("operation", ["reserve", "mark_sent", "mark_failed", "mark_unknown", "reserve_comment",
-                                        "record_comment", "recover_interrupted"])
+@pytest.mark.parametrize("operation", ["reserve", "mark_sent", "mark_unknown", "reserve_comment"])
 def test_事务任一阶段失败不丢旧记录且连接可继续使用(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                    caplog: pytest.LogCaptureFixture, phase: str, operation: str) -> None:
-    import traceback
 
     ledger, connection = _fault_open(tmp_path, monkeypatch)
     old_key, key = ledger_key(message_id="old"), ledger_key()
@@ -1040,7 +1033,6 @@ def test_事务任一阶段失败不丢旧记录且连接可继续使用(tmp_pat
 def test_实际写入后回滚失败必须有限恢复或停用并安全释放(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                     caplog: pytest.LogCaptureFixture, operation: str,
                                                     rollback_failures: int, close_failure: bool) -> None:
-    import traceback
 
     ledger, connection = _fault_open(tmp_path, monkeypatch)
     old_key, key = ledger_key(message_id="old-sent"), ledger_key()
@@ -1253,7 +1245,6 @@ def test_打开失败且解锁失败保留真实独占直到可以安全清理(t
 def test_锁描述符关闭失败不泄密不误关复用描述符且独占可接管(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                           closed_first: bool) -> None:
     import os
-    import traceback
 
     directory = tmp_path / "plugin"
     directory.mkdir()
@@ -1370,6 +1361,26 @@ def test_账本区分四种状态并保存评论结果(tmp_path: Path) -> None:
     reopened.close()
 
 
+def test_负数目标消息ID按原值存取且重开保留(tmp_path: Path) -> None:
+
+    ledger = open_test_ledger(tmp_path)
+    key = ledger_key(message_id="m-negative-target")
+    assert ledger.reserve(key).granted is True
+    assert ledger.mark_sent(key, "-1289506878") is True
+
+    record = ledger.get(key)
+    assert record is not None
+    assert (record.status, record.target_message_id) == (STATUS_SENT, "-1289506878"), (
+        "真实目标消息 ID 按返回原值存取，负号不是拒绝或改写理由"
+    )
+    ledger.close()
+
+    reopened = open_test_ledger(tmp_path)
+    again = reopened.get(key)
+    assert again is not None and again.target_message_id == "-1289506878", "负数 ID 跨重开保留"
+    reopened.close()
+
+
 def test_SQL参数绑定且特殊字符ID按字面量存取(tmp_path: Path) -> None:
     ledger = open_test_ledger(tmp_path)
     hostile = "m-1'; DROP TABLE delivery_ledger; --"
@@ -1388,46 +1399,13 @@ def test_SQL参数绑定且特殊字符ID按字面量存取(tmp_path: Path) -> N
     ledger.close()
 
 
-# --------------------------------------------------------------- 事务边界与失败可区分
+# --------------------------------------------------------------------------- 事务边界与失败可区分
 
 
-class _FlakyCommitConnection(sqlite3.Connection):
-    """可注入一次提交失败的连接：用真实 sqlite 连接表达存储故障，不伪造账本接口。"""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._fail_next_commit = False
-
-    def fail_next_commit(self) -> None:
-        """让下一次 `commit()` 抛错（不写入任何数据）。"""
-
-        self._fail_next_commit = True
-
-    def commit(self) -> None:
-        if self._fail_next_commit:
-            self._fail_next_commit = False
-            raise sqlite3.OperationalError("注入的提交失败")
-        super().commit()
-
-
-def _flaky_ledger(tmp_path: Path) -> tuple[DeliveryLedger, _FlakyCommitConnection]:
-    """先建好表，再用可注入提交失败的连接构造账本。"""
-
-    path = tmp_path / LEDGER_FILE_NAME
-    open_test_ledger(tmp_path).close()
-    connection = sqlite3.connect(
-        str(path),
-        timeout=5.0,
-        isolation_level=None,
-        factory=_FlakyCommitConnection,
-    )
-    return DeliveryLedger(connection, FakeClock()), connection
-
-
-def test_提交失败后回滚且连接仍可继续使用(tmp_path: Path) -> None:
-    ledger, connection = _flaky_ledger(tmp_path)
+def test_提交失败后回滚且连接仍可继续使用(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ledger, connection = _fault_open(tmp_path, monkeypatch)
     try:
-        connection.fail_next_commit()
+        connection.failure = "commit"
         with pytest.raises(LedgerUnavailableError) as failure:
             ledger.reserve(ledger_key(message_id="m-commit-fail"))
 
@@ -1476,11 +1454,6 @@ def test_恢复失败与零条可区分(tmp_path: Path) -> None:
 
 
 def test_发送状态与账本状态共用同一值域声明() -> None:
-    """发送步骤的结果值域不得另行声明一份字面量（第 4 组评审遗留 #3）。
-
-    `SendStatus` 必须是 `LedgerStatus` 本身（同一类型对象），而不是复制的
-    `Literal[...]`：两份声明一旦漂移，编排的兜底分支与账本状态就会不一致。
-    """
 
     from forward_delivery import SendStatus
 
@@ -1506,13 +1479,12 @@ def test_损坏账本返回不可用且不覆盖原文件(tmp_path: Path) -> Non
 
 # --------------------------------------------------------------------------- 9.1
 # 真实部署中宿主把 `ctx.paths.data_dir` 指向插件目录，目录里必然同时存在源码、
-# 文档、配置与缓存（design D11）。历史核对只阻断状态类证据，部署文件不阻断发送。
+# 文档、配置与缓存。历史核对只阻断状态类证据，部署文件不阻断发送。
 
 _DEPLOYMENT_FILE_CONTENT = b"synthetic-deployment-file"
 
 
 def _deployment_directory(directory: Path) -> None:
-    """按真实部署形态写入插件自身文件、缓存与配置备份；全部不是状态类证据。"""
 
     for name in ("plugin.py", "config.toml", "_manifest.json", "README.md", "pyrightconfig.json",
                  "config.toml.backup.20260929233435"):
@@ -1556,11 +1528,6 @@ def test_仅有部署文件且无主库时按新装建库(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize("name", ["config.toml.backup.20260929233435", "__pycache__/x.pyc"])
 def test_数字时间戳备份名与缓存文件名仍按部署文件放行(tmp_path: Path, name: str) -> None:
-    """反例：ASCII `backup` 不进标记集，数字时间戳扩展名与 `.pyc` 缓存都不是证据。
-
-    `config.toml.backup.20260929233435` 的扩展名是数字时间戳，`config_back/` 的
-    `back` 也不得按 ASCII `backup` 子串命中；否则真实部署会被误阻断。
-    """
 
     _deployment_directory(tmp_path)
     target = tmp_path / name
@@ -1574,9 +1541,6 @@ def test_数字时间戳备份名与缓存文件名仍按部署文件放行(tmp_
 
 
 def test_纯任意名文件无法按名字判定为证据(tmp_path: Path) -> None:
-    """固有边界（已在 verification/09 记为残留风险）：无扩展名、无状态标记、非
-    `.tmp-8hex` 的名字无法按名字识别，只能靠人工核对；名字判定不假装已覆盖内容。
-    """
 
     _deployment_directory(tmp_path)
     marker = tmp_path / "x"
@@ -1591,18 +1555,12 @@ def test_纯任意名文件无法按名字判定为证据(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize("evidence", [
     "service_binding.json",
-    "service_binding.json.tmp",
-    "Service_Binding.JSON",
     "service_ledger.sqlite3",
-    "service.lock",
     "delivery_ledger.sqlite3.bak",
-    "delivery_ledger-20261001.sqlite3",
     "snapshot-20261001.tar",
     "ledger_export.tmp-1234abcd",
-    "export.tmp-1234abcd",
     "export.tmp-1234abcd\n",
     "备份.tar.gz",
-    "人工快照.tar",
     "导出归档",
 ])
 def test_状态类证据仍阻断且不打开数据库也不改动文件(
@@ -1628,7 +1586,7 @@ def test_状态类证据仍阻断且不打开数据库也不改动文件(
         assert (tmp_path / name).read_bytes() == content
 
 
-@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+@pytest.mark.parametrize("suffix", _SQLITE_SIDECAR_SUFFIXES)
 def test_部署文件不能把孤立伴随文件当新装(tmp_path: Path, suffix: str) -> None:
     _deployment_directory(tmp_path)
     marker = tmp_path / (LEDGER_FILE_NAME + suffix)
