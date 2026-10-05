@@ -1,77 +1,72 @@
-"""测试装配助手：组件声明查询等跨用例公共装配。
+"""跨测试文件共享的替身与样本：几何常量、可控时钟、有界轮询与装配助手。
 
-组件声明一律经插件公共入口 `get_components()` 读取（Runner 的同款入口），
-不直接访问私有方法或内部状态。
+这里只放**默认 pytest 档**（不装 `aiohttp`）即可导入的公共部分：可控时钟、应答
+信封、账本键与打开助手、公开工厂注入点、组件声明查询，以及多个用例共用的消息
+样本。传输、客户端与内存平台装配各自的替身分别留在
+`tests/snowluma_transport_support.py`、`tests/snowluma_client_support.py` 与
+`tests/direct_support.py`，它们从这里取共享件，不再逐文件复制第二份实现。
+
+组件声明一律经插件公共入口 `get_components()` 读取（Runner 的同款入口），不直接
+访问私有方法或内部状态；账本断言只经 `open_ledger` 公开入口与真实 SQLite 文件。
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from delivery_ledger import (
+from maimai_courier_plugin.shared.delivery import DeliveryKey
+from maimai_courier_plugin.delivery_ledger import (
     LEDGER_FILE_NAME,
-    DeliveryKey,
     DeliveryLedger,
     open_ledger,
 )
-from plugin import (
+from maimai_courier_plugin.plugin import (
     PLANNER_AFTER_RESPONSE_HOOK,
     RECEIVE_AFTER_PROCESS_HOOK,
-    CourierPlugin,
     create_plugin,
 )
-
 from tests.fake_maibot_sdk import FakePluginContext
 
-# 测试几何常量：会话、群号、平台与账号由夹具与用例共用。定义必须早于各构造函数，
-# 因为默认参数值在**定义时**求值。
-# 第 3 组（工具权限与内容预检）起的用例经宿主 `maisaka.planner.after_response`
-# 注册 Hook 获取工具参数，再调用 `forward_message`——生产链路只信任该 Hook 签发的
-# 一次性凭据。
+SOURCE_SESSION_ID = "s-source"
+"""测试默认源群会话（宿主把 platform+account+scope+group 归一到会话 ID）。"""
 
-SOURCE_SESSION_ID = "s-source-10001"
-"""测试默认源群会话：宿主把 `platform+account+scope+group` 归一到会话 ID。"""
-
-SOURCE_GROUP_ID = "10001"
+SOURCE_GROUP_ID = "111"
 """测试默认白名单源群。"""
 
-TARGET_GROUP_ID = "20002"
+TARGET_GROUP_ID = "222"
 """测试默认白名单目标群（不同于源群）。"""
 
-SOURCE_PLATFORM = "qq"
-"""测试默认平台：宿主 QQ 平台名（非 QQ 平台一律拒绝）。"""
+OTHER_TARGET_GROUP_ID = "30003"
+"""第二个白名单目标群（多目标与并存隔离用例用）。"""
 
-SOURCE_ACCOUNT_ID = "10000"
+SOURCE_ACCOUNT_ID = "10001"
 """测试默认机器人账号（路由与白名单校验按此账号对齐）。"""
 
-SOURCE_SCOPE = "qq"
-"""测试默认路由作用域（宿主 `additional_config` 里的 platform_io_scope 别名）。"""
+MESSAGE_ID = "m-source-1"
+"""测试默认源消息 ID（宿主侧与 OneBot 侧同一标识）。"""
 
-HOST_ACCOUNT_ID_KEYS: tuple[str, ...] = (
-    "platform_io_account_id",
-    "account_id",
-    "self_id",
-    "bot_account",
-)
-"""宿主路由键工厂的账号别名（MaiBot `src/platform_io/route_key_factory.py:28-33`）。"""
+HTTP_URL = "http://127.0.0.1:3000"
+"""SnowLuma 正向 HTTP API 地址（回环明文，组合根解析后交给传输）。"""
 
-HOST_SCOPE_KEYS: tuple[str, ...] = (
-    "platform_io_scope",
-    "route_scope",
-    "adapter_scope",
-    "connection_id",
-)
-"""宿主路由键工厂的作用域别名（MaiBot `src/platform_io/route_key_factory.py:34-39`）。"""
+SENDER_USER_ID = 20002
+"""OneBot 源消息记录里的发送者账号（文字节点署名只来自源消息）。"""
+
+SENDER_NICKNAME = "群友甲"
+"""OneBot 源消息记录里的发送者昵称（与群名片区分）。"""
+
+SENDER_CARD = "名片甲"
+"""OneBot 源消息记录里的发送者群名片（文字节点 name 优先取它）。"""
 
 
 class FakeClock:
     """可控时钟：`now()` 返回虚拟时间，`sleep()` 登记唤醒点由 `advance()` 推进。
 
-    不真实等待，供「有界等待 / 0.5 秒评论延迟 / 超时」的确定性测试使用；实现
-    插件侧 `clock.Clock` 协议（`now` + async `sleep`）。`sleeps` 记录每次请求的
-    秒数（含非正数），供用例断言插件是否经注入时钟登记过等待。
+    实现插件侧 `clock.Clock` 协议（`now` + async `sleep`）；不真实等待，供
+    「动作期限 / 回执轮询上限 / 0.5 秒评论延迟」的确定性测试使用。`sleeps`
+    记录每次请求的秒数（含非正数），供用例断言是否经注入时钟登记过等待。
     """
 
     def __init__(self, start: float = 0.0) -> None:
@@ -103,244 +98,43 @@ class FakeClock:
                 fut.set_result(None)
 
 
-def make_plugin(
-    data_dir: Path,
-    *,
-    config: dict[str, Any] | None = None,
-    clock: FakeClock | None = None,
-    transport_factory: Any = None,
-    environ: dict[str, str] | None = None,
-    request_timeout_seconds: float | None = None,
-    storage_fault: bool = False,
-    ledger_opener: Any = None,
-) -> tuple[CourierPlugin, FakePluginContext]:
-    """经公开工厂注入直连传输、账本打开函数及受控时钟。
+async def spin_until(predicate: Callable[[], bool]) -> None:
+    """有界让出调度、有限轮询本地测试事件，不作真实长等待。"""
 
-    只用 SDK 替身注入宿主上下文；不安装真实 SDK，配置默认保持关闭。
-    传输工厂接收纯连接描述，环境映射里的合成凭证只交给建连入口。
-    """
-
-    kwargs: dict[str, Any] = {
-        "clock": clock or FakeClock(),
-        "transport_factory": transport_factory,
-        "environ": environ,
-        "ledger_opener": ledger_opener,
-    }
-    if request_timeout_seconds is not None:
-        kwargs["request_timeout_seconds"] = request_timeout_seconds
-    plugin = create_plugin(**kwargs)
-    plugin.set_plugin_config(config or {})
-    ctx = FakePluginContext(data_dir, storage_fault=storage_fault)
-    plugin._set_context(ctx)
-    return plugin, ctx
-
-
-def prepare_source(
-    ctx: Any,
-    *,
-    raw_message: list[dict[str, Any]] | None = None,
-    message_id: str = "m-source-1",
-    **stream_overrides: Any,
-) -> None:
-    """装配一条可信来源会话与其源消息（宿主查询面替身）。"""
-
-    ctx.chat.streams = [source_stream(**stream_overrides)]
-    ctx.message.store = {
-        (SOURCE_SESSION_ID, message_id): source_message(message_id=message_id, raw_message=raw_message),
-    }
-
-
-def components_of(plugin: Any) -> list[dict[str, Any]]:
-    """读取插件注册的组件声明列表。"""
-
-    return list(plugin.get_components())
-
-
-def find_component(components: list[dict[str, Any]], component_type: str, name: str) -> dict[str, Any]:
-    """按组件类型与名称取一条声明；不存在时直接断言失败并打印实际声明。"""
-
-    for component in components:
-        if component.get("type") == component_type and component.get("name") == name:
-            return component
-    raise AssertionError(f"未注册组件 type={component_type} name={name}；实际声明={components}")
-
-
-def find_tool(plugin: Any, name: str = "forward_message") -> dict[str, Any]:
-    """取指定 Tool 的组件声明。"""
-
-    return find_component(components_of(plugin), "TOOL", name)
-
-
-def find_hook(plugin: Any, hook: str) -> dict[str, Any]:
-    """取订阅指定命名 Hook 的组件声明。"""
-
-    for component in components_of(plugin):
-        if component.get("type") != "HOOK_HANDLER":
-            continue
-        if (component.get("metadata") or {}).get("hook") == hook:
-            return component
-    raise AssertionError(f"未注册 Hook {hook}；实际声明={components_of(plugin)}")
-
-
-def merged_forward_message(
-    *,
-    message_id: str = "m-forward-1",
-    group_id: str = SOURCE_GROUP_ID,
-    session_id: str = SOURCE_SESSION_ID,
-    user_id: str = "90001",
-    platform: str = SOURCE_PLATFORM,
-    is_notify: bool = False,
-    raw_message: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """构造宿主 `chat.receive.after_process` 载荷形态的合并转发消息。
-
-    形态对齐第 1 组证据：序列化 SessionMessage（message_id / session_id /
-    platform / message_info / raw_message / processed_plain_text），Hook 分发时以
-    关键字 `message=` 传入（`bot.py:812-815` → `hook_payloads.serialize_session_message`）。
-    **`is_notify` 是载荷/message 顶层键，不在 `message_info` 内**（宿主
-    `message_utils.py:56` 的 `MessageDict`，写入 `:440`、读回 `:546-548`；`message_info`
-    只有 user_info/group_info/additional_config，`:39-44`）。`additional_config` 使用
-    宿主路由键工厂真实读写的别名（`route_key_factory.py:28-39`：账号
-    `platform_io_account_id`，作用域 `platform_io_scope`；`"scope"` 不是宿主别名）。
-
-    实现复用 `received_message`：同一个宿主载荷形状只保留一个构造点，夹具默认会话与
-    来源装配（`prepare_source`）共用 `SOURCE_SESSION_ID`，不出现两套默认值。
-    转发节点键使用宿主**接收侧**序列化名 `user_id` / `user_nickname` /
-    `user_cardname` / `message_id` / `content`（MaiBot `src/plugin_runtime/host/message_utils.py:210-222`，
-    反向解析 `:304-324`）——`nickname` / `segments` 只是 `send.forward` 入参别名
-    （`src/plugin_runtime/capabilities/core.py:484-508`），不得混入本夹具。
-    节点材料如何物化由消息网关决定（第 8 组联验），这里只提供一段可展开的转发节点。
-    """
-
-    payload = received_message(
-        message_id=message_id,
-        raw_message=(
-            [
-                forward_segment(
-                    forward_node(
-                        content=[text_segment("这是被转发的原文")],
-                        message_id=f"{message_id}-node-1",
-                        user_id=user_id,
-                    )
-                )
-            ]
-            if raw_message is None
-            else raw_message
-        ),
-        session_id=session_id,
-        group_id=group_id,
-        user_id=user_id,
-        platform=platform,
-        is_notify=is_notify,
-    )
-    payload["message"]["processed_plain_text"] = "[合并转发]"
-    return payload
-
-
-def received_message(
-    *,
-    message_id: str,
-    raw_message: list[dict[str, Any]],
-    session_id: str = SOURCE_SESSION_ID,
-    group_id: str = SOURCE_GROUP_ID,
-    group_name: str = "测试源群",
-    user_id: str = "90001",
-    platform: str = SOURCE_PLATFORM,
-    account_id: str = SOURCE_ACCOUNT_ID,
-    scope: str = SOURCE_SCOPE,
-    is_notify: bool = False,
-) -> dict[str, Any]:
-    """构造观察 Hook 的入站消息载荷（宿主 `serialize_session_message` 同形）。
-
-    形状对齐第 1 组核实：`is_notify` 是 message 顶层键（`message_utils.py:56`，
-    `message_info` 只含 user_info/group_info/additional_config，`:39-44`）；
-    账号与作用域在 `additional_config` 且使用宿主别名（`route_key_factory.py:28-39`，
-    入站由 `supervisor.py:1496-1501` 写入 `platform_io_account_id` / `platform_io_scope`）。
-    """
-
-    return {
-        "message": {
-            "message_id": message_id,
-            "session_id": session_id,
-            "platform": platform,
-            "message_info": {
-                "group_info": {"group_id": group_id, "group_name": group_name},
-                "user_info": {"user_id": user_id, "user_nickname": "群友", "user_cardname": ""},
-                "additional_config": {
-                    HOST_ACCOUNT_ID_KEYS[0]: account_id,
-                    HOST_SCOPE_KEYS[0]: scope,
-                },
-            },
-            "raw_message": [dict(segment) for segment in raw_message],
-            "is_notify": is_notify,
-            "processed_plain_text": "入站消息",
-        }
-    }
-
-
-def observe_hook_handler(plugin: Any) -> Any:
-    """经注册组件取观察 Hook 的实际处理器（宿主分发同一入口）。"""
-
-    hook = find_hook(plugin, RECEIVE_AFTER_PROCESS_HOOK)
-    return getattr(plugin, hook["metadata"]["handler_name"])
-
-
-async def drive_observe_hook(
-    plugin: Any,
-    clock: FakeClock,
-    payload: dict[str, Any],
-    *,
-    until: Any = None,
-    ticks: int = 200,
-) -> None:
-    """模拟宿主后台分发一次观察 Hook，并推进注入时钟直到工作结束。
-
-    宿主对 observe 处理器是后台任务分发（`hook_dispatcher.py:632-662`），因此这里
-    同样以任务方式驱动；每个 tick 让出事件循环一次并推进本次新登记的注入时钟等待
-    （不真实等待）。`until` 成立或 tick 用尽即停止；处理器抛出的异常会在这里重新抛出。
-    """
-
-    task = asyncio.create_task(observe_hook_handler(plugin)(**payload))
-    advanced = 0
-    for _ in range(ticks):
-        await asyncio.sleep(0)
-        for seconds in clock.sleeps[advanced:]:
-            clock.advance(seconds)
-        advanced = len(clock.sleeps)
-        if until is not None and until():
-            break
-    if task.done() and not task.cancelled():
-        error = task.exception()
-        if error is not None:
-            raise error
-
-
-async def wait_until(predicate: Any, *, attempts: int = 1000) -> None:
-    """让出事件循环直到条件成立（不依赖真实时间）。"""
-
-    for _ in range(attempts):
+    for _ in range(20000):
         if predicate():
             return
         await asyncio.sleep(0)
-    raise AssertionError("等待条件超时")
+    raise AssertionError("本地测试事件未就绪")
 
 
-async def apply_config_update(plugin: Any, config: dict[str, Any]) -> None:
-    """模拟宿主配置热更新：先注入最新配置，再调用 `on_config_update`。
+def envelope(data: Any, *, status: str = "ok", retcode: int = 0, message: str = "") -> dict[str, Any]:
+    """OneBot 动作应答信封。"""
 
-    宿主顺序（`runner_main.py:2273-2281`）：scope 为 `self` 时先
-    `_apply_plugin_config`（经 `set_plugin_config` 归一注入，`:899-901`），再调用
-    `on_config_update(scope, config_data, config_version)`。`config` 与宿主一样是
-    归一后的完整配置（缺省字段回落模型默认值）。
-    """
+    return {"status": status, "retcode": retcode, "data": data, "message": message, "wording": ""}
 
-    plugin.set_plugin_config(config)
-    await plugin.on_config_update("self", dict(config), "")
+
+def source_record(
+    message: Any = None, *, sender: dict[str, Any] | None = None, message_id: Any = -12345,
+) -> dict[str, Any]:
+    """`get_msg` 的同账号源消息记录（OneBot 群消息形态，sender 署名只来自源消息）。"""
+
+    record: dict[str, Any] = {
+        "message_id": message_id,
+        "message_type": "group",
+        "group_id": 111,
+        "user_id": SENDER_USER_ID,
+        "message": [{"type": "text", "data": {"text": "甲"}}] if message is None else message,
+        "sender": {"user_id": SENDER_USER_ID, "nickname": SENDER_NICKNAME, "card": SENDER_CARD},
+    }
+    if sender is not None:
+        record["sender"] = sender
+    return record
 
 
 def ledger_key(
     *,
-    message_id: str = "m-source-1",
+    message_id: str = MESSAGE_ID,
     target_group_id: str = TARGET_GROUP_ID,
     account_id: str = SOURCE_ACCOUNT_ID,
     source_group_id: str = SOURCE_GROUP_ID,
@@ -363,157 +157,16 @@ def open_test_ledger(data_dir: Path, *, clock: Any = None) -> DeliveryLedger:
     return ledger
 
 
-def enabled_config(
-    *,
-    source_groups: tuple[str, ...] = (SOURCE_GROUP_ID,),
-    target_groups: tuple[str, ...] = (TARGET_GROUP_ID,),
-    message_types: tuple[str, ...] = ("forward",),
-    share_criteria: str | None = None,
-) -> dict[str, Any]:
-    """构造「总开关开启 + 给定白名单」的插件配置覆盖值。
-
-    `message_types` 默认 `("forward",)`，与配置模型默认一致（默认行为不变）；
-    第 4 组起用例显式传入以选择普通文字／图片候选。`share_criteria` 为 `None` 时
-    不写该键（回落配置模型默认原文，模拟旧配置缺字段）；传入字符串则原样写入
-    （含空串与全空白，供第 5 组验证空白回退）。
-    """
-
-    auto: dict[str, Any] = {"message_types": list(message_types)}
-    if share_criteria is not None:
-        auto["share_criteria"] = share_criteria
-    return {
-        "plugin": {"enabled": True},
-        "auto": auto,
-        "scope": {"source_groups": list(source_groups), "target_groups": list(target_groups)},
-    }
-
-
-def intent_criteria_region(intent: str) -> str:
-    """取主动判断意图里「用户配置的自动分享标准」区域之后的标准原文。
-
-    标准是意图的最后一个区块（design D4），因此区域即从标注行之后到意图末尾的
-    全部文本；用例据此断言标准内容与换行逐字保留，或断言空白回退后的默认原文。
-    """
-
-    lines = intent.split("\n")
-    for index, line in enumerate(lines):
-        if "用户配置的自动分享标准" in line:
-            return "\n".join(lines[index + 1:])
-    raise AssertionError(f"意图缺少用户配置的自动分享标准区域: {intent!r}")
-
-
-def source_stream(
-    *,
-    session_id: str = SOURCE_SESSION_ID,
-    platform: str = SOURCE_PLATFORM,
-    group_id: str = SOURCE_GROUP_ID,
-    account_id: str = SOURCE_ACCOUNT_ID,
-    scope: str = SOURCE_SCOPE,
-    is_group_session: bool = True,
-) -> dict[str, Any]:
-    """构造宿主 `chat.get_all_streams` 返回的单条会话字段（`data.py:_serialize_stream`）。"""
-
-    serialized = {
-        "session_id": session_id,
-        "stream_id": session_id,
-        "platform": platform,
-        "group_id": group_id,
-        "account_id": account_id,
-        "scope": scope,
-        "is_group_session": is_group_session,
-        "chat_type": "group" if is_group_session else "private",
-    }
-    if not is_group_session:
-        serialized["group_id"] = ""
-    return serialized
-
-
-def source_message(
-    *,
-    message_id: str = "m-source-1",
-    session_id: str = SOURCE_SESSION_ID,
-    group_id: str = SOURCE_GROUP_ID,
-    user_id: str = "90001",
-    raw_message: list[dict[str, Any]] | None = None,
-    processed_plain_text: str = "源消息正文",
-) -> dict[str, Any]:
-    """构造宿主 `message.get_by_id` 返回形态的消息字典（`message_utils.py:412-450`）。"""
-
-    return {
-        "message_id": message_id,
-        "session_id": session_id,
-        "platform": SOURCE_PLATFORM,
-        "message_info": {
-            "group_info": {"group_id": group_id, "group_name": "测试源群"},
-            "user_info": {"user_id": user_id, "user_nickname": "群友", "user_cardname": ""},
-            "additional_config": {"account_id": SOURCE_ACCOUNT_ID, "platform_io_scope": SOURCE_SCOPE,
-                                  "self_id": SOURCE_ACCOUNT_ID, "platform_io_account_id": SOURCE_ACCOUNT_ID,
-                                  "napcat_message_type": "group", "client_type": "napcat"},
-        },
-        "raw_message": (
-            [{"type": "text", "data": "源消息正文"}] if raw_message is None else list(raw_message)
-        ),
-        "processed_plain_text": processed_plain_text,
-    }
-
-
 def text_segment(text: str) -> dict[str, Any]:
     """文本段（宿主接收侧序列化形态）。"""
 
     return {"type": "text", "data": text}
 
 
-def image_segment(
-    *,
-    description: str = "图片描述",
-    binary_data_base64: str | None = "aW1hZ2UtYnl0ZXM=",
-    binary_hash: str = "hash-image",
-) -> dict[str, Any]:
-    """图片段：`binary_data_base64` 为 None 时模拟「只有描述、媒体已丢失」。"""
-
-    segment: dict[str, Any] = {"type": "image", "data": description, "hash": binary_hash}
-    if binary_data_base64 is not None:
-        segment["binary_data_base64"] = binary_data_base64
-    return segment
-
-
-def at_segment(
-    target_user_id: Any = "30001",
-    *,
-    nickname: Any = None,
-    cardname: Any = None,
-) -> dict[str, Any]:
-    """提及段（宿主接收侧序列化形态，见本变更 tasks.md 第 1 组 1.1 核实记录）。
-
-    三个字段是宿主唯一的序列化出口（`message_utils.py:134-142`，入站载荷、存储回读
-    与转发节点同形）：`target_user_id` 是对象标识字符串（全体成员为网关字面量
-    `"all"`，解析不出对象时是空串），名称字段由宿主在 `message.process()` 期间原地
-    补写、可能为 `null`（显示偏好是群名片优先、其次昵称）。参数默认取「个人、没有
-    名称」的合法形态；异常载荷由用例显式传入（如空串、`None`、非字典）。
-    """
-
-    return {
-        "type": "at",
-        "data": {
-            "target_user_id": target_user_id,
-            "target_user_nickname": nickname,
-            "target_user_cardname": cardname,
-        },
-    }
-
-
 def forward_segment(*nodes: dict[str, Any]) -> dict[str, Any]:
     """合并转发段（宿主接收侧序列化形态：`{"type": "forward", "data": [节点…]}`）。"""
 
     return {"type": "forward", "data": [dict(node) for node in nodes]}
-
-
-def unexpanded_forward_segment(*, nodes: list[Any] | None = None) -> dict[str, Any]:
-    """未展开的合并转发段：宿主没能恢复节点材料时收成 `DictComponent`
-    （`message_utils.py:327-338`），序列化后是 `{"type": "dict", "data": {"type": "forward", …}}`。
-    """
-
-    return {"type": "dict", "data": {"type": "forward", "data": list(nodes or [])}}
 
 
 def forward_node(
@@ -535,73 +188,138 @@ def forward_node(
     }
 
 
-def function_call_item(
+def source_stream(
     *,
-    func_name: str,
-    arguments: dict[str, Any],
-    call_id: str = "call-1",
-    item_id: str = "item-1",
+    session_id: str = SOURCE_SESSION_ID,
+    platform: str = "qq",
+    group_id: str = SOURCE_GROUP_ID,
+    account_id: str = SOURCE_ACCOUNT_ID,
+    scope: str = "qq",
+    is_group_session: bool = True,
 ) -> dict[str, Any]:
-    """构造宿主 `maisaka.planner.after_response` 载荷里的单个函数调用 Item。
+    """宿主 `chat.get_all_streams` 返回的单条会话字段。"""
 
-    形态对齐宿主快照序列化
-    （`serialize_context_item_snapshot`：`item_type` / `meta` / `tool_call`
-    `{call_id, func_name, args, extra_content}`）；宿主一次处理一批 tool_calls，
-    同一载荷里可以混有指向其它工具的调用。
-    """
+    serialized = {
+        "session_id": session_id,
+        "stream_id": session_id,
+        "platform": platform,
+        "group_id": group_id,
+        "account_id": account_id,
+        "scope": scope,
+        "is_group_session": is_group_session,
+        "chat_type": "group" if is_group_session else "private",
+    }
+    if not is_group_session:
+        serialized["group_id"] = ""
+    return serialized
+
+
+def source_message(
+    *,
+    message_id: str = MESSAGE_ID,
+    session_id: str = SOURCE_SESSION_ID,
+    group_id: str = SOURCE_GROUP_ID,
+    user_id: str = "90001",
+    raw_message: list[dict[str, Any]] | None = None,
+    processed_plain_text: str = "源消息正文",
+) -> dict[str, Any]:
+    """宿主 `message.get_by_id` 返回形态的消息字典（可信保留链样本）。"""
 
     return {
-        "item_type": "FunctionCallItem",
-        "meta": {"item_id": item_id},
-        "tool_call": {
-            "call_id": call_id,
-            "func_name": func_name,
-            "args": dict(arguments),
-            "extra_content": None,
+        "message_id": message_id,
+        "session_id": session_id,
+        "platform": "qq",
+        "message_info": {
+            "group_info": {"group_id": group_id, "group_name": "测试源群"},
+            "user_info": {"user_id": user_id, "user_nickname": "群友", "user_cardname": ""},
+            "additional_config": {
+                "account_id": SOURCE_ACCOUNT_ID,
+                "platform_io_scope": "qq",
+                "self_id": SOURCE_ACCOUNT_ID,
+                "platform_io_account_id": SOURCE_ACCOUNT_ID,
+                "napcat_message_type": "group",
+                "client_type": "napcat",
+            },
         },
+        "raw_message": (
+            [text_segment("源消息正文")] if raw_message is None else list(raw_message)
+        ),
+        "processed_plain_text": processed_plain_text,
     }
 
 
-def run_binding_hook(
-    plugin: Any,
-    *,
-    session_id: str = SOURCE_SESSION_ID,
-    output_items: Any,
-) -> list[dict[str, Any]]:
-    """模拟宿主调用 `maisaka.planner.after_response`，返回改写后的全部输出项。
+def components_of(plugin: Any) -> list[dict[str, Any]]:
+    """读取插件注册的组件声明列表（Runner 的同款入口）。"""
 
-    宿主形态：Hook 载荷由宿主构造（`session_id` + `output_items`），处理器可改写
-    `output_items`；本轮改写结果就是随后 `plugin.invoke_tool` 收到的调用
-    （`runner_main.py:2214` 取 `modified_kwargs`）。用例只经注册组件入口驱动，
-    不直接调用私有函数。
+    return list(plugin.get_components())
+
+
+def find_hook(plugin: Any, hook: str) -> dict[str, Any]:
+    """取订阅指定命名 Hook 的组件声明（宿主分发同一入口）。"""
+
+    for component in components_of(plugin):
+        if component.get("type") != "HOOK_HANDLER":
+            continue
+        if (component.get("metadata") or {}).get("hook") == hook:
+            return component
+    raise AssertionError(f"未注册 Hook {hook}；实际声明={components_of(plugin)}")
+
+
+def enabled_config(
+    *,
+    source_groups: tuple[str, ...] = (SOURCE_GROUP_ID,),
+    target_groups: tuple[str, ...] = (TARGET_GROUP_ID,),
+    message_types: tuple[str, ...] = ("forward",),
+    share_criteria: str | None = None,
+    http_url: str = HTTP_URL,
+) -> dict[str, Any]:
+    """「总开关开启 + 给定白名单 + 回环 HTTP 直连」的配置覆盖值。
+
+    `message_types` 默认 `("forward",)`，与配置模型默认一致；`share_criteria` 为
+    `None` 时不写该键（回落模型默认原文），传入字符串则原样写入（含空白串）。
     """
 
-    hook = find_hook(plugin, PLANNER_AFTER_RESPONSE_HOOK)
-    handler = getattr(plugin, hook["metadata"]["handler_name"])
-    result = asyncio.run(
-        handler(session_id=session_id, output_items=output_items, item_schema_version=1)
-    )
-    mutated_items = result["modified_kwargs"]["output_items"]
-    if not isinstance(mutated_items, list) or not mutated_items:
-        raise AssertionError(f"Hook 未返回可用的 output_items: {result!r}")
-    return mutated_items
+    auto: dict[str, Any] = {"message_types": list(message_types)}
+    if share_criteria is not None:
+        auto["share_criteria"] = share_criteria
+    return {
+        "plugin": {"enabled": True},
+        "auto": auto,
+        "scope": {"source_groups": list(source_groups), "target_groups": list(target_groups)},
+        "snowluma": {"http_url": http_url, "token": "合成令牌"},
+    }
+
+
+def make_plugin(
+    data_dir: Path,
+    *,
+    config: dict[str, Any] | None = None,
+    clock: Any = None,
+    transport_factory: Any = None,
+    environ: dict[str, str] | None = None,
+    ledger_opener: Any = None,
+) -> tuple[Any, FakePluginContext]:
+    """经公开工厂注入时钟、传输与环境；账本默认由真实 `open_ledger` 打开。"""
+
+    plugin = create_plugin(clock=clock or FakeClock(), transport_factory=transport_factory,
+                           environ=environ, ledger_opener=ledger_opener)
+    plugin.set_plugin_config(config or {})
+    ctx = FakePluginContext(data_dir)
+    plugin._set_context(ctx)
+    return plugin, ctx
 
 
 def issue_source_call(
     plugin: Any,
     *,
     session_id: str = SOURCE_SESSION_ID,
-    message_id: str = "m-source-1",
+    message_id: str = MESSAGE_ID,
     target_group_id: str = TARGET_GROUP_ID,
     comment: Any = "",
     extra_arguments: dict[str, Any] | None = None,
     output_items: Any = None,
 ) -> dict[str, Any]:
-    """模拟宿主调用 `maisaka.planner.after_response`，返回该工具调用最终收到的参数。
-
-    与 `run_binding_hook` 同一条注册组件入口；缺省只放一条指向 `forward_message`
-    的调用，返回它的最终参数（供随后驱动 `plugin.forward_message`）。
-    """
+    """经注册 Hook 签发一次性来源凭据，返回该工具调用最终收到的参数。"""
 
     arguments: dict[str, Any] = {
         "message_id": message_id,
@@ -610,56 +328,23 @@ def issue_source_call(
     }
     arguments.update(extra_arguments or {})
     if output_items is None:
-        output_items = [function_call_item(func_name="forward_message", arguments=arguments)]
-    mutated_items = run_binding_hook(plugin, session_id=session_id, output_items=output_items)
+        output_items = [{
+            "item_type": "FunctionCallItem",
+            "meta": {"item_id": "item-1"},
+            "tool_call": {
+                "call_id": "call-1",
+                "func_name": "forward_message",
+                "args": arguments,
+                "extra_content": None,
+            },
+        }]
+    hook = find_hook(plugin, PLANNER_AFTER_RESPONSE_HOOK)
+    handler = getattr(plugin, hook["metadata"]["handler_name"])
+    result = asyncio.run(handler(session_id=session_id, output_items=output_items, item_schema_version=1))
+    mutated_items = result["modified_kwargs"]["output_items"]
+    if not isinstance(mutated_items, list) or not mutated_items:
+        raise AssertionError(f"Hook 未返回可用的 output_items: {result!r}")
     tool_call = mutated_items[0].get("tool_call")
     if not isinstance(tool_call, dict):
         raise AssertionError(f"output_items 缺少 tool_call: {mutated_items!r}")
     return dict(tool_call.get("args") or {})
-
-
-def run_bound_forward(
-    plugin: Any,
-    *,
-    session_id: str = SOURCE_SESSION_ID,
-    message_id: str = "m-source-1",
-    target_group_id: str = TARGET_GROUP_ID,
-    comment: Any = "",
-    extra_arguments: dict[str, Any] | None = None,
-    clock: FakeClock | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """先经可信 Hook 绑定来源，再调用 `forward_message`；返回（工具结果, 工具参数）。
-
-    传入 `clock` 时在事件循环内自动推进插件登记的等待（评论 0.5 秒延迟不真实等待），
-    供不需要逐步断言等待时序的用例使用；需要断言时序的用例自己写事件循环场景。
-    """
-
-    arguments = issue_source_call(
-        plugin,
-        session_id=session_id,
-        message_id=message_id,
-        target_group_id=target_group_id,
-        comment=comment,
-        extra_arguments=extra_arguments,
-    )
-    if clock is None:
-        result = asyncio.run(plugin.forward_message(**arguments))
-    else:
-        result = asyncio.run(run_with_clock(plugin, clock, arguments))
-    return result, arguments
-
-
-async def run_with_clock(plugin: Any, clock: FakeClock, arguments: dict[str, Any]) -> dict[str, Any]:
-    """让即时查询先完成，仅推进真正的短等待，不把动作看门狗当业务延迟。"""
-    task = asyncio.create_task(plugin.forward_message(**arguments))
-    advanced = len(clock.sleeps)
-    for index in range(5000):
-        if task.done():
-            return task.result()
-        await asyncio.sleep(0)
-        if index % 50 == 49:
-            for seconds in clock.sleeps[advanced:]:
-                if seconds <= 0.5:
-                    clock.advance(seconds)
-            advanced = len(clock.sleeps)
-    raise AssertionError("工具调用在推进注入时钟后仍未结束")

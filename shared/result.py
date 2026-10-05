@@ -1,9 +1,8 @@
-"""共享投递结果面：状态词汇、结果类型与唯一的结果渲染（design D8）。
+"""共享投递结果面：状态词汇、结果类型与唯一的结果渲染。
 
-插件侧 `forward_delivery.py` 与服务端（第 3–5 组）都重导出/导入本模块，结果状态与
-渲染口径只有这一份定义（design D9）。本模块不依赖插件侧模块：材料只按结构面
-（`kind` + `shape`）渲染，不导入 `send_material`，因此无 `maibot_sdk` 的服务进程
-可以直接导入。
+结果状态与渲染口径只有这一份定义，编排与客户端都从这里导入。本模块不依赖
+插件侧模块：材料只按结构面（`kind` + `shape`）渲染，不导入 `send_material`，
+因此无 `maibot_sdk` 的解释器可以直接导入。
 """
 
 from __future__ import annotations
@@ -46,7 +45,7 @@ TOOL_STATUS_LEDGER_UNAVAILABLE: Final[ToolStatus] = "ledger_unavailable"
 
 @dataclass(frozen=True, slots=True)
 class SourceSendResult:
-    """发送步骤的结果面（源消息与服务端评论发送共用）。
+    """源消息与评论共用的发送结果面。
 
     - `sent`：拿到真实目标消息 ID（`target_message_id` 必须非空）；
     - `failed`：明确没有发出任何消息；
@@ -130,23 +129,12 @@ def render_forward_result(
     source_message_id: str = "",
     target_group_id: str = "",
 ) -> dict[str, Any]:
-    """把投递结果组装成统一工具结果面（唯一的结果口径，见下）。
+    """把投递结果组装成统一工具结果面（唯一的结果口径）。
 
-    口径关系：
-
-    - `status`：调用状态，七种可区分取值——`sent`（完整成功）、`partial`（部分成功：
-      源消息已投递并落账，评论未完成）、`already_forwarded`（此前已投递，本次未发送）、
-      `sending`（同键在途）、`rejected`（预检/总开关拒绝）、`failed`（源消息明确未发送，
-      可后续显式重试）、`unknown`（结果待核实，核实前不重发）；另有
-      `ledger_unavailable`（账本不可用，属拒绝类）。
-    - `success`：调用是否**完整成功**（`status` 为 `sent` 或 `already_forwarded`）；
-      部分成功、待核实与已知回执但未落盘都不是完整成功。
-    - `sent` / `delivered`：源消息是否已确认投递（拿到真实目标消息 ID），本次或既有
-      记录都算；「已发送但状态未落盘」时为 true，但此时 `success` 仍为 false。
-    - `comment_status`：""（未要求评论）/ `sent` / `failed` / `unknown`。
-    - `stage`：错误阶段（`rejected` / `source_send` / `source_persist` / `comment_send`
-      / `comment_persist`），无故障时为空串；`reason` 是配套的中文原因。
-    - `material` 只在预检通过后传入：拒绝分支没有已准备的材料，不得声称材料完整。
+    `success` 只在完整成功时为 true（`sent` / `already_forwarded`）；部分成功、
+    待核实与已知回执但未落盘都不是完整成功。`sent` / `delivered` 只表示源消息
+    已确认投递（含既有成功记录）。`material` 只在预检通过后传入：拒绝分支没有
+    已准备的材料，不得声称材料完整。
     """
 
     rendered: dict[str, Any] = {

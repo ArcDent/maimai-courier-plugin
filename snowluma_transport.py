@@ -1,4 +1,13 @@
-"""SnowLuma 固定动作传输与纯配置解析；网络库延迟到建连时导入。"""
+"""SnowLuma 固定动作 HTTP 传输与纯配置解析；网络库延迟到发出请求前导入。
+
+本模块只做传输与端点安全判定，不感知消息类型语义（分派归 `snowluma_client`）。
+契约要点：无连接，按请求 `POST /{action}`；凭证仅经 `Authorization: Bearer` 头；
+禁跟随重定向；请求体自设 2MiB 上限，序列化后超限在发出前拒绝；明文建连前解析
+主机名判定可信网络；单实例串行执行且不重放动作。固定七动作加关闭，没有任意动作
+代理：只读 `get_login_info` / `get_group_list` / `get_msg` / `get_forward_msg`，
+发送 `send_msg` / `send_forward_msg` / `send_group_forward_msg`（卡片路径的实测
+契约见 `docs/snowluma-http-api-catalog.md`）。
+"""
 
 from __future__ import annotations
 
@@ -7,32 +16,31 @@ import ipaddress
 import json
 import os
 import socket
-import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 from urllib.parse import urlsplit
-
-ONEBOT_ACTION_TIMEOUT_SECONDS: Final[float] = 10.0
-"""动作排队、握手、写入和响应共用的绝对期限。"""
-ONEBOT_CLOSE_TIMEOUT_SECONDS: Final[float] = 5.0
-"""单独关闭的上限；上层可提前取消以共享更小的卸载剩余预算。"""
-
-
-@dataclass(slots=True)
-class _Submission:
-    """本次调用的提交证据；取消后禁止尚未开始的写入。"""
-
-    submitted: bool = False
-    stopped: bool = False
 
 if TYPE_CHECKING:
     from .config import CourierConfig
+
 from .shared.clock import Clock, SystemClock
 from .shared.config_rules import is_loopback_host, is_private_host, onebot_endpoint_rejection, valid_env_var_name
 
+ONEBOT_ACTION_TIMEOUT_SECONDS: Final[float] = 10.0
+"""单个动作排队、写入和响应共用的绝对期限。"""
+
+ONEBOT_CLOSE_TIMEOUT_SECONDS: Final[float] = 5.0
+"""单独关闭的上限；上层可提前取消以共享更小的卸载剩余预算。"""
+
+ONEBOT_MAX_REQUEST_BYTES: Final[int] = 2 * 1024 * 1024
+"""客户端自设请求体上限：低于实测服务端上限（约 2–3MB）留余量。"""
+
+_DEFAULT_HTTP_PORT: Final[int] = 80
+"""地址未显式带端口时解析用的默认 HTTP 端口（只影响解析注入点，不改写端点）。"""
+
 HostResolver = Callable[[str, int], Awaitable[Sequence[str]]]
-"""建连前的主机名解析注入点：返回全部解析地址文本，解析失败抛异常。"""
+"""发出请求前的主机名解析注入点：返回全部解析地址文本，解析失败抛异常。"""
 
 
 async def _resolve_host_addresses(host: str, port: int) -> Sequence[str]:
@@ -62,7 +70,7 @@ class OneBotUnresolved:
 def resolve_onebot_connection(
     config: CourierConfig | Mapping[str, Any], environ: Mapping[str, str]
 ) -> OneBotConnection | OneBotUnresolved:
-    """只解析受控配置，不建立连接、不读取环境变量中的凭证值。"""
+    """只解析受控配置，不发出请求、不读取环境变量中的凭证值。"""
 
     if isinstance(config, Mapping):
         from .config import CourierConfig
@@ -71,9 +79,9 @@ def resolve_onebot_connection(
             config = CourierConfig(**dict(config))
         except ValueError as error:
             return OneBotUnresolved(str(error), config_failure=True)
-    endpoint = config.snowluma.websocket_url
+    endpoint = config.snowluma.http_url
     if not endpoint:
-        return OneBotUnresolved("未配置 SnowLuma WebSocket 地址；旧 [service] 配置已退役，不能作为直连配置")
+        return OneBotUnresolved("未配置 SnowLuma HTTP 地址")
     reason = onebot_endpoint_rejection(endpoint)
     if reason:
         return OneBotUnresolved(reason, config_failure=bool(endpoint))
@@ -95,10 +103,18 @@ def resolve_onebot_connection(
     return OneBotConnection(endpoint, token_env_var)
 
 
+UnavailableCategory = Literal[
+    "configuration", "closed", "insecure_endpoint", "credentials", "authentication",
+    "permission", "request_too_large", "timeout", "cancelled", "transport_unavailable",
+    "unexpected_response", "close_incomplete", "close_timeout", "close_pending",
+]
+"""传输不可用的安全类别全集（客户端与测试只依赖这些字面量，拼写漂移由类型检查兜住）。"""
+
+
 class OneBotUnavailable(RuntimeError):
     """只暴露安全类别；submitted 为可能进入写入，默认保守为真。"""
 
-    def __init__(self, category: str = "transport_unavailable", *, submitted: bool = True):
+    def __init__(self, category: UnavailableCategory = "transport_unavailable", *, submitted: bool = True):
         self.category = category
         self.submitted = submitted
         super().__init__(f"OneBot 传输不可用（{category}）")
@@ -110,94 +126,277 @@ def _consume_exception(task: asyncio.Future[Any]) -> None:
         task.exception()
 
 
-async def _reject_redirect(session: Any, context: Any, params: Any) -> None:
-    """公开 trace 在下一跳前拒绝；不读取或回显 URL 与认证头。"""
-    params.response.close()
-    raise OneBotUnavailable("redirect", submitted=False)
+_ENVELOPE_STATUSES: Final[frozenset[str]] = frozenset({"ok", "failed", "async"})
+_EVENT_KEYS: Final[tuple[str, ...]] = (
+    "post_type", "message_type", "meta_event_type", "notice_type", "request_type",
+)
+
+
+def _is_action_envelope(payload: object) -> bool:
+    """只认动作应答信封；事件、错形态与契约外状态不算响应。"""
+
+    return (isinstance(payload, Mapping)
+            and not any(key in payload for key in _EVENT_KEYS)
+            and isinstance(payload.get("status"), str)
+            and payload["status"] in _ENVELOPE_STATUSES
+            and type(payload.get("retcode")) is int
+            and "data" in payload
+            and isinstance(payload["data"], (dict, list, type(None))))
 
 
 @runtime_checkable
 class OneBotTransport(Protocol):
-    """仅供基础设施使用的四个固定动作；不提供任意动作代理。"""
+    """固定动作访问面：七个动作加关闭；不提供任意动作代理，不建立长连接。
 
-    @property
-    def connection_generation(self) -> int: ...
+    只读四个：`get_login_info` / `get_group_list` / `get_msg` / `get_forward_msg`
+    （后者按源卡片标识展开查询合并转发节点）；发送三个：`send_msg`（普通图片段与
+    评论）、`send_forward_msg`（普通文字单节点卡片）、`send_group_forward_msg`
+    （卡片展开节点重组投递）。
+    """
 
-    async def get_login_info(self, *, expected_generation: int | None = None) -> Mapping[str, Any]: ...
-    async def get_msg(self, message_id: str, *, expected_generation: int | None = None) -> Mapping[str, Any]: ...
-    async def get_group_list(self, *, expected_generation: int | None = None) -> Mapping[str, Any]: ...
+    async def get_login_info(self) -> Mapping[str, Any]: ...
+    async def get_group_list(self) -> Mapping[str, Any]: ...
+    async def get_msg(self, message_id: str) -> Mapping[str, Any]: ...
+    async def get_forward_msg(self, id: str) -> Mapping[str, Any]: ...
     async def send_msg(
         self, *, target_group_id: str, message: Sequence[Mapping[str, Any]],
-        expected_generation: int, before_submit: Callable[[], bool], stage: str = "",
+        before_submit: Callable[[], bool],
+    ) -> Mapping[str, Any]: ...
+    async def send_forward_msg(
+        self, *, target_group_id: str, messages: Sequence[Mapping[str, Any]],
+        before_submit: Callable[[], bool],
+    ) -> Mapping[str, Any]: ...
+    async def send_group_forward_msg(
+        self, *, target_group_id: str, messages: Sequence[Mapping[str, Any]],
+        before_submit: Callable[[], bool],
     ) -> Mapping[str, Any]: ...
     async def close(self) -> None: ...
 
 
+@dataclass(slots=True)
+class _Submission:
+    """本次调用的提交证据；取消后禁止尚未开始的写入。"""
+
+    submitted: bool = False
+    stopped: bool = False
+
+
 class AiohttpOneBotTransport:
-    """从原固定传输演进；构造不联网，单实例串行执行且不重放动作。"""
+    """无连接 HTTP 传输：构造不联网，单实例串行执行且不重放动作。"""
 
     def __init__(
         self, connection: OneBotConnection, *, clock: Clock | None = None,
         environ: Mapping[str, str] | None = None,
-        register_task: Callable[[asyncio.Task[Any], str], None] | None = None,
         session_factory: Callable[..., Any] | None = None,
         resolver: HostResolver | None = None,
     ) -> None:
         self._connection = connection
         self._clock = clock if clock is not None else SystemClock()
         self._environ = environ if environ is not None else os.environ
-        self._register_task = register_task
         self._session_factory = session_factory
         self._resolver = resolver if resolver is not None else _resolve_host_addresses
         self._lock = asyncio.Lock()
-        self._socket: Any = None
         self._session: Any = None
-        self._generation = 0
-        self._sequence = 0
-        self._instance = uuid.uuid4().hex
-        self._receiver: asyncio.Task[None] | None = None
-        self._pending: tuple[str, asyncio.Future[Mapping[str, Any]]] | None = None
         self._closed = False
         self._close_deadline: float | None = None
-        self._cleanup_tasks: dict[asyncio.Task[Any], bool] = {}
-        self._cleanup_failed = False
         self._operations: set[asyncio.Task[Any]] = set()
-        self._closed_signal: asyncio.Future[None] | None = None
 
-    @property
-    def connection_generation(self) -> int:
-        return self._generation
+    async def get_login_info(self) -> Mapping[str, Any]:
+        return await self._call("get_login_info", {})
 
-    async def get_login_info(self, *, expected_generation: int | None = None) -> Mapping[str, Any]:
-        return await self._call("get_login_info", {}, expected_generation)
+    async def get_group_list(self) -> Mapping[str, Any]:
+        return await self._call("get_group_list", {})
 
-    async def get_msg(self, message_id: str, *, expected_generation: int | None = None) -> Mapping[str, Any]:
-        return await self._call("get_msg", {"message_id": message_id}, expected_generation)
+    async def get_msg(self, message_id: str) -> Mapping[str, Any]:
+        return await self._call("get_msg", {"message_id": message_id})
 
-    async def get_group_list(self, *, expected_generation: int | None = None) -> Mapping[str, Any]:
-        return await self._call("get_group_list", {}, expected_generation)
+    async def get_forward_msg(self, id: str) -> Mapping[str, Any]:
+        """按源卡片标识展开查询合并转发节点；只读，不设提交许可闸门。"""
+
+        return await self._call("get_forward_msg", {"id": id})
 
     async def send_msg(
         self, *, target_group_id: str, message: Sequence[Mapping[str, Any]],
-        expected_generation: int, before_submit: Callable[[], bool], stage: str = "",
+        before_submit: Callable[[], bool],
     ) -> Mapping[str, Any]:
-        # stage 只定位基础设施工作，不写入协议。
         return await self._call("send_msg", {
             "message_type": "group", "group_id": target_group_id,
             "message": [dict(segment) for segment in message],
-        }, expected_generation, before_submit, stage=stage)
+        }, before_submit)
+
+    async def send_forward_msg(
+        self, *, target_group_id: str, messages: Sequence[Mapping[str, Any]],
+        before_submit: Callable[[], bool],
+    ) -> Mapping[str, Any]:
+        # 自定义节点卡片；不设置 summary/news/prompt/source 等预览类参数。
+        return await self._call("send_forward_msg",
+                                {"group_id": target_group_id, "messages": [dict(node) for node in messages]},
+                                before_submit)
+
+    async def send_group_forward_msg(
+        self, *, target_group_id: str, messages: Sequence[Mapping[str, Any]],
+        before_submit: Callable[[], bool],
+    ) -> Mapping[str, Any]:
+        # 卡片展开节点重组投递：节点数组只来自 get_forward_msg 展开查询结果；
+        # 不设置预览类参数，外层预览由平台默认生成。
+        return await self._call("send_group_forward_msg",
+                                {"group_id": target_group_id, "messages": [dict(node) for node in messages]},
+                                before_submit)
+
+    async def close(self) -> None:
+        """幂等且有界：重复调用立即返回；取消在途请求并在剩余预算内关闭会话。"""
+
+        if self._closed and self._session is None:
+            return
+        self._closed = True
+        for operation in tuple(self._operations):
+            operation.cancel()
+        session, self._session = self._session, None
+        if session is None:
+            return
+        if self._close_deadline is None:
+            self._close_deadline = self._clock.now() + ONEBOT_CLOSE_TIMEOUT_SECONDS
+        closer = asyncio.ensure_future(session.close())
+        try:
+            await self._race_until(closer, self._close_deadline,
+                                   lambda: OneBotUnavailable("close_incomplete", submitted=False))
+        except (Exception, asyncio.CancelledError):
+            raise OneBotUnavailable("close_incomplete", submitted=False) from None
+
+    async def _sleep_until(self, deadline: float) -> None:
+        await self._clock.sleep(max(0.0, deadline - self._clock.now()))
+
+    async def _call(
+        self, action: str, params: Mapping[str, Any], before_submit: Callable[[], bool] | None = None,
+    ) -> Mapping[str, Any]:
+        if self._closed:
+            raise OneBotUnavailable("closed", submitted=False)
+        deadline = self._clock.now() + ONEBOT_ACTION_TIMEOUT_SECONDS
+        state = _Submission()
+        operation = asyncio.create_task(self._execute(action, params, before_submit, deadline, state))
+        self._operations.add(operation)
+        operation.add_done_callback(self._operations.discard)
+        operation.add_done_callback(_consume_exception)
+        try:
+            return await self._race_until(operation, deadline,
+                                          lambda: OneBotUnavailable("timeout", submitted=state.submitted))
+        except asyncio.CancelledError:
+            raise OneBotUnavailable("cancelled", submitted=state.submitted) from None
+        except OneBotUnavailable:
+            raise
+        except Exception:
+            raise OneBotUnavailable("transport_unavailable", submitted=state.submitted) from None
+        finally:
+            state.stopped = True
+
+    async def _race_until(self, work: asyncio.Future[Any], deadline: float,
+                          on_timeout: Callable[[], OneBotUnavailable]) -> Any:
+        """在注入时钟期限内等待工作完成；未完成即取消工作并按给定类别报错（不重放）。
+
+        取消与异常回收对本实例一切后台等待统一收口：动作与关闭两类等待共用，
+        期限先到不等待不合作的取消。
+        """
+
+        timer = asyncio.create_task(self._sleep_until(deadline))
+        try:
+            await asyncio.wait((work, timer), return_when=asyncio.FIRST_COMPLETED)
+            if not work.done():
+                raise on_timeout()
+            return work.result()
+        finally:
+            timer.cancel()
+            work.cancel()
+            timer.add_done_callback(_consume_exception)
+            work.add_done_callback(_consume_exception)
+
+    async def _execute(
+        self, action: str, params: Mapping[str, Any],
+        before_submit: Callable[[], bool] | None, deadline: float, state: _Submission,
+    ) -> Mapping[str, Any]:
+        async with self._lock:
+            if self._closed:
+                raise OneBotUnavailable("closed", submitted=False)
+            if state.stopped or self._clock.now() >= deadline:
+                raise OneBotUnavailable("timeout", submitted=False)
+            body = self._request_body(action, params)
+            token = self._request_token()
+            if onebot_endpoint_rejection(self._connection.endpoint) is not None:
+                raise OneBotUnavailable("configuration", submitted=False)
+            if not await self._plaintext_target_allowed():
+                raise OneBotUnavailable("insecure_endpoint", submitted=False)
+            if before_submit is not None:
+                try:
+                    allowed = before_submit()
+                except Exception:
+                    allowed = False
+                if not allowed:
+                    raise OneBotUnavailable("permission", submitted=False)
+            session = await self._ensure_session()
+            try:
+                state.submitted = True
+                async with session.post(
+                    self._action_url(action), data=body, allow_redirects=False,
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                ) as response:
+                    return await self._read_envelope(response, state)
+            except OneBotUnavailable:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # 断连、载荷错误与库异常一律按传输不可用；不回显异常携带的敏感载荷。
+                raise OneBotUnavailable("transport_unavailable", submitted=state.submitted) from None
+
+    def _request_body(self, action: str, params: Mapping[str, Any]) -> bytes:
+        """动作信封序列化；超出自设上限时在发出前拒绝。"""
+
+        body = json.dumps(
+            {"action": action, "params": dict(params)}, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        if len(body) > ONEBOT_MAX_REQUEST_BYTES:
+            raise OneBotUnavailable("request_too_large", submitted=False)
+        return body
+
+    def _request_token(self) -> str:
+        """配置令牌优先；留空或全空白时才在发出请求前按名读取凭证环境变量。"""
+
+        token = self._connection.token
+        if isinstance(token, str) and token.strip():
+            return token
+        name = self._connection.token_env_var
+        if not isinstance(name, str) or not valid_env_var_name(name):
+            raise OneBotUnavailable("configuration", submitted=False)
+        value = self._environ.get(name, "")
+        if not isinstance(value, str) or not value.strip():
+            raise OneBotUnavailable("credentials", submitted=False)
+        return value
+
+    def _action_url(self, action: str) -> str:
+        """固定正向动作地址；令牌只经认证头，不进 URL。"""
+
+        return f"{self._connection.endpoint.rstrip('/')}/{action}"
+
+    async def _ensure_session(self) -> Any:
+        """惰性复用单一会话：不经环境代理；重定向旗标逐请求显式关闭。"""
+
+        if self._session is None or self._session.closed:
+            import aiohttp
+
+            factory = self._session_factory or aiohttp.ClientSession
+            self._session = factory(trust_env=False)
+        return self._session
 
     async def _plaintext_target_allowed(self) -> bool:
-        """明文端点只允许回环字面量与解析为回环/私有/链路本地的目标（design D11）。
+        """明文端点只允许回环字面量与解析为回环/私有/链路本地的目标。
 
-        `wss` 不做该判定；`ws` 的主机名在建立连接前用运行循环解析，要求**全部**
-        解析结果为可信网络。解析失败、结果含公网地址或没有任何结果一律拒绝，绝不
-        因主机名（容器名）形态直接放行公网目标；`ws` 公网 IP 字面量已在配置判定
-        中拒绝。这里只做判定，不写出任何帧、不携带凭证。
+        `https` 不做该判定（默认验证证书）；`http` 的主机名在发出请求前用运行循环
+        解析，要求**全部**解析结果为可信网络。解析失败、结果含公网地址或没有任何
+        结果一律拒绝，绝不因主机名（容器名）形态直接放行公网目标；`http` 公网 IP
+        字面量已在配置判定中拒绝。这里只做判定，不写出任何请求、不携带凭证。
         """
 
         parts = urlsplit(self._connection.endpoint)
-        if parts.scheme != "ws":
+        if parts.scheme != "http":
             return True
         host = parts.hostname or ""
         if is_loopback_host(host):
@@ -206,7 +405,7 @@ class AiohttpOneBotTransport:
             ipaddress.ip_address(host.rstrip("."))
         except ValueError:
             try:
-                addresses = await self._resolver(host, parts.port if parts.port is not None else 80)
+                addresses = await self._resolver(host, parts.port if parts.port is not None else _DEFAULT_HTTP_PORT)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -214,237 +413,20 @@ class AiohttpOneBotTransport:
             return bool(addresses) and all(is_private_host(str(address)) for address in addresses)
         return is_private_host(host)
 
-    async def _connect(self, state: _Submission, deadline: float) -> Any:
-        if (self._socket is not None and not self._socket.closed
-                and self._receiver is not None and not self._receiver.done()):
-            return self._socket
-        self._start_connection_close()
-        await self._wait_cleanup(deadline, wait_operations=False)
-        if self._closed or state.stopped or self._clock.now() >= deadline:
-            raise OneBotUnavailable("stopped", submitted=False)
-        import aiohttp
+    async def _read_envelope(self, response: Any, state: _Submission) -> Mapping[str, Any]:
+        """状态分类后只认动作信封；3xx 与认证失败可证明未送达，其余失败保守对待。"""
 
-        factory = self._session_factory or aiohttp.ClientSession
-        category = "handshake"
+        status = getattr(response, "status", 0)
+        if 300 <= status < 400:
+            raise OneBotUnavailable("insecure_endpoint", submitted=False)
+        if status in (401, 403):
+            raise OneBotUnavailable("authentication", submitted=False)
+        if status >= 400:
+            raise OneBotUnavailable("transport_unavailable", submitted=state.submitted)
         try:
-            token = self._connection.token
-            if (onebot_endpoint_rejection(self._connection.endpoint)
-                    or not isinstance(token, str)
-                    or (not token.strip() and not valid_env_var_name(self._connection.token_env_var))):
-                raise OneBotUnavailable("configuration", submitted=False)
-            if not await self._plaintext_target_allowed():
-                raise OneBotUnavailable("insecure_endpoint", submitted=False)
-            if not token.strip():
-                token = self._environ.get(self._connection.token_env_var, "")
-            if not isinstance(token, str) or not token.strip():
-                raise OneBotUnavailable("credentials", submitted=False)
-            trace = aiohttp.TraceConfig()
-            trace.on_request_redirect.append(_reject_redirect)
-            self._session = factory(trust_env=False, trace_configs=[trace])
-            socket = await self._session.ws_connect(
-                self._connection.endpoint, headers={"Authorization": f"Bearer {token}"},
-                ssl=True, compress=0, max_msg_size=4194304,
-            )
-            if self._closed or state.stopped:
-                self._schedule_close(socket, "SnowLuma 关闭迟到连接")
-                raise OneBotUnavailable("closed", submitted=False)
-            self._socket = socket
-        except OneBotUnavailable as error:
-            category = error.category
-        except aiohttp.ClientConnectorCertificateError:
-            category = "certificate"
-        except aiohttp.WSServerHandshakeError as error:
-            category = "authentication" if error.status in (401, 403) else "handshake"
-        except Exception:
-            pass
-        else:
-            self._generation += 1
-            self._receiver = asyncio.create_task(self._receive(self._socket, self._generation))
-            if self._register_task is not None:
-                self._register_task(self._receiver, "SnowLuma 接收")
-            return self._socket
-        self._start_connection_close()
-        raise OneBotUnavailable(category, submitted=False) from None
-
-    async def _call(
-        self, action: str, params: Mapping[str, Any], expected_generation: int | None,
-        before_submit: Callable[[], bool] | None = None, *, stage: str = "",
-    ) -> Mapping[str, Any]:
-        if self._closed:
-            raise OneBotUnavailable("closed", submitted=False)
-        deadline = self._clock.now() + ONEBOT_ACTION_TIMEOUT_SECONDS
-        state = _Submission()
-        if self._closed_signal is None:
-            self._closed_signal = asyncio.get_running_loop().create_future()
-        operation = asyncio.create_task(self._execute(action, params, expected_generation, before_submit, deadline, state))
-        self._operations.add(operation)
-        operation.add_done_callback(self._operations.discard)
-        operation.add_done_callback(_consume_exception)
-        timer = asyncio.create_task(self._wait_deadline(deadline))
-        if self._register_task is not None:
-            label = {"source": "源消息", "comment": "评论"}.get(stage, action)
-            self._register_task(operation, f"SnowLuma {label}")
-        try:
-            await asyncio.wait((operation, timer, self._closed_signal), return_when=asyncio.FIRST_COMPLETED)
-            if self._closed and not operation.done():
-                raise OneBotUnavailable("closed", submitted=state.submitted)
-            if self._clock.now() >= deadline:
-                raise OneBotUnavailable("timeout", submitted=state.submitted)
-            return operation.result()
-        except asyncio.CancelledError:
-            raise OneBotUnavailable("cancelled", submitted=state.submitted) from None
-        except OneBotUnavailable as error:
-            raise OneBotUnavailable(error.category, submitted=state.submitted) from None
-        except Exception:
-            raise OneBotUnavailable("transport", submitted=state.submitted) from None
-        finally:
-            state.stopped = True
-            timer.cancel()
-            operation.cancel()
-            # 不等待拒绝取消的操作；关闭入口继续跟踪残留，回收异常不回显原文。
-            timer.add_done_callback(_consume_exception)
-
-    async def _wait_deadline(self, deadline: float) -> None:
-        await self._clock.sleep(max(0.0, deadline - self._clock.now()))
-
-    async def _execute(
-        self, action: str, params: Mapping[str, Any], expected_generation: int | None,
-        before_submit: Callable[[], bool] | None, deadline: float, state: _Submission,
-    ) -> Mapping[str, Any]:
-        async with self._lock:
-            if self._closed:
-                raise OneBotUnavailable("closed", submitted=False)
-            if state.stopped or self._clock.now() >= deadline:
-                raise OneBotUnavailable("timeout", submitted=False)
-            if expected_generation is not None:
-                if (expected_generation != self._generation or self._socket is None
-                        or self._socket.closed or self._receiver is None or self._receiver.done()):
-                    raise OneBotUnavailable("connection_changed", submitted=False)
-                socket = self._socket
-            else:
-                socket = await self._connect(state, deadline)
-            if self._closed:
-                raise OneBotUnavailable("closed", submitted=False)
-            if state.stopped or self._clock.now() >= deadline:
-                raise OneBotUnavailable("timeout", submitted=False)
-            self._sequence += 1
-            echo = f"{self._instance}:{self._generation}:{self._sequence}"
-            response = asyncio.get_running_loop().create_future()
-            self._pending = (echo, response)
-            try:
-                if before_submit is not None:
-                    try:
-                        allowed = before_submit()
-                    except Exception:
-                        allowed = False
-                    if not allowed:
-                        raise OneBotUnavailable("permission", submitted=False)
-                state.submitted = True
-                await socket.send_json({"action": action, "params": dict(params), "echo": echo})
-                return await response
-            finally:
-                self._pending = None
-                response.cancel()
-                _consume_exception(response)
-
-    async def _receive(self, socket: Any, generation: int) -> None:
-        """唯一接收者；空闲也消费事件，不保存消息、不为事件创建任务。"""
-        from aiohttp import WSMsgType
-
-        try:
-            while True:
-                # receive 在缓冲已有事件时可能不让出；主动让期限与卸载任务得到调度。
-                await asyncio.sleep(0)
-                frame = await socket.receive()
-                if socket is not self._socket or generation != self._generation or frame.type != WSMsgType.TEXT:
-                    break
-                try:
-                    payload = json.loads(frame.data)
-                except (ValueError, TypeError):
-                    continue
-                pending = self._pending
-                if (
-                    pending is not None and isinstance(payload, dict)
-                    and not any(key in payload for key in (
-                        "post_type", "message_type", "meta_event_type", "notice_type", "request_type",
-                    ))
-                    and payload.get("echo") == pending[0]
-                    and isinstance(payload.get("status"), str)
-                    and payload["status"] in {"ok", "failed", "async"}
-                    and type(payload.get("retcode")) is int
-                    and "data" in payload
-                    and isinstance(payload["data"], (dict, list, type(None)))
-                    and not pending[1].done()
-                ):
-                    pending[1].set_result(payload)
-        except Exception:
-            pass
-        finally:
-            if socket is self._socket and generation == self._generation:
-                self._generation += 1
-                pending = self._pending
-                if pending is not None and not pending[1].done():
-                    pending[1].set_exception(OneBotUnavailable("disconnected"))
-
-    def _start_connection_close(self) -> None:
-        """同步失效旧核验；每个资源仅启动一次关闭，所有残留都可定位。"""
-        socket, session, receiver = self._socket, self._session, self._receiver
-        if socket is not None:
-            self._generation += 1
-        pending = self._pending
-        if pending is not None and not pending[1].done():
-            pending[1].set_exception(OneBotUnavailable("closed"))
-        self._socket = self._session = self._receiver = None
-        if receiver is not None:
-            self._cleanup_tasks[receiver] = False
-            receiver.add_done_callback(self._cleanup_done)
-        for resource, description in [(socket, "SnowLuma 关闭连接"), (session, "SnowLuma 关闭会话")]:
-            if resource is not None:
-                self._schedule_close(resource, description)
-
-    def _schedule_close(self, resource: Any, description: str) -> None:
-        task = asyncio.create_task(resource.close())
-        self._cleanup_tasks[task] = True
-        task.add_done_callback(self._cleanup_done)
-        if self._register_task is not None:
-            self._register_task(task, description)
-
-    def _cleanup_done(self, task: asyncio.Task[Any]) -> None:
-        resource = self._cleanup_tasks.pop(task, False)
-        # 资源关闭被取消不等于已释放；接收任务取消则是正常退出。
-        if task.cancelled():
-            self._cleanup_failed |= resource
-        elif task.exception() is not None:
-            self._cleanup_failed = True
-
-    async def _wait_cleanup(self, deadline: float, *, wait_operations: bool = True) -> None:
-        timer = asyncio.create_task(self._wait_deadline(deadline))
-        try:
-            while pending := {task for task in set(self._cleanup_tasks) | (self._operations if wait_operations else set()) if not task.done()}:
-                if self._clock.now() >= deadline:
-                    raise OneBotUnavailable("close_incomplete")
-                await asyncio.wait((*pending, timer), return_when=asyncio.FIRST_COMPLETED)
-            for task in tuple(self._cleanup_tasks):
-                self._cleanup_done(task)
-            if self._cleanup_failed:
-                raise OneBotUnavailable("close_incomplete")
-        except asyncio.CancelledError:
-            raise OneBotUnavailable("close_incomplete") from None
-        finally:
-            timer.cancel()
-            timer.add_done_callback(_consume_exception)
-            for task in set(self._cleanup_tasks) | (self._operations if wait_operations else set()):
-                if not task.done():
-                    task.cancel()
-
-    async def close(self) -> None:
-        """幂等且有界；未退出工作保持登记，不发送注销或服务控制动作。"""
-        self._closed = True
-        if self._closed_signal is not None and not self._closed_signal.done():
-            self._closed_signal.set_result(None)
-        for operation in self._operations:
-            operation.cancel()
-        if self._close_deadline is None:
-            self._close_deadline = self._clock.now() + ONEBOT_CLOSE_TIMEOUT_SECONDS
-        self._start_connection_close()
-        await self._wait_cleanup(self._close_deadline)
+            payload = await response.json(content_type=None)
+        except (ValueError, TypeError):
+            raise OneBotUnavailable("unexpected_response", submitted=state.submitted) from None
+        if not _is_action_envelope(payload):
+            raise OneBotUnavailable("unexpected_response", submitted=state.submitted)
+        return payload

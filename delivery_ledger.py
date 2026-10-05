@@ -1,4 +1,4 @@
-"""投递账本：宿主 `data_dir` 内的 SQLite 最小持久状态（design D6）。
+"""投递账本：宿主 `data_dir` 内的 SQLite 最小持久状态。
 
 - **唯一键**：机器人账号 + 源群 + 源消息 ID + 目标群；评论不参与键，评论结果作为
   字段附属于源发送记录。
@@ -33,7 +33,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Callable, Iterator, Union
 
-from .clock import Clock, SystemClock
+from .shared.clock import Clock, SystemClock
 from .shared.delivery import (
     STATUS_FAILED,
     STATUS_SENDING,
@@ -43,12 +43,10 @@ from .shared.delivery import (
     LedgerStatus,
     LedgerUnavailable,
     LedgerUnavailableError,
-    SendStatus,
 )
 
-# 投递身份、账本状态与账本错误类型的**唯一定义**在共享层 `shared/delivery.py`
-# （服务进程同样需要且不能依赖插件侧模块，design D9）；本模块只做兼容重导出，
-# 上面的导入保证 `delivery_ledger.DeliveryKey` 等名字与共享层是同一对象。
+# 投递身份、账本状态与账本错误类型的**唯一定义**在共享层 `shared/delivery.py`，
+# 本模块按自身签名需要直接导入子模块，不在顶层为调用方准备第二导入入口。
 
 LEDGER_FILE_NAME = "delivery_ledger.sqlite3"
 """账本文件名（固定落在宿主授予的 `ctx.paths.data_dir` 下）。"""
@@ -60,7 +58,7 @@ _LEDGER_COMPANION_SUFFIXES = ("-wal", "-shm", "-journal")
 """SQLite 伴随文件后缀；只允许主库存在时按固定名出现。"""
 
 _DEPLOYMENT_EXTENSIONS = (".py", ".md", ".toml", ".txt", ".rst", ".yaml", ".yml", ".ini", ".cfg", ".pyc", ".pyo")
-"""插件自身部署文件扩展名；带状态标记但属这些扩展名的条目不是账本证据（design D11）。"""
+"""插件自身部署文件扩展名；带状态标记但属这些扩展名的条目不是账本证据。"""
 
 _STATE_NAME_MARKERS = ("ledger", "delivery", "courier", "snapshot", "receipt")
 """状态类证据名字标记（忽略大小写）；用于识别旧账本归档、导出与快照痕迹。"""
@@ -69,11 +67,11 @@ _CHINESE_STATE_MARKERS = ("快照", "归档", "备份")
 """中文状态标记；仅在不以部署类扩展名结尾时阻断。
 
 刻意不含 ASCII `backup`/`archive`：真实部署目录存在 `config_back/`，按 ASCII
-子串判定会把正常部署误判成历史证据（design D11 第 1 条）。
+子串判定会把正常部署误判成历史证据。
 """
 
 _ARCHIVE_EXTENSIONS = (".tar", ".tgz", ".gz", ".zip", ".7z", ".rar", ".bak")
-"""归档类扩展名；命中即阻断，不按部署文件放行（design D11 第 1 条）。"""
+"""归档类扩展名；命中即阻断，不按部署文件放行。"""
 
 _TMP_EXPORT_NAME_PATTERN = re.compile(r"\.tmp-[0-9a-f]{8}\s*\Z")
 """历史导出/半成品的临时名形态 `<目标>.tmp-<8位十六进制>`（忽略大小写）。
@@ -211,7 +209,7 @@ def _state_evidence_category(name: str) -> str | None:
     部署类扩展名（源码/文档/配置/缓存）不因名字含标记而成为证据；主库、本插件
     独占锁与主库伴随后缀是固定状态文件，允许与否由调用方在名字规则之前处理。
     额外命中三类形态：`.tmp-<8位十六进制>` 历史导出临时名、归档类扩展名，以及
-    不以部署类扩展名结尾的中文「快照/归档/备份」标记（design D11 第 1 条）。
+    不以部署类扩展名结尾的中文「快照/归档/备份」标记。
     """
 
     lowered = name.lower()
@@ -282,7 +280,7 @@ def open_ledger(path: Path, *, clock: Clock | None = None) -> DeliveryLedger | L
     归档扩展名、中文快照/归档/备份标记、孤立伴随文件、链接文件及其子目录内一层
     名字命中的同类证据），插件自身部署文件不阻断发送；只在本次新建锁且没有任何
     状态类证据时按新装建库。拒绝符号链接、硬链接、未知状态条目或不兼容库，
-    不删除证据、不打开服务数据库（design D6/D11）。
+    不删除证据、不打开服务数据库。
     """
 
     time_source = clock or SystemClock()
