@@ -34,16 +34,22 @@ SOURCE_SESSION_ID = "s-source"
 """测试默认源群会话（宿主把 platform+account+scope+group 归一到会话 ID）。"""
 
 SOURCE_GROUP_ID = "111"
-"""测试默认白名单源群。"""
+"""测试默认转发分组内的源群。"""
 
 TARGET_GROUP_ID = "222"
-"""测试默认白名单目标群（不同于源群）。"""
+"""测试默认转发分组内的目标群（不同于源群）。"""
 
 OTHER_TARGET_GROUP_ID = "30003"
-"""第二个白名单目标群（多目标与并存隔离用例用）。"""
+"""默认分组内的第二个目标群（多目标与并存隔离用例用）。"""
+
+DEFAULT_GROUP_NAME = "默认分组"
+"""测试夹具默认转发分组名（只作用户标识与日志前缀，不参与判定）。"""
+
+CONTROL_CHARACTER_GROUP_NAME = "研发\n甲\x00"
+"""含换行与裸控制字符的分组名：日志与任务描述必须压平为单行。"""
 
 SOURCE_ACCOUNT_ID = "10001"
-"""测试默认机器人账号（路由与白名单校验按此账号对齐）。"""
+"""测试默认机器人账号（路由与分组校验按此账号对齐）。"""
 
 MESSAGE_ID = "m-source-1"
 """测试默认源消息 ID（宿主侧与 OneBot 侧同一标识）。"""
@@ -272,20 +278,34 @@ def enabled_config(
     message_types: tuple[str, ...] = ("forward",),
     share_criteria: str | None = None,
     http_url: str = HTTP_URL,
+    groups: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """「总开关开启 + 给定白名单 + 回环 HTTP 直连」的配置覆盖值。
+    """「总开关开启 + 给定转发分组 + 回环 HTTP 直连」的配置覆盖值。
 
     `message_types` 默认 `("forward",)`，与配置模型默认一致；`share_criteria` 为
     `None` 时不写该键（回落模型默认原文），传入字符串则原样写入（含空白串）。
+    转发分组有两种入口：默认（及 `source_groups=`/`target_groups=` 关键字）构造**单一
+    默认分组**，两个关键字落入同一分组；`groups=` 按给定字典序列显式构造多分组，
+    与 `CourierConfig(scope={"groups": [...]})` 的字段面一致；传入 `groups` 时另外
+    两个关键字（`source_groups=`/`target_groups=`）被忽略。
     """
 
     auto: dict[str, Any] = {"message_types": list(message_types)}
     if share_criteria is not None:
         auto["share_criteria"] = share_criteria
+    scope_groups = (
+        [{"name": DEFAULT_GROUP_NAME, "source_groups": list(source_groups),
+          "target_groups": list(target_groups)}]
+        if groups is None else [
+            {**group, "source_groups": list(group.get("source_groups") or []),
+             "target_groups": list(group.get("target_groups") or [])}
+            for group in groups
+        ]
+    )
     return {
         "plugin": {"enabled": True},
         "auto": auto,
-        "scope": {"source_groups": list(source_groups), "target_groups": list(target_groups)},
+        "scope": {"groups": scope_groups},
         "snowluma": {"http_url": http_url, "token": "合成令牌"},
     }
 

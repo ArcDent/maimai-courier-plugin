@@ -81,8 +81,10 @@ async def trusted_forward(
         "item_type": "FunctionCallItem",
         "tool_call": {"func_name": "forward_message", "args": arguments},
     }])
-    config = CourierConfig(**{"plugin": {"enabled": True},
-                              "scope": {"source_groups": ["111"], "target_groups": ["222", "111"]}})
+    config = CourierConfig(plugin={"enabled": True},
+                           scope={"groups": [{"name": "客户端测试分组",
+                                              "source_groups": ["111"],
+                                              "target_groups": ["222", "111"]}]})
     return await precheck_forward_request(
         ctx=ctx, config=config, bindings=bindings, arguments=items[0]["tool_call"]["args"],
     )

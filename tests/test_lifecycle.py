@@ -19,10 +19,11 @@ from typing import Any
 
 from maimai_courier_plugin.shared.delivery import STATUS_SENT
 from maimai_courier_plugin.shared.result import COMMENT_DELAY_SECONDS
-from tests.direct_support import DirectFixture, merged_forward_message
+from tests.direct_support import (DirectFixture, apply_config_update, merged_forward_message)
 from tests.fake_maibot_sdk import FakePluginContext
 from tests.snowluma_client_support import TARGET_MESSAGE_ID
 from tests.support import (
+    CONTROL_CHARACTER_GROUP_NAME,
     HTTP_URL,
     MESSAGE_ID,
     SOURCE_ACCOUNT_ID,
@@ -34,6 +35,7 @@ from tests.support import (
     issue_source_call,
     make_plugin,
     open_test_ledger,
+    source_message,
     source_stream,
     spin_until,
 )
@@ -547,3 +549,145 @@ def test_端点替换后新投递改走新会话且旧会话不再续发(tmp_pat
 
     asyncio.run(scenario())
     fixture.ledger.close()
+
+
+def test_分组收紧后评论提交前复验失败且不回滚已投递源(tmp_path: Path) -> None:
+
+    fixture = DirectFixture(tmp_path)
+    fixture.prepare_source()
+    arguments = issue_source_call(fixture.plugin, comment="收紧后不应发送的评论")
+
+    async def scenario() -> None:
+        await fixture.plugin.on_load()
+        task = asyncio.create_task(fixture.plugin.forward_message(**arguments))
+        await spin_until(lambda: COMMENT_DELAY_SECONDS in fixture.clock.sleeps)
+        tightened = enabled_config(
+            groups=[{"name": "研发", "source_groups": [SOURCE_GROUP_ID], "target_groups": []}],
+        )
+        await apply_config_update(fixture.plugin, tightened)
+        fixture.clock.advance(COMMENT_DELAY_SECONDS)
+        result = await asyncio.wait_for(task, 5)
+
+        assert result["status"] == "partial", result
+        assert result["comment_status"] == "failed", result
+        assert [item["action"] for item in fixture.transport.sent] == ["send_group_forward_msg"], (
+            "目标被移出源组后不得提交评论发送",
+        )
+        record = fixture.record()
+        assert record is not None and record["status"] == STATUS_SENT, record
+        assert record["comment_status"] == "", record
+
+    asyncio.run(scenario())
+    fixture.ledger.close()
+
+
+def test_卸载告警的任务描述带压平分组前缀(tmp_path: Path) -> None:
+
+    clock = SwallowingClock()
+    fixture = DirectFixture(tmp_path, clock=clock, groups=[
+        {"name": CONTROL_CHARACTER_GROUP_NAME, "source_groups": [SOURCE_GROUP_ID],
+         "target_groups": [TARGET_GROUP_ID]},
+    ])
+    fixture.prepare_source()
+    arguments = issue_source_call(fixture.plugin, comment="等待期间卸载")
+
+    async def scenario() -> None:
+        await fixture.plugin.on_load()
+        task = asyncio.create_task(fixture.plugin.forward_message(**arguments))
+        await spin_until(lambda: COMMENT_DELAY_SECONDS in fixture.clock.sleeps)
+        unloading = asyncio.create_task(fixture.plugin.on_unload())
+        try:
+            for _ in range(30):
+                await asyncio.sleep(0)
+            fixture.clock.advance(5)
+            await unloading
+            warnings = "\n".join(fixture.ctx.logger.texts("warning"))
+            assert "分组=研发 甲" in warnings, warnings
+            for text in fixture.ctx.logger.texts("warning"):
+                assert "\n" not in text and "\x00" not in text, text
+        finally:
+            clock.unstuck()
+            for _ in range(50):
+                await asyncio.sleep(0)
+        assert task.done() and (await task)["status"] == "partial", "放行后按已知源事实报告部分成功"
+
+    asyncio.run(scenario())
+    fixture.ledger.close()
+
+
+def test_源提交前分组收紧按拒绝处理且不发送不落账(tmp_path: Path) -> None:
+    """目标被移出来源群分组后，源提交前的许可复验（`_send_allowed`）整条拒绝。"""
+
+    fixture = DirectFixture(tmp_path)
+    fixture.prepare_source()
+    arguments = issue_source_call(fixture.plugin, comment="不应发送的评论")
+    tightened = enabled_config(
+        groups=[{"name": "研发", "source_groups": [SOURCE_GROUP_ID], "target_groups": []}],
+    )
+    applied = False
+
+    async def tighten_on_prepare(action: str, params: Any) -> Any:
+        # 预检通过后、源查询（同账号名册与源消息）期间收紧分组：源提交前复验必须拦截。
+        nonlocal applied
+        if action == "get_login_info" and not applied:
+            applied = True
+            await apply_config_update(fixture.plugin, tightened)
+        return None
+
+    fixture.transport.on_action = tighten_on_prepare
+
+    async def scenario() -> None:
+        await fixture.plugin.on_load()
+        result = await fixture.plugin.forward_message(**arguments)
+        assert result["status"] == "rejected", result
+        assert "本次未发送任何消息" in str(result["reason"]), result
+        assert fixture.transport.sent == [], "分组收紧后不得提交源发送"
+        assert fixture.record() is None, "未发送不得落账"
+
+    asyncio.run(scenario())
+    fixture.ledger.close()
+
+
+def test_on_config_update只取消失效自动判断且不打断合法候选(tmp_path: Path) -> None:
+    clock = FakeClock()
+    groups = [
+        {"name": "研发", "source_groups": [SOURCE_GROUP_ID], "target_groups": [TARGET_GROUP_ID]},
+        {"name": "运营", "source_groups": ["555"], "target_groups": ["666"]},
+    ]
+    plugin, ctx = make_plugin(tmp_path, clock=clock, config=enabled_config(groups=groups))
+    candidate_a = merged_forward_message(message_id="m-auto-a", group_id=SOURCE_GROUP_ID,
+                                         session_id="s-a")
+    candidate_b = merged_forward_message(message_id="m-auto-b", group_id="555", session_id="s-b")
+    # 收紧研发分组（源 111 的目标被移出），运营分组保持不变：A 失效、B 仍合法。
+    tightened = enabled_config(groups=[
+        {"name": "研发", "source_groups": [SOURCE_GROUP_ID], "target_groups": []},
+        {"name": "运营", "source_groups": ["555"], "target_groups": ["666"]},
+    ])
+
+    def queries(message_id: str) -> int:
+        return sum(1 for call in ctx.message.calls if call["message_id"] == message_id)
+
+    async def scenario() -> None:
+        await plugin.observe_received_message(**candidate_a)
+        await plugin.observe_received_message(**candidate_b)
+        await spin_until(lambda: len(clock.sleeps) >= 1 and len(ctx.message.calls) >= 2)
+        await apply_config_update(plugin, tightened)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        a_before, b_before = queries("m-auto-a"), queries("m-auto-b")
+        # 收紧后消息仍未就绪：被取消的 A 停止轮询，仍合法的 B 继续有限的就绪轮询。
+        clock.advance(2.0)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert queries("m-auto-a") == a_before, "失效候选被热更新取消，停止就绪轮询"
+        assert queries("m-auto-b") > b_before, "仍合法的候选不被打断，继续就绪轮询"
+        # 两条候选此刻都可读取：只有仍合法的 B 被唤起。
+        ctx.message.default_result = source_message(message_id="m-auto-any")
+        clock.advance(20.0)
+        for _ in range(100):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    triggered = [call["metadata"]["source_message_id"] for call in ctx.maisaka.proactive.calls]
+    assert triggered == ["m-auto-b"], "热更新只取消失效的自动判断，仍合法的候选照常唤起"

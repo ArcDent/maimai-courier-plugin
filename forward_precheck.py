@@ -4,8 +4,8 @@
 
 1. 三参数类型校验（ID 一律按字符串处理，禁止数值换算）；
 2. 用一次性凭据换回可信 Planner 会话（拒绝模型伪造的会话/平台/授权字段）；
-3. 校验来源为 QQ 群聊且在源白名单，并按可信会话查询源消息归属与可读性；
-4. 校验目标群白名单、不同于源群（目标平台与账号可用性由直连准备阶段核对）；
+3. 校验来源为 QQ 群聊且属于某个转发分组，并按可信会话查询源消息归属与可读性；
+4. 校验目标群与来源群同属一个转发分组、不同于源群（目标平台与账号可用性由直连准备阶段核对）；
 5. 构建材料摘要：普通消息继续做完整内容预检（含提及文本化与不支持段拒绝），
    **合并转发卡片只取标识与归属核验**（顶层唯一形状，混排拒绝）：与客户端
    `SnowLumaClient.prepare_source` 的判定口径一致，不在本地重复构造卡片材料
@@ -131,7 +131,7 @@ async def precheck_forward_request(
     if isinstance(source, Rejected):
         return source
     if not source_group_is_allowed(config, source.group_id):
-        return Rejected.not_sent("调用来源群不在源群白名单内")
+        return Rejected.not_sent("调用来源群不在任何转发分组内")
 
     message = await _fetch_source_message(ctx, parsed.message_id, source.session_id)
     if isinstance(message, Rejected):
@@ -139,8 +139,8 @@ async def precheck_forward_request(
 
     if parsed.target_group_id == source.group_id:
         return Rejected.not_sent("目标群不能是调用来源群自身")
-    if not target_is_allowed(config, parsed.target_group_id):
-        return Rejected.not_sent("目标群不在目标白名单内")
+    if shared_forward_group(config, source.group_id, parsed.target_group_id) is None:
+        return Rejected.not_sent("目标群不在与来源群相同的转发分组内")
 
     onebot_message_id = _mapped_source_id(message, parsed.message_id, source)
     if not onebot_message_id:
@@ -272,11 +272,11 @@ async def _fetch_source_message(
     return message
 
 
-def whitelist_entries(values: Any) -> tuple[str, ...]:
-    """把配置白名单归一成去空白字符串序列（字符串化、丢弃空值、保持配置顺序）。
+def group_id_entries(values: Any) -> tuple[str, ...]:
+    """把配置里的群号序列归一成去空白字符串（字符串化、丢弃空值、保持配置顺序）。
 
-    工具侧预检、权限复验与自动入口共用本口径：用户可能手工编辑配置文件，判定不得
-    因为一处实现只接受 `str` 而在另一处接受字符串化结果。
+    工具侧预检、成对判定、阶段复验与自动入口共用本口径：用户可能手工编辑配置文件，
+    判定不得因为一处实现只接受 `str` 而在另一处接受字符串化结果。
     """
 
     try:
@@ -286,17 +286,68 @@ def whitelist_entries(values: Any) -> tuple[str, ...]:
     return tuple(text for item in items if (text := str(item).strip()))
 
 
-def source_group_is_allowed(config: Any, group_id: str) -> bool:
-    """来源群是否仍在源群白名单内（与目标群判定共用同一份白名单口径）。"""
+@dataclass(frozen=True, slots=True)
+class ForwardGroup:
+    """一个转发分组的归一视图（纯数据：分组名 + 源群号 + 目标群号）。
 
-    return str(group_id).strip() in set(whitelist_entries(config.scope.source_groups))
-
-
-def target_is_allowed(config: Any, target_group_id: str) -> bool:
-    """目标群是否仍在目标白名单内。
-
-    预检、源阶段授权前的复验与评论阶段授权前的复验共用同一口径：复验必须读提交
-    时的最新配置，不得使用调用开始时的旧快照。
+    `name` 只作用户标识与日志前缀（压平后），不参与任何判定；群号已经
+    `group_id_entries` 归一，源/目标集合分别只由成对判定、源群判定与自动入口列举
+    消费。
     """
 
-    return str(target_group_id).strip() in set(whitelist_entries(config.scope.target_groups))
+    name: str
+    source_groups: tuple[str, ...]
+    target_groups: tuple[str, ...]
+
+
+def forward_group_entries(config: Any) -> tuple[ForwardGroup, ...]:
+    """按配置顺序归一全部分组：`name` 去首尾空白，群号复用 `group_id_entries` 口径。
+
+    纯函数：不查询、不发送、不修改输入，随处可调。分组判定族（成对判定、源群判定）
+    与自动入口的目标列举都以本视图为唯一归一来源，避免各自复制一份群号口径。
+    """
+
+    return tuple(
+        ForwardGroup(
+            name=str(group.name).strip(),
+            source_groups=group_id_entries(group.source_groups),
+            target_groups=group_id_entries(group.target_groups),
+        )
+        for group in config.scope.groups
+    )
+
+
+def source_group_is_allowed(config: Any, group_id: str) -> bool:
+    """来源群是否出现在任一分组的源群集合内（本地预检、自动入口筛选与自动入口重验共用）。"""
+
+    return forward_group_of(config, group_id) is not None
+
+
+def forward_group_of(config: Any, source_group_id: str) -> ForwardGroup | None:
+    """来源群所属转发分组（群号归一后匹配），否则 `None`。
+
+    「来源群号归一 → 所属分组」的成员判定只有这一处：成对判定与自动入口的同组目标
+    列举都以本函数定位来源群所属分组，再在该分组内判目标。
+    """
+
+    source = str(source_group_id).strip()
+    for entry in forward_group_entries(config):
+        if source in entry.source_groups:
+            return entry
+    return None
+
+
+def shared_forward_group(config: Any, source_group_id: str, target_group_id: str) -> str | None:
+    """来源群与目标群是否属于同一转发分组：命中返回该分组名，否则 `None`。
+
+    成对判定只有这一处定义：来源群号与目标群号一起进入，签名上不存在「只判目标」的
+    用法，从形式上杜绝漏绑来源的越权判定。命中条件是「来源群在该组源群集合内，且
+    目标群在该组目标集合内」；目标群可跨组重复，来源群只能属于一个分组，因此命中时
+    至多只有一个分组符合。「目标 = 来源群自身」由调用方（工具预检）单独拒绝。
+    """
+
+    entry = forward_group_of(config, source_group_id)
+    if entry is None:
+        return None
+    target = str(target_group_id).strip()
+    return entry.name if target in entry.target_groups else None

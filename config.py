@@ -1,6 +1,8 @@
-"""麦麦搬运喵配置：开关、自动判断、白名单及固定 SnowLuma 连接。
+"""麦麦搬运喵配置：开关、自动判断、转发分组及固定 SnowLuma 连接。
 
-`[snowluma]` 保存地址、可选令牌与凭证环境变量名，默认空；模型不能覆盖连接配置。
+`[scope]` 保存具名转发分组集合（名称 + 源群号 + 目标群号），目标群须与来源群同组；
+默认空分组集合，等价于没有源群也没有目标群。`[snowluma]` 保存地址、可选令牌与
+凭证环境变量名，默认空；模型不能覆盖连接配置。
 `plugin.config_version` 是宿主要求的数字点分版本，新增字段时提升。
 评论延迟、概率与超时均不进入配置；默认值与 config.toml 保持一致。
 """
@@ -32,13 +34,13 @@ class PluginSection(PluginConfigBase):
         default=False,
         description="插件总开关，关闭后不做自动判断也不执行工具发送。",
         json_schema_extra={
-            "hint": "默认关闭：安装后先填好白名单再打开，避免安装即跨群发送。",
+            "hint": "默认关闭：安装后先填好转发分组再打开，避免安装即跨群发送。",
             "label": "启用插件",
             "order": 0,
         },
     )
     config_version: str = Field(
-        default="1.5.0",
+        default="1.6.0",
         description="配置版本号；新增字段时提升（数字点分），宿主据此把新字段写回配置文件。",
         json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "order": 99},
     )
@@ -86,30 +88,118 @@ class AutoSection(PluginConfigBase):
     )
 
 
-class ScopeSection(PluginConfigBase):
-    """`[scope]` 节：源／目标白名单。"""
+class ForwardGroupSection(PluginConfigBase):
+    """一个具名转发分组：分组名、源群号与目标群号。
 
-    __ui_label__: ClassVar[str] = "白名单"
-    __ui_order__: ClassVar[int] = 2
+    `name` 只作用户标识与日志前缀，不参与路由、权限或判断，不限长与字符集。
+    `name` 给空串默认是为了让宿主 Schema 生成器能无参构造默认视图（宿主要求嵌套
+    模型字段全有默认）；实际生效仍以 `ScopeSection.__init__` 的配置期校验为准：
+    去空白后为空、跨组重复与源群重复一律拒绝。
+    """
 
+    __ui_label__: ClassVar[str] = "转发分组"
+
+    name: str = Field(
+        default="",
+        description="分组名称：只作用户标识与日志前缀，不参与路由或判断，不限长与字符集。",
+        json_schema_extra={
+            "hint": "必填；去空白后不能为空，且不能与其他分组同名。",
+            "label": "分组名称",
+            "order": 0,
+        },
+    )
     source_groups: list[str] = Field(
         default_factory=list,
-        description="允许麦麦从中转发消息的源群号白名单。",
+        description="本分组的源群号：允许麦麦从中转发消息的群；同一源群只能属于一个分组。",
         json_schema_extra={
-            "hint": "留空 = 没有源群，不触发自动判断，也不接受工具调用。",
-            "label": "源群白名单",
-            "order": 0,
+            "hint": "留空 = 本分组没有源群；同一源群不得出现在多个分组或在本分组内重复。",
+            "label": "源群号",
+            "order": 1,
         },
     )
     target_groups: list[str] = Field(
         default_factory=list,
-        description="允许接收转发消息的目标群号白名单。",
+        description="本分组的目标群号：允许接收转发消息的群；可跨组重复，源群也可兼作别组目标。",
         json_schema_extra={
-            "hint": "留空 = 没有目标群，工具调用只能得到拒绝原因。",
-            "label": "目标群白名单",
-            "order": 1,
+            "hint": "留空 = 本分组源群的调用与自动判断都因没有同组目标而拒绝；目标群可跨组重复。",
+            "label": "目标群号",
+            "order": 2,
         },
     )
+
+
+class ScopeSection(PluginConfigBase):
+    """`[scope]` 节：具名转发分组。
+
+    默认空分组集合：没有源群也没有目标群。平铺键 `source_groups` / `target_groups`
+    已移除（无兼容期）：旧配置里的平铺键按未知键忽略，表现为「源群不在任何转发分组」
+    的可定位拒绝，安全失效方向为不发送。空目标分组与组内「源 = 目标」允许在本层
+    保存：运行期由「目标 ≠ 来源群自身」与同组没有合法目标拒绝。
+    """
+
+    __ui_label__: ClassVar[str] = "转发分组"
+    __ui_order__: ClassVar[int] = 2
+
+    groups: list[ForwardGroupSection] = Field(
+        default_factory=list,
+        description="具名转发分组：每个分组由名称、源群号与目标群号构成，目标群须与来源群同组。",
+        json_schema_extra={
+            "hint": (
+                "留空 = 没有分组，不触发自动判断，也不接受工具调用；"
+                "同一源群只能属于一个分组，分组名去空白后不能为空且跨组唯一。"
+            ),
+            "label": "转发分组",
+            "order": 0,
+        },
+    )
+
+    def __init__(self, **data: Any) -> None:
+        """分组结构校验在 SDK 字段校验前完成（沿用 `SnowLumaSection` 先例）。
+
+        三项结构检查：源群跨组重复、同一分组内源群重复、`name` 去空白后为空或跨组
+        重复；命中即抛中文 `ValueError`，不静默归并、不放行部分配置。dict 与已构造
+        的 `ForwardGroupSection` 实例两条输入路径都校验——宿主 Schema 链路会拿默认
+        视图落回配置，实例路径漏检等于放开空白 name。
+        """
+
+        groups = data.get("groups") or []
+        if isinstance(groups, (list, tuple)):
+            names: dict[str, int] = {}
+            source_owner: dict[str, str] = {}
+            for position, raw_group in enumerate(groups, start=1):
+                if isinstance(raw_group, ForwardGroupSection):
+                    group_name = raw_group.name
+                    raw_sources: Any = raw_group.source_groups
+                elif isinstance(raw_group, dict):
+                    group_name = raw_group.get("name")
+                    raw_sources = raw_group.get("source_groups")
+                else:
+                    continue
+                name = str(group_name or "").strip()
+                if not name:
+                    raise ValueError(f"第 {position} 个转发分组的名称去空白后不能为空")
+                if name in names:
+                    raise ValueError(f"转发分组名称「{name}」跨分组重复，分组名称必须唯一")
+                names[name] = position
+                if not isinstance(raw_sources, (list, tuple)):
+                    continue
+                seen_sources: set[str] = set()
+                for raw_source in raw_sources:
+                    # 群号按去空白字符串比对，与运行期 `group_id_entries` 口径一致；
+                    # 空值不参与（运行期同样丢弃），非字符串由字段校验拒绝。
+                    source = str(raw_source).strip()
+                    if not source:
+                        continue
+                    if source in seen_sources:
+                        raise ValueError(f"转发分组「{name}」的源群 {source} 重复，同一分组内源群不能重复")
+                    seen_sources.add(source)
+                    if source in source_owner:
+                        raise ValueError(
+                            f"源群 {source} 同时出现在转发分组「{source_owner[source]}」与「{name}」中，"
+                            "同一源群只能属于一个分组"
+                        )
+                    source_owner[source] = name
+        super().__init__(**data)
 
 
 class SnowLumaSection(PluginConfigBase):

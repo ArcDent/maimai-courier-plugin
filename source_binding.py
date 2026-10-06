@@ -39,7 +39,7 @@ FORWARD_TOOL_PARAMETERS: dict[str, Any] = {
         },
         "target_group_id": {
             "type": "string",
-            "description": "接收转发的目标群号（必须在允许的目标群内，且不同于源群）。",
+            "description": "接收转发的目标群号（必须与来源群属于同一转发分组，且不同于源群）。",
         },
         "comment": {
             "type": "string",
@@ -154,7 +154,7 @@ class SourceBindingTable:
 
         宿主把模型输出当**一批** `tool_calls` 处理（`reasoning_engine.py:2099-…`
         的 `_handle_tool_calls`），同一载荷里混有指向其它工具的调用：那些调用必须
-        原样保留，也不能被签发凭据或被白名单改写参数。因此这里只处理
+        原样保留，也不能被签发凭据或被分组判定改写参数。因此这里只处理
         `func_name` 为本插件 `forward_message` 的调用；公开参数原样保留。
         """
 

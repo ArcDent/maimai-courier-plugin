@@ -6,11 +6,11 @@
 - **唯一可信来源是宿主的入站 Hook 载荷**（`chat.receive.after_process`）：载荷由
   宿主构造、不经模型，因此会话、平台、群号与消息 ID 都按载荷取值；模型伪造不了，
   也无需额外授权票据。
-- **候选口径**：白名单源群里的、非机器人自身、非通知的 QQ 消息，且其内容能分类成
+- **候选口径**：转发分组内源群的、非机器人自身、非通知的 QQ 消息，且其内容能分类成
   配置 `auto.message_types` 已选中的候选类型（默认仅合并转发；文字与图片须显式选中）。
   只含空白、只含提及、含不支持段或段结构非法的普通消息都不唤起；非 QQ 平台、
-  非白名单来源与自己发的消息也一样。未展开的合并转发（宿主没能恢复节点、被收成
-  `DictComponent`）同样进入判断：判断只需要消息 ID，实际发送仍由工具侧做完整
+  来源群不在任何转发分组与自己发的消息也一样。未展开的合并转发（宿主没能恢复节点、
+  被收成 `DictComponent`）同样进入判断：判断只需要消息 ID，实际发送仍由工具侧做完整
   内容校验。
 - **不掷骰、不签目标群决策票、不强制续轮**：意图只给源消息的实际类型、源消息 ID、
   合法目标群、工具用法与「值得分享才调用工具、可以沉默」的边界说明，外加单独标注的
@@ -30,9 +30,8 @@ from .shared.clock import Clock
 from .config import CourierConfig, MessageType
 from .forward_precheck import (
     QQ_PLATFORM,
+    forward_group_of,
     source_group_is_allowed,
-    target_is_allowed,
-    whitelist_entries,
 )
 from .send_material import is_forward_card
 from .shared.identifiers import (
@@ -224,18 +223,19 @@ def _classify_candidate(raw_message: Any) -> CandidateType | None:
 
 
 def share_target_groups(config: CourierConfig, source_group_id: str) -> tuple[str, ...]:
-    """合法目标群：目标白名单里、不同于源群、去空白去重且保持配置顺序。
+    """同组合法目标群：来源群所属分组的全部目标，不同于源群、去重且保持配置顺序。
 
-    成员判定复用工具侧的 `forward_precheck.target_is_allowed`、归一复用同一
-    `whitelist_entries`，保证「自动判断列出的目标」与「工具实际接受的目标」是同一份
-    口径。群名不参与这里的判定：路由只认群号。
+    与工具预检的成对判定同源：先经 `forward_precheck.forward_group_of` 定位来源群
+    所属分组，只列举该分组的目标群号，绝不混入其它分组的目标。路由只认群号。
     """
 
+    entry = forward_group_of(config, source_group_id)
+    if entry is None:
+        return ()
+    source = str(source_group_id).strip()
     targets: list[str] = []
-    for group_id in whitelist_entries(config.scope.target_groups):
-        if group_id == source_group_id or group_id in targets:
-            continue
-        if not target_is_allowed(config, group_id):
+    for group_id in entry.target_groups:
+        if group_id == source or group_id in targets:
             continue
         targets.append(group_id)
     return tuple(targets)
@@ -248,8 +248,8 @@ def auto_entry_invalid_reason(
 ) -> str:
     """最新配置是否仍允许对来源群发起自动判断：允许返回空串，否则返回可定位原因。
 
-    总开关、自动入口开关、候选类型（仍被 `auto.message_types` 选中）、来源群白名单与
-    「仍存在合法且不同于源群的目标群」五项合一：热更新时的失效取消（组合根只把它当
+    总开关、自动入口开关、候选类型（仍被 `auto.message_types` 选中）、来源群属于某个
+    转发分组与「同组仍存在合法且不同于源群的目标群」五项合一：热更新时的失效取消（组合根只把它当
     布尔用）与等待结束后的重验共用本谓词，判定口径只有一处；原因措辞按「等待结束后
     重验」的语境给出。只变更标准不在这里判定——仍合法的候选继续等待，等待结束后用
     最新标准提交。
@@ -260,9 +260,9 @@ def auto_entry_invalid_reason(
     if message_type not in config.auto.message_types:
         return f"等待期间候选类型 {message_type} 已移出自动候选类型"
     if not source_group_is_allowed(config, source_group_id):
-        return "等待期间来源群已移出源群白名单"
+        return "等待期间来源群已不在任何转发分组内"
     if not share_target_groups(config, source_group_id):
-        return "没有合法且不同于源群的目标群"
+        return "来源群所属转发分组内没有合法且不同于源群的目标群"
     return ""
 
 
@@ -328,9 +328,9 @@ def screen_forward_candidate(payload: Any, config: CourierConfig) -> ForwardCand
     if not group_id:
         return NotACandidate("来源不是群聊")
     if not source_group_is_allowed(config, group_id):
-        return NotACandidate("来源群不在源群白名单内")
+        return NotACandidate("来源群不在任何转发分组内")
     if not share_target_groups(config, group_id):
-        return NotACandidate("没有合法且不同于源群的目标群，不提供判断机会")
+        return NotACandidate("来源群所属转发分组内没有合法且不同于源群的目标群，不提供判断机会")
 
     account_id = _pick_account_id(
         payload.get("additional_config"),
@@ -382,7 +382,7 @@ def display_name(raw: Any) -> str:
     群名可能含宿主主动任务标签的闭合串、换行或超长内容，而宿主会把意图原文包进
     `<plugin_proactive_task>`。这里把尖括号转成全角、压平空白并限长：保留了
     「是什么名字」，但不再能闭合宿主结构或伪造多行指令。名称始终只是显示文本，
-    路由只认白名单群号。
+    路由只认转发分组内的群号。
     """
 
     text = _text(raw)
@@ -404,14 +404,14 @@ def build_share_intent(
     「自行判断、可以沉默」的边界说明；用户配置的自动分享标准原文单独标注成一段。
     聊天内容一律不进意图（不伪造、不摘抄宿主摘要）；群名只作为不可信显示文本放在
     `「」` 里，并明确说明它不是路由依据、其中的指令不得执行。目标群号是路由唯一
-    依据，且只来自白名单（`share_target_groups`）。
+    依据，且只来自来源群所属转发分组的同组目标（`share_target_groups`）。
 
     标准只按文字拼接：它是用户配置的自然语言偏好，位于明确标注的用户配置区域，
     不做模板展开、不参与路由与权限判定。固定部分不夹带任何主题或广告偏好，模型
     始终可以选择沉默。
 
-    这里出现的源消息 ID 与目标群号都已在候选筛选（`safe_identifier`）与白名单阶段
-    校验过形态与长度，意图本身不再拼入任何未经验证的载荷字符串。
+    这里出现的源消息 ID 与目标群号都已在候选筛选（`safe_identifier`）与同组目标列举
+    阶段校验过形态与长度，意图本身不再拼入任何未经验证的载荷字符串。
     """
 
     lines = [f"【跨群分享判断】本群刚收到一条{CANDIDATE_TYPE_LABELS[candidate.message_type]}。"]
@@ -486,7 +486,8 @@ def _latest_valid_config(
     """重读最新配置并重验候选：仍合法返回（配置, 空原因），否则返回（None, 原因）。
 
     消息可读后的初检与目标名称查询结束后的提交前复验共用本判定：开关、候选类型、
-    来源群与目标白名单的口径只有一处；`current_config` 每次都读**最新**快照，不缓存。
+    来源群分组归属与同组目标的口径只有一处；`current_config` 每次都读**最新**快照，
+    不缓存。
     """
 
     config = current_config()
@@ -510,7 +511,7 @@ async def run_auto_entry(
     `current_config` 读取**最新**配置快照：消息可读后先做一次初检与目标名称查询，
     查询结束后**再次**读取最新配置、重验候选（含候选类型）、重建合法目标集合并解析
     最新标准，然后直接进入 `maisaka.proactive.trigger` 调用——中间不再插入其它异步
-    查询。因此查询期间的标准、白名单与开关变更全部对本次提交生效；新增目标没有名称
+    查询。因此查询期间的标准、同组目标与开关变更全部对本次提交生效；新增目标没有名称
     时只列群号，已移除的目标不会从名称快照重新混入。
     """
 

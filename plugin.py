@@ -17,7 +17,7 @@ from .shared.clock import Clock, SystemClock
 from .config import CourierConfig
 from .delivery_ledger import LEDGER_FILE_NAME, DeliveryLedger, LedgerUnavailable, open_ledger
 from .forward_delivery import deliver_forward
-from .forward_precheck import PreparedForward, precheck_forward_request, source_group_is_allowed, target_is_allowed
+from .forward_precheck import PreparedForward, precheck_forward_request, shared_forward_group
 from .shared.result import DeliveryResult, STAGE_REJECTED, TOOL_STATUS_REJECTED, render_forward_result
 from .snowluma_client import SnowLumaClient
 from .snowluma_transport import (AiohttpOneBotTransport, OneBotConnection, OneBotTransport,
@@ -61,6 +61,24 @@ MAX_INFLIGHT_DELIVERIES: Final[int] = 8
 
 TransportFactory = Callable[[OneBotConnection], OneBotTransport]
 LedgerFactory = Callable[[Path], DeliveryLedger | LedgerUnavailable]
+
+
+def _flattened_group_name(name: str) -> str:
+    """把分组名压平为单行定位文本（空白折叠为空格，剔除控制字符，其余原样保留）。
+
+    分组名不限长与字符集，但日志与任务描述必须保持单行；只压平显示形态，判定只认
+    群号，不用本函数的结果。
+    """
+
+    characters: list[str] = []
+    for character in name:
+        if character.isspace():
+            characters.append(" ")
+        elif ord(character) < 32 or 127 <= ord(character) < 160:
+            continue
+        else:
+            characters.append(character)
+    return "".join(characters).strip()
 
 
 class CourierPlugin(MaiBotPlugin):
@@ -299,29 +317,30 @@ class CourierPlugin(MaiBotPlugin):
                                                  bindings=self._bindings, arguments=kwargs)
         if isinstance(outcome, Rejected):
             return self._finish(self._render_rejection(outcome.reason, kwargs))
+        group_label = self._group_label(outcome)
         if (not self._send_allowed(outcome) or generation != self._config_generation
                 or signature != self._connection_signature()):
-            return self._finish(self._render_rejection(Rejected.not_sent("源发送前权限复验未通过（插件已卸载、开关或配置变化）").reason, kwargs))
+            return self._finish(self._render_rejection(Rejected.not_sent("源发送前权限复验未通过（插件已卸载、开关或配置变化）").reason, kwargs), group_label)
         connection = resolve_onebot_connection(self.config, self._environ)
         if isinstance(connection, OneBotUnresolved):
-            return self._finish(self._render_rejection(Rejected.not_sent(connection.reason).reason, kwargs))
+            return self._finish(self._render_rejection(Rejected.not_sent(connection.reason).reason, kwargs), group_label)
         if self._ledger is None:
             self._ledger = self._ledger_opener(self.ctx.paths.data_dir / LEDGER_FILE_NAME)
         if self._client is not None and (self._connection != connection or self._client_generation != generation):
             if self._client_refreshing or any(not task.done() for task in self._delivery_tasks):
-                return self._finish(self._render_rejection("旧连接仍有在途工作，拒绝新投递", kwargs))
+                return self._finish(self._render_rejection("旧连接仍有在途工作，拒绝新投递", kwargs), group_label)
             self._client_refreshing = True
             try:
                 close_task = self._start_client_close(
                     f"旧连接关闭（源消息={outcome.arguments.message_id}，目标群={outcome.arguments.target_group_id}，阶段=连接替换）")
                 await asyncio.shield(close_task)
             except (Exception, asyncio.CancelledError):
-                return self._finish(self._render_rejection("旧连接关闭未确认，拒绝新投递", kwargs))
+                return self._finish(self._render_rejection("旧连接关闭未确认，拒绝新投递", kwargs), group_label)
             finally:
                 self._client_refreshing = False
             if (not self._send_allowed(outcome) or generation != self._config_generation
                     or signature != self._connection_signature()):
-                return self._finish(self._render_rejection("连接关闭等待后许可已失效，本次未发送任何消息", kwargs))
+                return self._finish(self._render_rejection("连接关闭等待后许可已失效，本次未发送任何消息", kwargs), group_label)
             self._client = None
             self._client_close_task = None
         if self._client is None:
@@ -329,7 +348,8 @@ class CourierPlugin(MaiBotPlugin):
             self._connection = connection
             self._client = SnowLumaClient(transport=self._transport_factory(connection), clock=self._clock,
                                          config_generation=self._config_generation)
-        label = f"投递（源消息={outcome.arguments.message_id}，目标群={outcome.arguments.target_group_id}"
+        prefix = f"分组={group_label}，" if group_label else ""
+        label = f"投递（{prefix}源消息={outcome.arguments.message_id}，目标群={outcome.arguments.target_group_id}"
         def stage_changed(stage: str) -> None:
             description = f"{label}，阶段={stage}）"
             self._task_origin.set(description)
@@ -344,28 +364,51 @@ class CourierPlugin(MaiBotPlugin):
         ))
         self._delivery_tasks.add(task)
         task.add_done_callback(self._delivery_tasks.discard)
-        self._register_task(task, f"投递（源消息={outcome.arguments.message_id}，目标群={outcome.arguments.target_group_id}，阶段=源准备）")
+        self._register_task(task, f"{label}，阶段=源准备）")
         result = await task
         return self._finish(render_forward_result(result, material=outcome.material,
-            source_message_id=outcome.arguments.message_id, target_group_id=outcome.arguments.target_group_id))
+            source_message_id=outcome.arguments.message_id, target_group_id=outcome.arguments.target_group_id),
+            group_label)
 
     def _send_allowed(self, prepared: PreparedForward) -> bool:
-        """同步复验最新开关及两级白名单；源和评论实际提交前均复用。"""
+        """同步复验最新开关与同组判定；源和评论实际提交前均复用。
 
-        return self._is_live() and source_group_is_allowed(
-            self.config, prepared.source.group_id
-        ) and target_is_allowed(self.config, prepared.arguments.target_group_id)
+        成对判定（`shared_forward_group`）从 `self.config` 现算：预检与复验不共享中间
+        缓存，分组收紧（目标被移出来源群所属分组）在评论提交前同样拦截，已提交的源
+        投递不回滚。
+        """
 
-    def _finish(self, rendered: dict[str, Any]) -> dict[str, Any]:
+        return self._is_live() and shared_forward_group(
+            self.config,
+            prepared.source.group_id,
+            prepared.arguments.target_group_id,
+        ) is not None
+
+    def _group_label(self, prepared: PreparedForward) -> str:
+        """本次投递所属转发分组的压平显示名（得不到分组名时返回空串）。
+
+        分组名只作日志与任务描述定位：压平空白与控制字符成单行文本，不作为任何判定
+        输入（判定只认群号，`shared_forward_group` 返回的是原始去空白组名）。
+        """
+
+        name = shared_forward_group(
+            self.config,
+            prepared.source.group_id,
+            prepared.arguments.target_group_id,
+        )
+        return _flattened_group_name(name) if name else ""
+
+    def _finish(self, rendered: dict[str, Any], group_label: str = "") -> dict[str, Any]:
         """记录可定位的失败信息并返回结果（完整成功不额外记录）。
 
-        日志只含阶段、源消息 ID、目标群 ID、状态与中文原因：不回显评论正文、
-        不输出一次性来源凭据，也不生成任何摘要或评论副本。
+        日志只含分组名（压平后）、阶段、源消息 ID、目标群 ID、状态与中文原因：不回显
+        评论正文、不输出一次性来源凭据，也不生成任何摘要或评论副本。
         """
 
         if not rendered["success"]:
+            prefix = f"分组={group_label}，" if group_label else ""
             self.ctx.logger.warning(
-                f"转发未完成：阶段={rendered['stage'] or 'none'}，"
+                f"转发未完成：{prefix}阶段={rendered['stage'] or 'none'}，"
                 f"源消息={rendered['source_message_id'] or '未知'}，"
                 f"目标群={rendered['target_group_id'] or '未知'}，"
                 f"状态={rendered['status']}，原因={rendered['reason']}"
@@ -494,7 +537,7 @@ class CourierPlugin(MaiBotPlugin):
     def _auto_entry_config(self) -> CourierConfig | None:
         """等待结束后读一次最新配置快照；不可继续自动判断时返回 None。
 
-        自动判断不缓存配置：等待期间的热更新必须对「还要不要唤起」生效，目标白名单
+        自动判断不缓存配置：等待期间的热更新必须对「还要不要唤起」生效，同组目标
         的增删也按同一份最新快照重新计算。观察 Hook 入口也经本判定早退（与等待结束
         后的判定同源），卸载标记同样在此生效。
         """

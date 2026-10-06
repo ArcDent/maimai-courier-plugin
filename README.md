@@ -2,7 +2,7 @@
 
 麦麦在群聊间分享消息的独立 MaiBot 插件。源群出现已选候选类型的消息后，由源群
 Maisaka 依据可编辑标准自主决定分享或沉默；群友也可明确请求，通过 `forward_message`
-把本群指定源消息转发到一个白名单目标群，可另附一条延迟 0.5 秒的评论。
+把本群指定源消息转发到与它同属一个转发分组的目标群，可另附一条延迟 0.5 秒的评论。
 
 **当前路径：插件进程内客户端 → 操作者配置的单一 SnowLuma HTTP API 端点 → QQ。**
 源消息、评论和必要平台查询都经本插件自己的端点按请求完成（`POST /{action}`、
@@ -26,7 +26,8 @@ Maisaka 依据可编辑标准自主决定分享或沉默；群友也可明确请
   Hook 名称不是能力。
 - [直连运维清单](docs/direct-snowluma-operations.md)：端点、环境、账本、备份与停止条件。
 - [CONTEXT.md](CONTEXT.md)：领域术语；[ADR 0008](docs/adr/0008-http-direct-client-and-forward-actions.md)：
-  当前架构决定（HTTP 直连与三类分派，取代 ADR 0007）；实测快照见
+  当前架构决定（HTTP 直连与三类分派，取代 ADR 0007）；[ADR 0010](docs/adr/0010-scoped-forward-groups.md)：
+  转发分组决定（同组才能互投，取代源/目标平铺白名单）；实测快照见
   [SnowLuma HTTP API 目录](docs/snowluma-http-api-catalog.md)。
 - 当前行为以主规格 [跨群转发](openspec/specs/cross-group-forward/spec.md) 与
   [直连客户端](openspec/specs/snowluma-direct-client/spec.md) 为准；HTTP 直连与三类
@@ -47,7 +48,7 @@ Maisaka 依据可编辑标准自主决定分享或沉默；群友也可明确请
 ```toml
 [plugin]
 enabled = false
-config_version = "1.5.0"
+config_version = "1.6.0"
 
 [auto]
 enabled = true
@@ -55,8 +56,12 @@ message_types = ["forward"]
 share_criteria = "结合消息内容与目标群，自行判断是否值得分享；不值得或无法判断时保持沉默，不必回复，不要编造消息内容。"
 
 [scope]
-source_groups = []
-target_groups = []
+groups = []
+
+# [[scope.groups]]
+# name = "研发群"
+# source_groups = ["111111"]
+# target_groups = ["222222", "333333"]
 
 [snowluma]
 http_url = ""
@@ -64,7 +69,31 @@ token = ""
 token_env_var = ""
 ```
 
-- 总开关默认关闭，自动入口默认开启、仅选合并转发，白名单默认全空。关闭总开关时
+`[scope]` 是**具名转发分组**：每个分组由 `name`、`source_groups`（源群号）与
+`target_groups`（目标群号）构成，`[[scope.groups]]` 可写任意多项。
+
+- **同组才能互投**：一次转发只要求「目标群与来源群属于同一个分组」。源群写进哪个
+  分组，就只能投给那个分组的目标群；跨分组的目标（只在别的分组，或不在任何分组内）
+  在发送前被整条拒绝。工具预检、源/评论提交前复验、自动入口的候选筛选与目标列举
+  共用同一处判定。
+- **同一源群只能属于一个分组**：源群跨组重复、组内重复、`name` 去空白后为空或跨组
+  重复，都在**配置期**直接拒绝保存，不静默合并、不放行部分配置。
+- **目标群可跨组重复**：同一个吃瓜群可以列在多个分组的 `target_groups` 里，各分组的
+  源群都能投给它；源群也可兼作别组的目标群（实际投递仍受「目标 ≠ 来源群自身」兜底）。
+- **`name` 只是给人看的标识**：不参与路由、权限或判断，只在日志与任务描述里以
+  `分组=<name>` 前缀出现（压平空白与控制字符后）；不限长、不限字符集，但必填、非空白
+  且跨组唯一。
+- 空目标分组允许保存，但该分组的源群显式调用与自动判断都会因「同组没有合法目标」被拒。
+- **默认空分组等价于旧的空白名单**：没有源群也没有目标群，不触发自动判断，工具调用被拒。
+
+> **Breaking（2026-10-06 起）**：平铺键 `source_groups` / `target_groups` 已移除，
+> 无兼容期。升级时必须**手工**把旧配置改写成上面的分组形态：把原来的源群
+> `source_groups` 与目标群 `target_groups` 归入同一个 `[[scope.groups]]` 块并补一个
+> `name`；若原来只有一份源群 + 一份目标群，直接合成一个分组即可。`plugin.config_version`
+> 已由 1.5.0 提升到 1.6.0。未改写的旧配置表现为「源群不在任何转发分组内」的可定位
+> 拒绝，不会误发；要回滚代码，先把仓库示例与线上配置写回平铺键再降级。
+
+- 总开关默认关闭，自动入口默认开启、仅选合并转发，转发分组默认为空。关闭总开关时
   工具和观察 Hook 都不会发出任何平台请求、执行平台动作或自动判断；加载本身不联网。
 - `snowluma.http_url` 是操作者确认的完整 HTTP API 端点，默认空（旧 WS 端点键不再解析，
   无兼容期）。明文 `http` 只允许回环、私有或链路本地目标（主机名在请求
@@ -92,14 +121,14 @@ token_env_var = ""
   开启普通文字或图片候选会增加模型调用。
 
 先保持关闭，确认运行版本、U3–U8（U1 已在授权实测实例确认，本部署仍须复验；U2 的
-长连接事件广播随 HTTP 直连不再是风险面）、端点与环境注入、本插件账本完整性及两级
-白名单，获得真实测试授权后再启用。评论延迟、超时和容量均为代码常量，不是配置或
+长连接事件广播随 HTTP 直连不再是风险面）、端点与环境注入、本插件账本完整性及转发
+分组，获得真实测试授权后再启用。评论延迟、超时和容量均为代码常量，不是配置或
 模型参数。
 
 ## 群聊工具 `forward_message`
 
 公开参数仅三个字符串：`message_id`（必填，本群源消息 ID）、`target_group_id`（必填，
-目标白名单中且不同于源群）、`comment`（可选，默认空，普通文本）。
+与来源群同属一个转发分组且不同于源群）、`comment`（可选，默认空，普通文本）。
 
 ```json
 {"message_id": "1234567890", "target_group_id": "222222222", "comment": "这条挺有意思"}
@@ -110,7 +139,8 @@ token_env_var = ""
 OneBot 源记录。来源对应不足、私聊、越权或目标不可确认都在发送前拒绝。模型不能
 提供正文、资源 ID、媒体地址或任意平台动作。
 
-自动入口只观察宿主 `chat.receive.after_process`，给源群一次判断机会；消息可读等待
+自动入口只观察宿主 `chat.receive.after_process`，给源群一次判断机会：只对转发分组内的
+源群触发，列给 Maisaka 的目标群仅限来源群所属分组的同组目标；消息可读等待
 最多 10 秒，去重为 10 分钟/4096 项的独立内存状态。直连收到的普通消息、自发事件或
 通知不触发自动判断，不构成第二条宿主入站链；Planner 沉默时不转发、不评论。
 
@@ -202,8 +232,8 @@ OneBot 源记录。来源对应不足、私聊、越权或目标不可确认都�
 ## 离线开发验证
 
 ```bash
-uv run --no-project --with pytest pytest tests/ -q                  # 默认：596 passed, 2 skipped
-uv run --no-project --with pytest --with aiohttp pytest tests/ -q   # 传输与跨进程用例：689 passed
+uv run --no-project --with pytest pytest tests/ -q                  # 默认：619 passed, 2 skipped
+uv run --no-project --with pytest --with aiohttp pytest tests/ -q   # 传输与跨进程用例：714 passed
 uv run --no-project --with pyright pyright                          # 生产代码零错误（filesAnalyzed=18）
 ```
 
@@ -213,6 +243,6 @@ uv run --no-project --with pyright pyright                          # 生产代�
 默认不装网络库：真实 HTTP 传输与回环验收模块（`tests/test_snowluma_transport.py`、
 `tests/test_direct_acceptance.py`）在导入期跳过，默认档的 2 个 skipped 正是这两个模块；
 带库才执行真实回环 HTTP 端点与公共工具完整链。根 `pytest -q` 与显式 `tests/` 同范围，
-历史不收集。以上为 2026-10-06 代码与注释收敛后实跑结果。
+历史不收集。以上为 2026-10-06 转发分组收敛后实跑结果。
 
 真实行为需要真实 QQ 联验，见 [docs/real-qq-validation.md](docs/real-qq-validation.md)。
