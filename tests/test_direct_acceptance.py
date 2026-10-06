@@ -289,10 +289,11 @@ class Assembly:
 def assemble(path: Path, url: str, raw: list[dict[str, Any]], clock: FakeClock, *,
              ledger: Any = None, token_env_var: str = "ACCEPTANCE_TOKEN",
              targets: tuple[str, ...] = (TARGET_GROUP_ID, OTHER_TARGET_GROUP_ID),
-             message_types: tuple[str, ...] = ("forward", "text", "image")
+             message_types: tuple[str, ...] = ("forward", "text", "image"),
+             groups: list[dict[str, Any]] | None = None
              ) -> Assembly:
 
-    config = enabled_config(target_groups=targets, message_types=message_types)
+    config = enabled_config(target_groups=targets, message_types=message_types, groups=groups)
     config["snowluma"] = {"http_url": url, "token_env_var": token_env_var}
     environ = {token_env_var: ACCEPTANCE_TOKEN}
     transports: list[Any] = []
@@ -365,6 +366,15 @@ def assert_no_leak(result: dict[str, Any], ctx: Any, secrets: tuple[str, ...] = 
     observed = json.dumps([result, ctx.logger.records], ensure_ascii=False)
     for secret in secrets:
         assert secret not in observed, secret
+
+
+def _revoke_all_targets(config: dict[str, Any]) -> None:
+    """把 `scope.groups` 各组 `target_groups` 置空（原地收紧配置，模拟撤权目标）。"""
+
+    config["scope"]["groups"] = [
+        {**group.model_dump(), "target_groups": []}
+        for group in config["scope"]["groups"]
+    ]
 
 
 # --------------------------------------------------------------------------- 主互证
@@ -554,7 +564,7 @@ def test_真实HTTP评论等待撤权保留本次结果与持久字段边界(tmp
                     if change == "关闭":
                         config["plugin"]["enabled"] = False
                     elif change == "撤销目标":
-                        config["scope"]["target_groups"] = []
+                        _revoke_all_targets(config)
                     else:
                         config["snowluma"]["token_env_var"] = "OTHER_TOKEN_REFERENCE"
                     assembly.plugin.set_plugin_config(config)
@@ -666,7 +676,7 @@ def test_真实HTTP源账号查询等待后复验权限(tmp_path, change):
                     if change == "关闭":
                         config["plugin"]["enabled"] = False
                     else:
-                        config["scope"]["target_groups"] = []
+                        _revoke_all_targets(config)
                     assembly.plugin.set_plugin_config(config)
                     await assembly.plugin.on_config_update("self", config, "test")
                     server.release.set()
@@ -710,6 +720,68 @@ def test_宿主Hook与真实端点并存只有源群判断且沉默不发送(tmp
                 assert len(server.sent) == 1
                 assert ledger.get(ledger_key()).status == "sent"
                 assert assembly.ctx.send.calls == [] and assembly.api_calls == []
+            finally:
+                await close_assembly(assembly, ledger)
+
+    asyncio.run(scenario())
+
+
+def test_同组命名分组经真实HTTP端到端成功并落账(tmp_path):
+
+    async def scenario():
+        clock = FakeClock()
+        raw = [text_segment("同组正文")]
+        ledger = open_test_ledger(tmp_path, clock=clock)
+        server = LocalOneBot(clock, raw, ledger=ledger, targets=(TARGET_GROUP_ID,))
+        async with http_endpoint(server.handler) as url:
+            assembly = assemble(tmp_path, url, raw, clock, ledger=ledger, groups=[
+                {"name": "研发", "source_groups": [SOURCE_GROUP_ID], "target_groups": [TARGET_GROUP_ID]},
+            ])
+            try:
+                await assembly.plugin.on_load()
+                assert server.requests == []
+                result = await bound_call(assembly.plugin)
+                assert result["status"] == "sent" and result["success"] and result["delivered"], result
+                assert result["target_message_id"] == "wire-target-1"
+                assert [item["params"]["group_id"] for item in server.sent] == [TARGET_GROUP_ID], (
+                    "同组调用只发送给指定同组目标")
+                row = ledger.get(ledger_key())
+                assert (row.status, row.target_message_id) == ("sent", "wire-target-1"), (
+                    "同组成功必须落账并保存真实目标消息 ID")
+                assert_clean_requests(server)
+                assert_no_leak(result, assembly.ctx)
+                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
+            finally:
+                await close_assembly(assembly, ledger)
+
+    asyncio.run(scenario())
+
+
+def test_跨组目标经真实HTTP发送前拒绝且传输层零请求(tmp_path):
+
+    async def scenario():
+        clock = FakeClock()
+        raw = [text_segment("跨组")]
+        ledger = open_test_ledger(tmp_path, clock=clock)
+        server = LocalOneBot(clock, raw, ledger=ledger)
+        async with http_endpoint(server.handler) as url:
+            # 源 111 属研发组（目标 222）；30003 只在运营组（源 555）→ 跨组目标。
+            assembly = assemble(tmp_path, url, raw, clock, ledger=ledger, groups=[
+                {"name": "研发", "source_groups": [SOURCE_GROUP_ID], "target_groups": [TARGET_GROUP_ID]},
+                {"name": "运营", "source_groups": ["555"], "target_groups": [OTHER_TARGET_GROUP_ID]},
+            ])
+            try:
+                await assembly.plugin.on_load()
+                result = await bound_call(assembly.plugin, target=OTHER_TARGET_GROUP_ID)
+                assert result["status"] == "rejected", result
+                assert "目标群不在与来源群相同的转发分组内" in str(result["reason"]), result
+                assert "本次未发送任何消息" in str(result["reason"]), result
+                assert server.requests == [], "跨组拒绝必须发生在任何 HTTP 请求之前（端点无调用记录）"
+                assert server.sent == []
+                assert ledger.get(ledger_key(target_group_id=OTHER_TARGET_GROUP_ID)) is None, (
+                    "跨组拒绝不得落账")
+                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
+                assert_no_leak(result, assembly.ctx)
             finally:
                 await close_assembly(assembly, ledger)
 

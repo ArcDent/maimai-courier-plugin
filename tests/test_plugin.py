@@ -28,12 +28,17 @@ from maimai_courier_plugin.plugin import (
 )
 from maimai_courier_plugin.shared.delivery import STATUS_SENT
 from tests.direct_support import DEFAULT_RESOURCE_ID, DirectFixture, merged_forward_message
-from tests.snowluma_client_support import TARGET_MESSAGE_ID
+from tests.snowluma_client_support import TARGET_MESSAGE_ID, envelope
 from tests.support import (
+    CONTROL_CHARACTER_GROUP_NAME,
+    DEFAULT_GROUP_NAME,
     HTTP_URL,
+    OTHER_TARGET_GROUP_ID,
+    SOURCE_GROUP_ID,
     TARGET_GROUP_ID,
     FakeClock,
     components_of,
+    enabled_config,
     find_hook,
     issue_source_call,
     make_plugin,
@@ -154,6 +159,65 @@ def test_注入可控时钟后总开关关闭不产生等待与发送(tmp_path: 
     assert result["success"] is False
     assert ctx.send.calls == []
     assert clock.sleeps == [], "总开关关闭时不得经注入时钟登记任何等待"
+
+
+def test_共享夹具默认构造单一转发分组且显式分组入口可用(tmp_path: Path) -> None:
+    # 默认夹具：单一默认分组，含测试源群与目标群。
+    default, _ = make_plugin(tmp_path, config=enabled_config())
+    assert [(group.name, group.source_groups, group.target_groups)
+            for group in default.config.scope.groups] == [
+        (DEFAULT_GROUP_NAME, [SOURCE_GROUP_ID], [TARGET_GROUP_ID])]
+
+    # 既有分组关键字仍可用，且落入同一个默认分组。
+    legacy, _ = make_plugin(
+        tmp_path,
+        config=enabled_config(
+            source_groups=(SOURCE_GROUP_ID,),
+            target_groups=(TARGET_GROUP_ID, OTHER_TARGET_GROUP_ID),
+        ),
+    )
+    assert [(group.name, group.source_groups, group.target_groups)
+            for group in legacy.config.scope.groups] == [
+        (DEFAULT_GROUP_NAME, [SOURCE_GROUP_ID], [TARGET_GROUP_ID, OTHER_TARGET_GROUP_ID])]
+
+    # 显式分组入口：多分组按给定顺序原样构造。
+    explicit, _ = make_plugin(tmp_path, config=enabled_config(groups=[
+        {"name": "甲", "source_groups": [SOURCE_GROUP_ID], "target_groups": [TARGET_GROUP_ID]},
+        {"name": "乙", "source_groups": ["333"], "target_groups": [OTHER_TARGET_GROUP_ID]},
+    ]))
+    assert [(group.name, group.source_groups, group.target_groups)
+            for group in explicit.config.scope.groups] == [
+        ("甲", [SOURCE_GROUP_ID], [TARGET_GROUP_ID]),
+        ("乙", ["333"], [OTHER_TARGET_GROUP_ID])]
+
+
+def test_投递失败日志与任务描述带压平分组前缀(tmp_path: Path) -> None:
+    fixture = DirectFixture(tmp_path, groups=[
+        {"name": CONTROL_CHARACTER_GROUP_NAME, "source_groups": [SOURCE_GROUP_ID],
+         "target_groups": [TARGET_GROUP_ID]},
+    ])
+    fixture.prepare_source()
+
+    async def fail_send(action: str, params: Any) -> Any:
+        if action == "send_group_forward_msg":
+            return envelope(None, status="failed", retcode=100, message="synthetic failure")
+        return None
+
+    fixture.transport.on_action = fail_send
+    arguments = issue_source_call(fixture.plugin)
+
+    async def scenario() -> None:
+        await fixture.plugin.on_load()
+        result = await fixture.plugin.forward_message(**arguments)
+        assert result["status"] == "failed", result
+        warnings = fixture.ctx.logger.texts("warning")
+        assert warnings, fixture.ctx.logger.records
+        for text in warnings:
+            assert "\n" not in text and "\x00" not in text, text
+        assert any("分组=研发 甲" in text for text in warnings), warnings
+
+    asyncio.run(scenario())
+    fixture.ledger.close()
 
 
 def test_缺直连配置时不构造传输且拒绝可定位(tmp_path: Path) -> None:

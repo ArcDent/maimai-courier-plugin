@@ -1,9 +1,9 @@
 """工具入口的本地权限与内容预检（直连口径，不联网、不发送）。
 
 断言面只经 `forward_precheck` 公开导出（`precheck_forward_request` /
-`whitelist_entries` / `source_group_is_allowed` / `target_is_allowed` /
-`PreparedForward`）：凭据换可信会话、白名单与异群、顶层唯一卡片校验（混排拒绝）、
-按可信会话的源消息归属核验。卡片材料只取标识与归属核验（与客户端
+`group_id_entries` / `forward_group_entries` / `shared_forward_group` /
+`source_group_is_allowed` / `PreparedForward`）：凭据换可信会话、转发分组与异群、
+顶层唯一卡片校验（混排拒绝）、按可信会话的源消息归属核验。卡片材料只取标识与归属核验（与客户端
 `SnowLumaClient.prepare_source` 的判定口径一致，不重复构造材料）；普通消息仍走
 `send_material` 的完整内容预检。替身宿主按保留链样本构造
 （`tests/snowluma_client_support` 的 `host_message`），不触真实网络。
@@ -20,13 +20,15 @@ import pytest
 
 from maimai_courier_plugin.config import CourierConfig
 from maimai_courier_plugin.forward_precheck import (
+    ForwardGroup,
     PreparedForward,
     MaterialDigest,
     SourceSession,
+    forward_group_entries,
     precheck_forward_request,
+    shared_forward_group,
     source_group_is_allowed,
-    target_is_allowed,
-    whitelist_entries,
+    group_id_entries,
 )
 from maimai_courier_plugin.send_material import SendMaterial, UnsupportedContent, is_forward_card
 from maimai_courier_plugin.shared.identifiers import verbatim_identifier
@@ -69,11 +71,15 @@ def source_stream(**overrides: Any) -> dict[str, Any]:
 
 
 def enabled_config(
-    *, source_groups: tuple[str, ...] = ("111",), target_groups: tuple[str, ...] = ("222", "111")
+    *, source_groups: tuple[str, ...] = ("111",), target_groups: tuple[str, ...] = ("222", "111"),
+    groups: list[dict[str, Any]] | None = None,
 ) -> CourierConfig:
-    return CourierConfig(**{"plugin": {"enabled": True},
-                            "scope": {"source_groups": list(source_groups),
-                                      "target_groups": list(target_groups)}})
+    scope_groups = (
+        groups if groups is not None
+        else [{"name": "测试分组", "source_groups": list(source_groups),
+               "target_groups": list(target_groups)}]
+    )
+    return CourierConfig(plugin={"enabled": True}, scope={"groups": scope_groups})
 
 
 def issue_call(
@@ -126,7 +132,8 @@ async def run_precheck(
     stored: Any, *, message_id: str = SOURCE_MESSAGE_ID, target: str = "222", comment: str = "",
     streams: list[dict[str, Any]] | None = None, fail_streams: bool = False,
     fail_message: bool = False, source_groups: tuple[str, ...] = ("111",),
-    target_groups: tuple[str, ...] = ("222", "111"), token_message_id: str | None = None,
+    target_groups: tuple[str, ...] = ("222", "111"), groups: list[dict[str, Any]] | None = None,
+    token_message_id: str | None = None,
     poison: dict[str, Any] | None = None,
 ) -> tuple[PreparedForward | Any, FakeMessageHost]:
 
@@ -141,7 +148,7 @@ async def run_precheck(
                            fail_message=fail_message)
     result = await precheck_forward_request(
         ctx=host_context(host), config=enabled_config(source_groups=source_groups,
-                                                      target_groups=target_groups),
+                                                      target_groups=target_groups, groups=groups),
         bindings=bindings, arguments=arguments)
     return result, host
 
@@ -288,7 +295,7 @@ def test_is_forward_card是唯一卡片形状判据且输入不被修改() -> No
     assert raw == original
 
 
-# --- 4.1：凭据、白名单与异群口径 ------------------------------------------------
+# --- 4.1：凭据、转发分组与异群口径 ------------------------------------------------
 
 
 def test_凭据缺失伪造或错配时拒绝且不查询消息() -> None:
@@ -355,18 +362,61 @@ def test_来源会话不可验证或非群聊非QQ时拒绝() -> None:
     asyncio.run(scenario())
 
 
-def test_来源群或目标群白名单与异群校验() -> None:
+def test_来源群分组与跨组目标和异群校验() -> None:
     async def scenario() -> None:
         stored = host_stored(SOURCE_MESSAGE_ID)
         result, host = await run_precheck(stored, source_groups=("999",))
-        assert rejection(result).startswith("调用来源群不在源群白名单内")
-        assert host.queried == []  # 白名单先于消息读取
+        assert rejection(result).startswith("调用来源群不在任何转发分组内")
+        assert host.queried == []  # 分组判定先于消息读取
 
         result, _ = await run_precheck(stored, target="333")
-        assert rejection(result).startswith("目标群不在目标白名单内")
+        assert rejection(result).startswith("目标群不在与来源群相同的转发分组内")
 
         result, _ = await run_precheck(stored, target="111")
         assert rejection(result).startswith("目标群不能是调用来源群自身")
+    asyncio.run(scenario())
+
+
+def test_同组命名分组内预检通过且分组可定位() -> None:
+    async def scenario() -> None:
+        groups = [{"name": "研发", "source_groups": ["111"], "target_groups": ["222"]}]
+        stored = host_stored(SOURCE_MESSAGE_ID)
+        result, host = await run_precheck(stored, groups=groups)
+        assert isinstance(result, PreparedForward)
+        assert host.queried == [SOURCE_MESSAGE_ID], "同组调用仍核验源消息归属"
+        # 目标判定来自同一具名分组（去空白原值）。
+        assert shared_forward_group(enabled_config(groups=groups), "111", "222") == "研发"
+    asyncio.run(scenario())
+
+
+def test_目标只在别组或不在任何分组均在预检发送前拒绝() -> None:
+    async def scenario() -> None:
+        groups = [
+            {"name": "研发", "source_groups": ["111"], "target_groups": ["222"]},
+            {"name": "运营", "source_groups": ["444"], "target_groups": ["333"]},
+        ]
+        stored = host_stored(SOURCE_MESSAGE_ID)
+        # 目标只在别的分组（运营的 333）。
+        result, _ = await run_precheck(stored, target="333", groups=groups)
+        assert rejection(result).startswith("目标群不在与来源群相同的转发分组内")
+        # 目标不在任何分组。
+        result, _ = await run_precheck(stored, target="999", groups=groups)
+        assert rejection(result).startswith("目标群不在与来源群相同的转发分组内")
+    asyncio.run(scenario())
+
+
+def test_目标群跨组重复时各分组的源都可同组投递() -> None:
+    async def scenario() -> None:
+        groups = [
+            {"name": "研发", "source_groups": ["111"], "target_groups": ["222"]},
+            {"name": "运营", "source_groups": ["444"], "target_groups": ["222"]},
+        ]
+        # 同一目标群 222 出现在两个分组：来源群 111（研发）的预检照常通过。
+        stored = host_stored(SOURCE_MESSAGE_ID)
+        result, _ = await run_precheck(stored, target="222", groups=groups)
+        assert isinstance(result, PreparedForward)
+        # 另一分组（运营）的源 444 同样与 222 同组，跨组重复不拒绝合法调用。
+        assert shared_forward_group(enabled_config(groups=groups), "444", "222") == "运营"
     asyncio.run(scenario())
 
 
@@ -426,16 +476,69 @@ def test_不可定位源消息或宿主查询失败时拒绝() -> None:
     asyncio.run(scenario())
 
 
-def test_白名单三导出共用同一份口径() -> None:
-    assert whitelist_entries([" 111 ", "222", "", "  ", "111"]) == ("111", "222", "111")
-    assert whitelist_entries("111") == ("1", "1", "1")  # 字符串按可迭代逐字符处理
-    assert whitelist_entries(None) == ()
-    assert whitelist_entries([111, 222, None, True]) == ("111", "222", "None", "True")
-    config = enabled_config()
+def test_成对判定同组命中返回分组名否则无() -> None:
+    config = CourierConfig(scope={"groups": [
+        {"name": " 研发 ", "source_groups": ["111"], "target_groups": ["222", "333"]},
+        {"name": "运营", "source_groups": ["444"], "target_groups": ["333"]},
+    ]})
+    # 同组命中返回去空白后的分组名；目标群跨组重复时各自分组均可命中。
+    assert shared_forward_group(config, "111", "222") == "研发"
+    assert shared_forward_group(config, "111", "333") == "研发"
+    assert shared_forward_group(config, "444", "333") == "运营"
+    # 目标只在别组、不在任何分组、来源群不在任何源组：都不命中。
+    assert shared_forward_group(config, "444", "222") is None
+    assert shared_forward_group(config, "111", "999") is None
+    assert shared_forward_group(config, "999", "222") is None
+
+
+def test_源群兼作别组目标时仍只判本组目标() -> None:
+    config = CourierConfig(scope={"groups": [
+        {"name": "甲", "source_groups": ["111"], "target_groups": ["222"]},
+        {"name": "乙", "source_groups": ["333"], "target_groups": ["111"]},
+    ]})
+    assert shared_forward_group(config, "333", "111") == "乙"
+    # 源群自身作为目标不成组（「目标 = 来源群自身」另由预检拒绝）。
+    assert shared_forward_group(config, "111", "111") is None
+
+
+def test_forward_group_entries归一全部分组并保持配置顺序() -> None:
+    config = CourierConfig(scope={"groups": [
+        {"name": " 研发 ", "source_groups": [" 111 ", "112", "  "],
+         "target_groups": [" 222 ", "222"]},
+        {"name": "运营", "source_groups": [], "target_groups": []},
+    ]})
+    before = [group.model_dump() for group in config.scope.groups]
+
+    entries = forward_group_entries(config)
+
+    assert entries == (
+        ForwardGroup(name="研发", source_groups=("111", "112"), target_groups=("222", "222")),
+        ForwardGroup(name="运营", source_groups=(), target_groups=()),
+    )
+    assert [group.model_dump() for group in config.scope.groups] == before, (
+        "归一视图不得原地修改配置分组")
+
+
+def test_forward_group_entries的群号归一与group_id_entries口径一致() -> None:
+    # 空白丢弃、字符串逐字符、不可迭代回落空：与 `group_id_entries` 同一口径。
+    stub = SimpleNamespace(scope=SimpleNamespace(groups=[SimpleNamespace(
+        name=" 研发 ", source_groups="111  ", target_groups=None)]))
+    entries = forward_group_entries(stub)
+    assert entries == (ForwardGroup(name="研发", source_groups=("1", "1", "1"), target_groups=()),)
+
+
+def test_群号归一与来源群判定共用同一份口径() -> None:
+    assert group_id_entries([" 111 ", "222", "", "  ", "111"]) == ("111", "222", "111")
+    assert group_id_entries("111") == ("1", "1", "1")  # 字符串按可迭代逐字符处理
+    assert group_id_entries(None) == ()
+    assert group_id_entries([111, 222, None, True]) == ("111", "222", "None", "True")
+    config = CourierConfig(scope={"groups": [
+        {"name": "研发", "source_groups": ["111", "112"], "target_groups": ["222"]},
+        {"name": "运营", "source_groups": ["333"], "target_groups": ["222"]},
+    ]})
     assert source_group_is_allowed(config, "111") and source_group_is_allowed(config, " 111 ")
+    assert source_group_is_allowed(config, "333")
     assert not source_group_is_allowed(config, "999")
-    assert target_is_allowed(config, "222") and target_is_allowed(config, "111")
-    assert not target_is_allowed(config, "333")
 
 
 def test_预检不联网且不触碰平台凭证() -> None:

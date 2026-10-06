@@ -9,8 +9,8 @@ from typing import Any, get_args, get_type_hints
 
 import pytest
 
-from config import AutoSection
-from plugin import CourierPlugin
+from config import AutoSection, CourierConfig, ForwardGroupSection, ScopeSection
+from plugin import FORWARD_TOOL_NAME, CourierPlugin
 from shared.config_rules import onebot_endpoint_rejection
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,20 +56,19 @@ def _all_keys(config: dict[str, Any], prefix: str = "") -> list[str]:
     return keys
 
 
-def test_默认配置字段面限定为开关白名单自动入口直连与宿主配置版本() -> None:
+def test_默认配置字段面限定为开关转发分组自动入口直连与宿主配置版本() -> None:
     config = CourierPlugin.build_default_config()
 
     assert config["plugin"]["enabled"] is False, "默认总开关必须关闭"
     assert config["auto"]["enabled"] is True, "默认自动入口开启"
-    assert config["scope"]["source_groups"] == []
-    assert config["scope"]["target_groups"] == []
+    assert config["scope"]["groups"] == []
     assert set(config) == {"plugin", "auto", "scope", "snowluma"}
     # config_version 是宿主强制项，不是本插件的业务开关。
     assert set(config["plugin"]) == {"enabled", "config_version"}
     assert set(config["auto"]) == {"enabled", "message_types", "share_criteria"}
-    assert set(config["scope"]) == {"source_groups", "target_groups"}
+    assert set(config["scope"]) == {"groups"}
     assert config["snowluma"] == {"http_url": "", "token": "", "token_env_var": ""}
-    assert config["plugin"]["config_version"] == "1.5.0"
+    assert config["plugin"]["config_version"] == "1.6.0"
     assert tomllib.loads((ROOT / "config.toml").read_text(encoding="utf-8")) == config
 
     from config import SnowLumaSection
@@ -81,13 +80,139 @@ def test_默认配置字段面限定为开关白名单自动入口直连与宿�
         assert field.json_schema_extra["hint"]
 
 
+def test_配置版本与仓库样例同步提升为分组结构() -> None:
+    assert CourierConfig().plugin.config_version == "1.6.0"
+    raw = (ROOT / "config.toml").read_text(encoding="utf-8")
+    parsed = tomllib.loads(raw)
+    assert parsed["plugin"]["config_version"] == "1.6.0"
+    assert parsed["scope"] == {"groups": []}, "config.toml 的 [scope] 必须是空分组，注释示例不得生效"
+    assert re.search(r"^\s*#\s*\[\[scope\.groups\]\]", raw, re.MULTILINE), "需附注释形态的 [[scope.groups]] 示例"
+
+
+def test_空目标分组与组内源自同均可保存() -> None:
+    empty_targets = CourierConfig(
+        scope={"groups": [{"name": "研发", "source_groups": ["111111"], "target_groups": []}]}
+    )
+    assert empty_targets.scope.groups[0].model_dump() == {
+        "name": "研发",
+        "source_groups": ["111111"],
+        "target_groups": [],
+    }
+
+    same_group = CourierConfig(
+        scope={"groups": [{"name": "研发", "source_groups": ["111111"], "target_groups": ["111111", "222222"]}]}
+    )
+    assert same_group.scope.groups[0].model_dump() == {
+        "name": "研发",
+        "source_groups": ["111111"],
+        "target_groups": ["111111", "222222"],
+    }
+
+
+def test_分组结构校验拒绝四类非法配置() -> None:
+    # 源群跨组重复：拒绝原因必须点出群号与两个组名
+    with pytest.raises(ValueError) as cross_group:
+        CourierConfig(
+            scope={
+                "groups": [
+                    {"name": "研发", "source_groups": ["111111"], "target_groups": ["222222"]},
+                    {"name": "运营", "source_groups": ["111111"], "target_groups": ["333333"]},
+                ]
+            }
+        )
+    assert "111111" in str(cross_group.value)
+    assert "研发" in str(cross_group.value) and "运营" in str(cross_group.value)
+
+    # 同一分组内源群重复
+    with pytest.raises(ValueError) as in_group:
+        CourierConfig(
+            scope={"groups": [{"name": "研发", "source_groups": ["111111", "111111"], "target_groups": []}]}
+        )
+    assert "111111" in str(in_group.value)
+
+    # name 缺失或去空白后为空
+    with pytest.raises(ValueError) as blank_name:
+        CourierConfig(scope={"groups": [{"name": "   ", "source_groups": ["111111"], "target_groups": []}]})
+    assert "空白" in str(blank_name.value) and "为空" in str(blank_name.value)
+    with pytest.raises(ValueError):
+        CourierConfig(scope={"groups": [{"source_groups": ["111111"], "target_groups": []}]})
+
+    # name 跨组重复
+    with pytest.raises(ValueError) as duplicate_name:
+        CourierConfig(
+            scope={
+                "groups": [
+                    {"name": "研发", "source_groups": ["111111"], "target_groups": []},
+                    {"name": "研发", "source_groups": ["222222"], "target_groups": []},
+                ]
+            }
+        )
+    assert "研发" in str(duplicate_name.value)
+
+
+def test_宿主Schema生成器可无参构造分组默认视图且空名仍被拒绝() -> None:
+    # 宿主生成配置 Schema 时对嵌套模型无参构造取默认视图：三个字段必须都有默认。
+    default_view = ForwardGroupSection()
+    assert default_view.model_dump() == {"name": "", "source_groups": [], "target_groups": []}
+    # 默认视图落进配置仍按空白 name 拒绝（配置期校验不因默认值放宽）。
+    with pytest.raises(ValueError, match="空白"):
+        ScopeSection(groups=[default_view])
+    with pytest.raises(ValueError, match="空白"):
+        CourierConfig(scope={"groups": [{}]})
+
+
+def test_合法多分组配置可构造且目标群可跨组重复() -> None:
+    config = CourierConfig(
+        scope={
+            "groups": [
+                {"name": "研发", "source_groups": ["111111"], "target_groups": ["222222"]},
+                {"name": "运营", "source_groups": ["333333"], "target_groups": ["222222", "444444"]},
+            ]
+        }
+    )
+    assert [item.model_dump() for item in config.scope.groups] == [
+        {"name": "研发", "source_groups": ["111111"], "target_groups": ["222222"]},
+        {"name": "运营", "source_groups": ["333333"], "target_groups": ["222222", "444444"]},
+    ]
+
+
+def test_scope_收敛为单个_groups_字段且组件声明仍完整() -> None:
+    assert set(CourierConfig().scope.model_dump()) == {"groups"}
+
+    components = CourierPlugin().get_components()
+    types = [component["type"] for component in components]
+    assert types.count("TOOL") == 1, "转发工具必须保持一个"
+    assert types.count("HOOK_HANDLER") == 2, "来源签发与自动入口两个 Hook 必须保持"
+    assert [item["name"] for item in components if item["type"] == "TOOL"] == [FORWARD_TOOL_NAME]
+
+
+def test_转发分组结构可经配置构造且界面元数据齐全() -> None:
+    from config import ForwardGroupSection
+
+    group = ForwardGroupSection(name="研发群", source_groups=["111111"], target_groups=["222222"])
+    assert group.model_dump() == {"name": "研发群", "source_groups": ["111111"], "target_groups": ["222222"]}
+
+    config = CourierConfig(
+        scope={"groups": [{"name": "研发群", "source_groups": ["111111"], "target_groups": ["222222"]}]}
+    )
+    assert [item.model_dump() for item in config.scope.groups] == [group.model_dump()]
+    assert CourierConfig().scope.groups == []
+
+    for name in ("name", "source_groups", "target_groups"):
+        field = getattr(ForwardGroupSection, name)
+        assert set(field.json_schema_extra) <= _CONSUMED_SCHEMA_KEYS, name
+        assert field.json_schema_extra["label"], f"{name} 必须有中文标签"
+        assert field.json_schema_extra["hint"], f"{name} 必须有提示"
+        assert isinstance(field.json_schema_extra.get("order"), int), f"{name} 必须声明界面排序"
+
+
 def test_自动入口新增字段的默认值与设计一致() -> None:
 
     config = CourierPlugin.build_default_config()
 
     assert config["auto"]["message_types"] == ["forward"], "默认不得扩大自动候选类型"
     assert config["auto"]["share_criteria"] == _DEFAULT_SHARE_CRITERIA
-    assert config["plugin"]["config_version"] == "1.5.0", "新增字段需提升配置版本以触发宿主归一化写回"
+    assert config["plugin"]["config_version"] == "1.6.0", "新增字段需提升配置版本以触发宿主归一化写回"
     assert re.fullmatch(r"\d+(\.\d+)*", config["plugin"]["config_version"]), "宿主按数字点分段比较版本"
 
 
@@ -160,8 +285,7 @@ def test_旧配置缺少新字段时加载成功并补为默认() -> None:
     assert config.auto.enabled is False, "旧自动入口开关不得被覆盖"
     assert config.auto.message_types == ["forward"], "旧配置不得因此扩大自动候选类型"
     assert config.auto.share_criteria == _DEFAULT_SHARE_CRITERIA
-    assert config.scope.source_groups == ["111111"]
-    assert config.scope.target_groups == ["222222"]
+    assert config.scope.groups == [], "旧配置的平铺键按未知键忽略，回落空分组（无源无目标，不发送）"
     assert config.model_dump()["auto"]["message_types"] == ["forward"]
 
 
@@ -417,7 +541,7 @@ def test_旧服务配置退役且保留业务设置不产生直连() -> None:
     exported = plugin.config.model_dump()
     assert exported["plugin"] == old["plugin"]
     assert exported["auto"]["enabled"] is False
-    assert exported["scope"] == old["scope"]
+    assert exported["scope"] == {"groups": []}, "退役的平铺键不进入新字段面"
     assert exported["snowluma"] == {"http_url": "", "token": "", "token_env_var": ""}
     assert "service" not in exported
     assert old["service"]["expected_ledger_id"] == "old-ledger", "不原地清除旧输入或历史线索"

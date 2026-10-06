@@ -2,6 +2,62 @@
 
 本文件按时间倒序记录项目变更；只收用户可见的结构、契约与验证面变化。
 
+## [未发布] - 2026-10-06（转发分组）
+
+### Changed（BREAKING）
+
+- `[scope]` 节由两份平铺白名单（`source_groups` / `target_groups`）改为 `groups`
+  具名转发分组结构数组，每项含必填 `name`、`source_groups`、`target_groups`；两份
+  平铺键直接移除，不设兼容期，**存量配置需手工改写**（OpenSpec 变更
+  `2026-10-06-scoped-forward-groups`，尚未归档；决策见 `docs/adr/0010`）。
+  `plugin.config_version` 1.5.0 → 1.6.0；默认空分组集合等价于旧的空白名单（没有
+  源群也没有目标群），未改写的旧配置表现为「源群不在任何转发分组内」的可定位拒绝。
+- 投递判定口径由「目标在目标白名单」收紧为**目标必须与来源同属一个转发分组**：
+  工具预检、源与评论提交前复验、自动入口的候选筛选与目标列举共用同一个成对判定，
+  不再各自复制。跨组目标（只在别的分组，或不在任何分组内）在发送前整条拒绝，措辞为
+  「目标群不在与来源群相同的转发分组内」。
+- 自动入口的合法目标从「全部目标白名单」收紧为「来源群所属分组的目标」；同组没有
+  合法且不同于源群的目标时不提供判断机会，显式调用同样因同组判定被拒。
+- `name` 只作用户标识与日志前缀（投递任务描述与 `_finish` 日志带压平后的
+  `分组=<name>` 前缀），不参与任何路由、权限或判断；不限长与字符集，但去空白后非空
+  且跨组唯一。
+- 目标群可跨组重复（多个源群喂同一个吃瓜群），源群也可兼作别组的目标群，实际投递
+  仍受「目标 ≠ 来源群自身」兜底。
+
+### Added
+
+- 分组判定族单点定义：`forward_group_entries`（归一视图，纯函数）、`forward_group_of`
+  （来源群所属分组）、`shared_forward_group`（成对判定，命中返回分组名）与
+  `source_group_is_allowed`（源群出现在任一分组）；`target_is_allowed` 随之删除。
+
+### Changed（配置期校验）
+
+- `config.ForwardGroupSection` 与 `ScopeSection.groups`：源群跨组重复、同一分组内源群
+  重复、`name` 去空白后为空或跨组重复一律抛中文 `ValueError`，不静默归并、不放行部分
+  配置（沿用 `SnowLumaSection.__init__` 先例，两处 SDK 环境一致）；空目标分组与组内
+  「源 = 目标」允许保存，由运行期既有规则拒绝。
+
+### Fixed（部署联验补齐）
+
+- arclinux 实机部署暴露：宿主生成配置 Schema 时要求嵌套模型所有字段有默认值，
+  `ForwardGroupSection.name` 无默认导致「构造插件配置 Schema 失败」（配置界面不可用，
+  config.toml 手写不受影响）。`name` 改为空串默认；实际生效仍以配置期校验为准
+  （空白 name 一律拒绝），并新增 `ForwardGroupSection()` 无参构造用例守住该契约。
+- 同一链路暴露：分组结构校验原先只覆盖 dict 输入，宿主默认视图以实例路径落回配置
+  会绕过三项校验。`ScopeSection.__init__` 现对 dict 与 `ForwardGroupSection` 实例两条
+  路径都执行校验，实例路径的空白 name / 重复同样拒绝。
+
+### 验证
+
+- 默认档 `620 passed, 2 skipped`；aiohttp 档 `715 passed`；pyright `0 errors`
+  （filesAnalyzed=18）。四字段账本键与直连协议、七动作、账本 schema 均不变。
+- arclinux 实机部署（`maim-bot-core`，SDK 2.9.0 / Python 3.13.16）：55 文件运行负载
+  md5 18/18 与本地一致；容器内冒烟 7 项通过（编译导入、1 Tool + 2 Hook 且
+  chat_scope=group、七动作+close 公开面、配置面、判定族、宿主 Schema 无参构造、
+  实例路径校验）；宿主热重载 7 插件 0 失败，Schema 失败日志消除。远端真实
+  `config.toml`、账本与锁原样保留；**分组配置需操作者在远端手工改写**[scope] 后才能
+  恢复发送（旧平铺键不被识别，fail-closed 不误发）。
+
 ## [未发布] - 2026-10-06
 
 ### Added

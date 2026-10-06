@@ -454,6 +454,7 @@ class DirectFixture:
     def __init__(self, path: Path, *, raw_message: list[dict[str, Any]] | None = None,
                  target_groups: tuple[str, ...] = (TARGET_GROUP_ID,),
                  source_groups: tuple[str, ...] = (SOURCE_GROUP_ID,),
+                 groups: list[dict[str, Any]] | None = None,
                  message_types: tuple[str, ...] = ("forward",),
                  share_criteria: str | None = None, clock: Any = None,
                  config_overrides: dict[str, dict[str, Any]] | None = None,
@@ -465,8 +466,8 @@ class DirectFixture:
         self.storage = FaultLedger(self.ledger)
         self.close_calls = self.storage.closed
         config = enabled_config(source_groups=source_groups, target_groups=target_groups,
-                                message_types=message_types, share_criteria=share_criteria,
-                                http_url=http_url)
+                                groups=groups, message_types=message_types,
+                                share_criteria=share_criteria, http_url=http_url)
         for section, values in (config_overrides or {}).items():
             config.setdefault(section, {}).update(values)
         self.onebot = DirectOneBot()
