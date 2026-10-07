@@ -13,6 +13,7 @@
     "auto_entry.py",
     "snowluma_client.py",
     "snowluma_transport.py",
+    "type_check.py",
     "shared",
   ],
   "exclude": ["history", "**/__pycache__"],

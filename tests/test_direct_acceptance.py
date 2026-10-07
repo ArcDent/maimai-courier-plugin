@@ -30,6 +30,7 @@ from maimai_courier_plugin.snowluma_transport import (
     AiohttpOneBotTransport,
     OneBotConnection,
 )
+from maimai_courier_plugin.type_check import NESTED_FORWARD_DETAIL, NESTED_FORWARD_REASON
 from tests.direct_support import (
     ACCEPTANCE_TOKEN,
     DEFAULT_MEDIA_URL,
@@ -43,6 +44,7 @@ from tests.direct_support import (
     onebot_segments,
     prepare_source,
 )
+from tests.snowluma_client_support import NESTED_EXPANDED_CARD
 from tests.snowluma_transport_support import http_endpoint
 from tests.support import (
     MESSAGE_ID,
@@ -81,10 +83,14 @@ EXPANDED_MESSAGES: list[dict[str, Any]] = [
      "message": [{"type": "text", "data": {"text": "合成展开节点一"}}]},
     {"sender": {"user_id": "90002", "card": "名片乙"},
      "message": [{"type": "image", "data": {"url": DEFAULT_MEDIA_URL}},
-                 {"type": "forward", "data": {"id": "old-res-id", "content": [
-                     {"type": "text", "data": {"text": "内层卡片"}}]}}]},
+                 {"type": "text", "data": {"text": "合成展开节点二"}}]},
 ]
-"""`get_forward_msg` 展开查询的合成应答：第二节点内容含嵌套 forward 段（原样提交）。"""
+"""`get_forward_msg` 展开查询的合成应答：两节点非嵌套卡片（第二节点含图片段与文字，原样提交）。
+
+默认夹具按新契约不含嵌套 forward 段：含嵌套内层卡片的展开应答必须在发送前整条拒绝
+（专用覆盖见文末「嵌套卡片类型检查互证」节，样本取
+`tests.snowluma_client_support.NESTED_EXPANDED_CARD`），本夹具只覆盖非嵌套材料的成功链路。
+"""
 
 MATERIALS = [
     pytest.param(
@@ -136,13 +142,12 @@ MATERIALS = [
                                       "content": [{"type": "text", "data": {"text": "合成展开节点一"}}]}},
             {"type": "node", "data": {"uin": "90002", "name": "名片乙", "content": [
                 {"type": "image", "data": {"url": DEFAULT_MEDIA_URL}},
-                {"type": "forward", "data": {"id": "old-res-id", "content": [
-                    {"type": "text", "data": {"text": "内层卡片"}}]}}]}}]}},
+                {"type": "text", "data": {"text": "合成展开节点二"}}]}}]}},
         id="原卡片",
     ),
 ]
 """各候选类型的期望发送线路。卡片行：源卡片只提供卡片标识给只读
-`get_forward_msg` 展开查询，发送载荷是展开应答构造的节点数组（含嵌套 forward 段
+`get_forward_msg` 展开查询，发送载荷是展开应答构造的节点数组（两节点、内容段
 原样），不是源消息内部内容，也不含源卡片资源 ID。"""
 
 
@@ -178,7 +183,8 @@ class LocalOneBot:
     def __init__(self, clock: FakeClock, raw: list[dict[str, Any]], *, fault: str = "",
                  ledger: Any = None, account: str = SOURCE_ACCOUNT_ID,
                  targets: tuple[str, ...] = (TARGET_GROUP_ID, OTHER_TARGET_GROUP_ID),
-                 token: str = ACCEPTANCE_TOKEN, negative_ids: bool = False) -> None:
+                 token: str = ACCEPTANCE_TOKEN, negative_ids: bool = False,
+                 expanded: dict[str, Any] | None = None, expand_failure: bool = False) -> None:
         self.clock = clock
         self.raw = raw
         self.fault = fault
@@ -187,6 +193,11 @@ class LocalOneBot:
         self.targets = list(targets)
         self.token = token
         self.negative_ids = negative_ids
+        self.expanded = {"messages": deepcopy(EXPANDED_MESSAGES)} if expanded is None else expanded
+        self.expand_failure = expand_failure
+        """展开查询失败注入（与 `tests/direct_support.DirectOneBot.expand_failure` 同口径）：
+        置真时 `get_forward_msg` 按业务失败信封应答（平台确认该卡片不存在或不可展开），
+        自动入口只读预识别必须 fail-open、照常提供判断机会。"""
         self.requests: list[dict[str, Any]] = []
         self.sent: list[dict[str, Any]] = []
         self.receipts: dict[str, dict[str, Any]] = {}
@@ -226,8 +237,13 @@ class LocalOneBot:
         elif action == "get_msg":
             data = self._record_for(params["message_id"])
         elif action == "get_forward_msg":
-            # 只读展开查询：按源卡片标识返回合成节点序列。
-            data = {"messages": deepcopy(EXPANDED_MESSAGES)}
+            # 只读展开查询：按源卡片标识返回合成节点序列（样本可按用例整体替换）。
+            if self.expand_failure:
+                # 展开查询按业务失败应答（平台确认该卡片不存在或不可展开）：
+                # 自动入口预识别只读查询必须 fail-open，不阻断本次自动判断机会。
+                return web.json_response(envelope(None, status="failed", retcode=100,
+                                                  message="not found"))
+            data = deepcopy(self.expanded)
         elif action in SEND_ACTIONS:
             return await self._send(request, action, params)
         else:
@@ -716,7 +732,11 @@ def test_宿主Hook与真实端点并存只有源群判断且沉默不发送(tmp
                     await asyncio.sleep(0)
                 assert len(assembly.ctx.maisaka.proactive.calls) == 1
                 assert assembly.ctx.maisaka.proactive.calls[0]["stream_id"] == SOURCE_SESSION_ID
-                assert len(server.requests) == before, "沉默的判断不得触发新的平台请求"
+                # 新契约：自动入口对合并转发候选先做只读预识别（`get_msg` 取同账号源
+                # 消息、`get_forward_msg` 按卡片标识展开）。沉默的判断仍不发送，平台
+                # 侧新增的只有这一次只读查询序列，不得出现任何发送或其它动作。
+                assert [item["body"]["action"] for item in server.requests[before:]] == [
+                    "get_msg", "get_forward_msg"], "沉默的判断只产生只读预识别查询"
                 assert len(server.sent) == 1
                 assert ledger.get(ledger_key()).status == "sent"
                 assert assembly.ctx.send.calls == [] and assembly.api_calls == []
@@ -786,3 +806,106 @@ def test_跨组目标经真实HTTP发送前拒绝且传输层零请求(tmp_path)
                 await close_assembly(assembly, ledger)
 
     asyncio.run(scenario())
+
+
+# ----------------------------------------------------------- 嵌套卡片类型检查互证（design D6）
+# 卡片展开应答含嵌套内层卡片时，工具路径发送前整条拒绝、自动入口只读预识别跳过；
+# 展开查询失败时自动入口 fail-open。两条链都走真实 aiohttp 回环端点与公开入口
+# （`forward_message` 工具、观察 Hook），不 mock 客户端或其它内部协作者。
+
+
+def test_嵌套卡片经真实HTTP展开后发送前整条拒绝且零发送(tmp_path):
+    """嵌套卡片的工具调用全链拒绝：拒绝点在展开查询之后、节点构造之前。"""
+
+    async def scenario():
+        clock = FakeClock()
+        raw = [forward_segment(forward_node())]
+        ledger = open_test_ledger(tmp_path, clock=clock)
+        server = LocalOneBot(clock, raw, ledger=ledger, expanded=deepcopy(NESTED_EXPANDED_CARD))
+        async with http_endpoint(server.handler) as url:
+            assembly = assemble(tmp_path, url, raw, clock, ledger=ledger)
+            try:
+                result = await bound_call(assembly.plugin)
+                assert (result["status"], result["stage"], result["sent"], result["delivered"],
+                        result["success"]) == ("rejected", "rejected", False, False, False), result
+                assert NESTED_FORWARD_REASON in result["reason"], result
+                assert NESTED_FORWARD_DETAIL in result["reason"], result
+                assert server.sent == [], "嵌套卡片不得提交任何发送动作（发送动作表恒空）"
+                assert [item["body"]["params"] for item in server.requests
+                        if item["body"]["action"] == "get_forward_msg"] == [
+                    {"id": DEFAULT_RESOURCE_ID}], "拒绝点：按源卡片标识展开查询之后、节点构造之前"
+                assert ledger.get(ledger_key()) is None, "发送前拒绝不得在账本留下记录"
+                assert assembly.ctx.maisaka.proactive.calls == []
+                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
+                assert_clean_requests(server)
+                assert_no_leak(result, assembly.ctx)
+            finally:
+                await close_assembly(assembly, ledger)
+
+    asyncio.run(scenario())
+
+
+def test_嵌套卡片自动候选经真实HTTP预识别跳过且展开失败照常唤起(tmp_path):
+    """自动入口预识别的两种结局：命中嵌套不唤起（留可定位日志），展开查询业务失败放行。"""
+
+    async def scenario_nested() -> None:
+        clock = FakeClock()
+        raw = [forward_segment(forward_node())]
+        data_dir = tmp_path / "nested"
+        data_dir.mkdir()
+        ledger = open_test_ledger(data_dir, clock=clock)
+        server = LocalOneBot(clock, raw, ledger=ledger, expanded=deepcopy(NESTED_EXPANDED_CARD))
+        async with http_endpoint(server.handler) as url:
+            assembly = assemble(data_dir, url, raw, clock, ledger=ledger)
+            try:
+                payload = merged_forward_message(message_id=MESSAGE_ID, raw_message=raw)
+                await assembly.plugin.observe_received_message(**payload)
+                await spin_until(lambda: any(
+                    "未提供分享判断机会" in text for text in assembly.ctx.logger.texts("warning")))
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                assert assembly.ctx.maisaka.proactive.calls == [], (
+                    "预识别命中嵌套内层卡片，不提供本次自动判断机会")
+                warnings = "\n".join(assembly.ctx.logger.texts("warning"))
+                assert MESSAGE_ID in warnings, warnings
+                assert "嵌套" in warnings, warnings
+                assert [item["body"]["params"] for item in server.requests
+                        if item["body"]["action"] == "get_forward_msg"] == [
+                    {"id": DEFAULT_RESOURCE_ID}], "命中前仍按源卡片标识展开查询（只读、不重试）"
+                assert server.sent == [] and ledger.get(ledger_key()) is None, (
+                    "预识别只读：任何结局都不得提交发送或落账")
+                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
+                assert_clean_requests(server)
+            finally:
+                await close_assembly(assembly, ledger)
+
+    async def scenario_expand_failed() -> None:
+        clock = FakeClock()
+        raw = [forward_segment(forward_node())]
+        data_dir = tmp_path / "expand-failed"
+        data_dir.mkdir()
+        ledger = open_test_ledger(data_dir, clock=clock)
+        server = LocalOneBot(clock, raw, ledger=ledger, expand_failure=True)
+        async with http_endpoint(server.handler) as url:
+            assembly = assemble(data_dir, url, raw, clock, ledger=ledger)
+            try:
+                payload = merged_forward_message(message_id=MESSAGE_ID, raw_message=raw)
+                await assembly.plugin.observe_received_message(**payload)
+                await spin_until(lambda: len(assembly.ctx.maisaka.proactive.calls) == 1)
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                assert len(assembly.ctx.maisaka.proactive.calls) == 1, (
+                    "展开查询失败（平台确认该卡片不可展开）按放行处理，照常提供一次判断机会")
+                assert assembly.ctx.maisaka.proactive.calls[0]["stream_id"] == SOURCE_SESSION_ID
+                assert [item["body"]["params"] for item in server.requests
+                        if item["body"]["action"] == "get_forward_msg"] == [
+                    {"id": DEFAULT_RESOURCE_ID}], "查询失败不重试：展开查询只发生一次"
+                assert server.sent == [] and ledger.get(ledger_key()) is None, (
+                    "自动入口只唤起源群判断，任何结局都不得提交发送或落账")
+                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
+                assert_clean_requests(server)
+            finally:
+                await close_assembly(assembly, ledger)
+
+    asyncio.run(scenario_nested())
+    asyncio.run(scenario_expand_failed())

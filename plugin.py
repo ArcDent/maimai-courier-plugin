@@ -241,6 +241,24 @@ class CourierPlugin(MaiBotPlugin):
         return (self.config.snowluma.http_url, self.config.snowluma.token_env_var,
                 self.config.snowluma.token)
 
+    def _adopt_client(self, connection: OneBotConnection | OneBotUnresolved) -> SnowLumaClient | None:
+        """按连接构造客户端，并写入 `_client`/`_connection`/`_client_generation` 三字段。
+
+        客户端实例的唯一写点：工具路径连接替换尾段与自动路径惰性创建都经本方法落账；
+        刷新策略（工具路径的连接替换/关闭竞裁与代次比较）留在各自调用方，不在这里合并
+        语义。连接不可解析（端点未配置、地址非法或凭证缺失）时返回 `None`，不构造、
+        不改写既有实例。
+        """
+
+        if isinstance(connection, OneBotUnresolved):
+            return None
+        client = SnowLumaClient(transport=self._transport_factory(connection), clock=self._clock,
+                                config_generation=self._config_generation)
+        self._client = client
+        self._connection = connection
+        self._client_generation = self._config_generation
+        return client
+
     def _forget_task(self, task: asyncio.Future[Any]) -> None:
         """任务结束后从本插件台账移除：卸载只等待仍在运行的任务。"""
 
@@ -344,10 +362,8 @@ class CourierPlugin(MaiBotPlugin):
             self._client = None
             self._client_close_task = None
         if self._client is None:
-            self._client_generation = generation
-            self._connection = connection
-            self._client = SnowLumaClient(transport=self._transport_factory(connection), clock=self._clock,
-                                         config_generation=self._config_generation)
+            self._adopt_client(connection)
+        assert self._client is not None
         prefix = f"分组={group_label}，" if group_label else ""
         label = f"投递（{prefix}源消息={outcome.arguments.message_id}，目标群={outcome.arguments.target_group_id}"
         def stage_changed(stage: str) -> None:
@@ -498,6 +514,40 @@ class CourierPlugin(MaiBotPlugin):
 
         task.add_done_callback(_forget)
 
+    def _auto_entry_client(self) -> SnowLumaClient | None:
+        """自动路径只读查询用的客户端：复用工具路径实例，连接不符时按当前配置重建。
+
+        与 `_forward_request` 同一惰性创建口径：连接不可解析（端点未配置、地址非法或
+        凭证缺失）时返回 `None`，组合根据此跳过预搜索。创建后的客户端与工具路径复用
+        同一实例（连接相同不触发替换）；自动路径只创建/复用、不关闭旧连接——HTTP 无
+        长连接，旧客户端的在途请求由各自持有的引用自行收尾，连接替换与关闭竞裁仍只由
+        工具路径负责。构造与三字段写入都走 `_adopt_client` 单写点。
+        """
+
+        connection = resolve_onebot_connection(self.config, self._environ)
+        if self._client is not None and self._connection == connection:
+            return self._client
+        return self._adopt_client(connection)
+
+    async def _presearch_card_content(self, candidate: ForwardCandidate) -> str | None:
+        """自动入口的卡片内容预搜索（`run_auto_entry` 的 `presearch` 缝隙）。
+
+        命中嵌套内层卡片返回拒绝原因（据此不提供判断机会并记录可定位日志）；客户端
+        不可用（连接不可解析）与任何查询异常都返回 `None` 放行：照常给源群
+        一次判断机会，能否发送由工具路径在发送前权威拒绝。查询只读、有界，与工具路径
+        共用同一传输替身，不设置提交许可闸门。
+        """
+
+        if self._closed:
+            return None
+        client = self._auto_entry_client()
+        if client is None:
+            return None
+        try:
+            return await client.card_content_rejection(candidate.source_message_id)
+        except Exception:
+            return None
+
     async def _run_auto_entry(self, candidate: ForwardCandidate) -> None:
         """执行一次自动判断唤起，并记录可定位结果（后台任务不得丢失异常）。"""
 
@@ -507,6 +557,7 @@ class CourierPlugin(MaiBotPlugin):
                 candidate=candidate,
                 clock=self._clock,
                 current_config=self._auto_entry_config,
+                presearch=self._presearch_card_content,
             )
         except asyncio.CancelledError:
             self.ctx.logger.debug(

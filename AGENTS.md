@@ -18,7 +18,7 @@
   其设计取舍见归档 `openspec/changes/archive/2026-10-04-direct-snowluma-websocket-forwarding/design.md`
   D1–D11（历史）；当前架构决定见 `docs/adr/0008-http-direct-client-and-forward-actions.md`
   （取代 ADR 0007），实测依据见 `docs/snowluma-http-api-catalog.md` 第 6 节；
-  原卡片边界见 ADR 0004。
+  原卡片边界见 ADR 0004；嵌套卡片发送前拒绝见 `docs/adr/0011-nested-card-rejection.md`。
 - 核对外部契约时读归档 `verification/01`–`07` 与 `unverified-server-contracts.md`
   （位于 `openspec/changes/archive/2026-10-04-direct-snowluma-websocket-forwarding/`）。
   U1（仅 Bearer 头认证）已在 2026-10-04 授权实测实例确认，U3–U8 仍未确认，服务端字段
@@ -87,7 +87,9 @@
   另持卡片节点载荷构造 `build_card_nodes`：把 `get_forward_msg` 展开结果转成
   `{"type":"node","data":{"uin","name","content"}}` 节点数组，uin 取 sender 的
   user_id、name 取 card 优先回退 nickname（压平限长）、content 段原样深拷贝；
-  空名或 uin 不可确认整条拒绝，嵌套 forward 段原样保留。字段名是 `uin` 而非
+  空名或 uin 不可确认整条拒绝。嵌套 forward 段在到达本函数前已被发送前类型检查拒绝
+  （`type_check` 单点判定），本函数不再接收嵌套内容（函数行为未变：content 段仍
+  原样深拷贝）。字段名是 `uin` 而非
   `sender`：平台只解析 `user_id`/`uin` 与 `nickname`/`name`，`sender` 被静默
   丢弃、uin 回退 bot 自身（2026-10-06 实测，见 API 目录 6.8）；文字路径
   `snowluma_client._text_card_node` 同口径用 `uin`/`name`。署名取值
@@ -134,7 +136,18 @@
   `name` 空白/跨组重复，空目标分组与组内「源 = 目标」允许保存（ADR 0010，取代源/目标
   平铺白名单）。`MessageType` 是候选配置与分类的唯一词汇，旧 `[service]` 不转换为可发送配置。
 - `auto_entry.py`：只从宿主已处理入站筛选候选、有限等可读、唤起源群一次；不调用直连
-  执行、不选目标、不复制聊天链。合法目标只列举来源群所属分组的同组目标。规则见下节。
+  执行、不选目标、不复制聊天链。合法目标只列举来源群所属分组的同组目标。另持合并
+  转发候选的只读预搜索（`type_check` 判定共用）：仅 forward 候选，在可读性确认与
+  配置初检之后、目标名称查询之前，用与工具路径相同的两步只读查询（`get_msg` 取
+  平台卡片标识 → `get_forward_msg` 展开）预识别嵌套卡片；命中不提供判断机会并记录
+  可定位原因，查询失败/取不到标识/不可判定按失败放行（fail-open，不阻断自动判断）；
+  预搜索不替代发送前判定、无任何发送动作、不改变候选分类口径。规则见下节。
+- `type_check.py`：卡片内容类型检查的判定族单点，当前只含「展开结果节点内容含嵌套
+  内层合并转发卡片」一种；`unsupported_card_content` 是纯函数（无 IO、不 import
+  传输/客户端/`send_material`/`auto_entry`，畸形输入稳定判定不抛异常）。reason 常量
+  `NESTED_FORWARD_REASON` 与固定对外措辞 `NESTED_FORWARD_DETAIL` 是两个独立常量，
+  前者只进代码与日志定位、后者随结果面给出；新类型经同一判定点与同一结果面扩展，
+  不在各调用方复制判定。
 - 退役模块已删除（`host_send.py` / `remote_client.py` / `service/` 原墓碑不导出代码）：
   旧服务、专属测试与环境完整留在 `history/snowluma-forward-service/`，MANIFEST 的109项
   1,633,141字节不得覆盖；65项退出原路径的证据见 ISOLATION。历史不导入、不收集，
@@ -163,15 +176,20 @@
 - 卡片消息转发按源消息卡片标识展开查询→节点重组发送：取顶层唯一卡片段的
   `forward.data.id`，`get_forward_msg` 展开后经 `build_card_nodes` 结构校验构造节点
   数组，`send_group_forward_msg` 一次提交目标群与节点；平台按目标群上下文重建卡片并
-  重新上传卡片内媒体。内部回复、提及、媒体与未知段随节点内容原样保留，嵌套内层
-  forward 段原样提交、不递归展开，其目标群展示不保证；插件不提取、不改写、不清洗
+  重新上传卡片内媒体。内部回复、提及、媒体与未知段随节点内容原样保留；展开结果
+  节点内容含嵌套内层 forward 段（卡片套卡片）时发送前整条拒绝，固定措辞「源卡片
+  包含嵌套聊天记录，无法完整转发，不建议继续尝试」，不退化为递归展开、拍平或摘要
+  后发送（ADR 0011：实测嵌套内层在目标群客户端只能显示为降级空壳，与所引用资源的
+  新旧无关，类型判定在 `type_check` 单点）；插件不提取、不改写、不清洗
   节点，不提交调用方资源 ID，不设置外层预览/摘要参数。禁 `send_msg` 直引旧 `res_id`
   （实测信封成功而群内展示降级空壳、四项回执无法识别）。顶层多卡片/混排、源消息不存在
   或缓存缺失、展开失败/空节点/sender 不可确认仍整条拒绝，不摘要/拆段/以源ID猜资源。
   外层预览由平台默认生成，卡片内 at 是否触发客户端提醒不作未经真实验证的保证。
 - 自动入口仅转发分组内的源群、非机器人自身、非通知的 QQ 消息；身份/发送者不明就放弃。
   卡片优先 `forward`（含未展开），无卡片时图文为 `image`、非空文字为 `text`，提及只
-  附属；非法结构/不支持段放弃。分类成功不承诺可发送，未选类型不触发。
+  附属；非法结构/不支持段放弃。分类成功不承诺可发送，未选类型不触发。合并转发候选
+  在可读性确认与配置初检后、目标名称查询前做只读嵌套预搜索（两步只读查询同工具路径，
+  命中不唤起，查询失败放行，最终仍由发送前类型检查权威判定）。
 - 会话ID和源ID先过 `safe_identifier`（限128、无空白/控制字符/尖括号引号反引号），
   异常直接放弃、不净化成另一ID。意图含真实源ID、实际候选类型、合法目标与可用名称、
   标准原文和“自行判断、可以沉默”边界；不摘抄/伪造正文，不掷骰、不签目标决策票。
@@ -226,15 +244,15 @@
 ## 验证
 
 ```bash
-uv run --no-project --with pytest pytest tests/ -q                  # 默认：620 passed, 2 skipped
-uv run --no-project --with pytest --with aiohttp pytest tests/ -q   # 传输与跨进程用例：715 passed
-uv run --no-project --with pyright pyright                          # 生产代码零错误（filesAnalyzed=18）
+uv run --no-project --with pytest pytest tests/ -q                  # 默认：672 passed, 2 skipped
+uv run --no-project --with pytest --with aiohttp pytest tests/ -q   # 传输与跨进程用例：769 passed
+uv run --no-project --with pyright pyright                          # 生产代码零错误（filesAnalyzed=19）
 ```
 
-覆盖边界详见 [README 的离线开发验证](README.md#离线开发验证)。以上为 2026-10-06
-转发分组收敛后的实跑结果；每次修改重跑实际结果，不沿用旧数字；测试仅使用临时合成数据与
-本地端点，不安装真实 SDK、SSH、读取真实状态、部署或发 QQ。根默认收集与 `tests/`
-同范围，历史不收集。
+覆盖边界详见 [README 的离线开发验证](README.md#离线开发验证)。以上为 2026-10-07
+嵌套卡片发送前拒绝（变更 `nested-card-type-check`）收尾时的实跑结果；每次修改重跑
+实际结果，不沿用旧数字；测试仅使用临时合成数据与本地端点，不安装真实 SDK、SSH、
+读取真实状态、部署或发 QQ。根默认收集与 `tests/` 同范围，历史不收集。
 `pyrightconfig.json` 明确排除历史，目标 Python 3.11；真实 SDK 未安装，因此关闭
 `reportMissingImports`。实机返修证据见归档 `verification/09-deployment-revision.md`，
 离线通过不能代替实际加载版本确认、独立验收或真实 QQ 联验。
