@@ -27,7 +27,8 @@ Maisaka 依据可编辑标准自主决定分享或沉默；群友也可明确请
 - [直连运维清单](docs/direct-snowluma-operations.md)：端点、环境、账本、备份与停止条件。
 - [CONTEXT.md](CONTEXT.md)：领域术语；[ADR 0008](docs/adr/0008-http-direct-client-and-forward-actions.md)：
   当前架构决定（HTTP 直连与三类分派，取代 ADR 0007）；[ADR 0010](docs/adr/0010-scoped-forward-groups.md)：
-  转发分组决定（同组才能互投，取代源/目标平铺白名单）；实测快照见
+  转发分组决定（同组才能互投，取代源/目标平铺白名单）；[ADR 0011](docs/adr/0011-nested-card-rejection.md)：
+  嵌套卡片发送前拒绝决定（卡片套卡片不再原样提交）；实测快照见
   [SnowLuma HTTP API 目录](docs/snowluma-http-api-catalog.md)。
 - 当前行为以主规格 [跨群转发](openspec/specs/cross-group-forward/spec.md) 与
   [直连客户端](openspec/specs/snowluma-direct-client/spec.md) 为准；HTTP 直连与三类
@@ -140,9 +141,11 @@ OneBot 源记录。来源对应不足、私聊、越权或目标不可确认都�
 提供正文、资源 ID、媒体地址或任意平台动作。
 
 自动入口只观察宿主 `chat.receive.after_process`，给源群一次判断机会：只对转发分组内的
-源群触发，列给 Maisaka 的目标群仅限来源群所属分组的同组目标；消息可读等待
-最多 10 秒，去重为 10 分钟/4096 项的独立内存状态。直连收到的普通消息、自发事件或
-通知不触发自动判断，不构成第二条宿主入站链；Planner 沉默时不转发、不评论。
+源群触发，列给 Maisaka 的目标群仅限来源群所属分组的同组目标；合并转发候选在唤起前
+经两步只读查询预识别嵌套卡片，命中不提供判断机会，查询失败不影响本次机会（能否发送
+仍由发送前类型检查权威决定）；消息可读等待最多 10 秒，去重为 10 分钟/4096 项的独立
+内存状态。直连收到的普通消息、自发事件或通知不触发自动判断，不构成第二条宿主入站链；
+Planner 沉默时不转发、不评论。
 
 ## 支持与整条拒绝
 
@@ -153,7 +156,12 @@ OneBot 源记录。来源对应不足、私聊、越权或目标不可确认都�
   `get_forward_msg` 展开取得节点序列，经结构校验后以 `send_group_forward_msg` 单次
   提交，平台按目标群上下文重新上传卡片内媒体；插件不提取调用方资源 ID、不改写或清洗
   节点内容、不设置外层预览/摘要参数。内部回复、提及、媒体和未知段随节点内容原样保留；
-  嵌套内层卡片原样提交、不递归展开，其在目标群的展示不保证（待真实联验，归 U6）。
+  **展开结果含嵌套内层卡片（卡片套卡片）时发送前整条拒绝**，固定措辞「源卡片包含嵌套
+  聊天记录，无法完整转发，不建议继续尝试」——实测该形态在目标群客户端只能显示为降级
+  空壳，且与所引用资源的新旧无关（ADR 0011）。**显式工具调用同样在发送前被拒**；
+  自动入口对这类候选不提供判断机会（只读预识别，查询失败不影响正常唤起）。其它实测
+  有问题的节点类型（作节点内容时回执平台群序列为 0 的 `xml`/`share`/`contact`，端点
+  拒收的 `poke`/`market_face`）本轮不阻断、留待以后处理，其目标群展示不另行保证。
   卡片内 at 是否在目标群客户端触发提醒不作保证（待真实联验，归 U6）；工具评论另发，
   不塞进卡片节点。
 - **单节点卡片文字**（普通文字）：以单节点合并转发卡片发送，节点署名取自源消息
@@ -232,9 +240,9 @@ OneBot 源记录。来源对应不足、私聊、越权或目标不可确认都�
 ## 离线开发验证
 
 ```bash
-uv run --no-project --with pytest pytest tests/ -q                  # 默认：619 passed, 2 skipped
-uv run --no-project --with pytest --with aiohttp pytest tests/ -q   # 传输与跨进程用例：714 passed
-uv run --no-project --with pyright pyright                          # 生产代码零错误（filesAnalyzed=18）
+uv run --no-project --with pytest pytest tests/ -q                  # 默认：672 passed, 2 skipped
+uv run --no-project --with pytest --with aiohttp pytest tests/ -q   # 传输与跨进程用例：769 passed
+uv run --no-project --with pyright pyright                          # 生产代码零错误（filesAnalyzed=19）
 ```
 
 固定下限复验可把第二条的 `aiohttp` 改为 `aiohttp==3.14.3`；结果以本次实际输出为准，
@@ -243,6 +251,7 @@ uv run --no-project --with pyright pyright                          # 生产代�
 默认不装网络库：真实 HTTP 传输与回环验收模块（`tests/test_snowluma_transport.py`、
 `tests/test_direct_acceptance.py`）在导入期跳过，默认档的 2 个 skipped 正是这两个模块；
 带库才执行真实回环 HTTP 端点与公共工具完整链。根 `pytest -q` 与显式 `tests/` 同范围，
-历史不收集。以上为 2026-10-06 转发分组收敛后实跑结果。
+历史不收集。以上为 2026-10-07 嵌套卡片发送前拒绝（变更 `nested-card-type-check`）
+收尾后实跑结果。
 
 真实行为需要真实 QQ 联验，见 [docs/real-qq-validation.md](docs/real-qq-validation.md)。

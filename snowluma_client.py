@@ -31,6 +31,7 @@ from .snowluma_transport import (
     ONEBOT_ACTION_TIMEOUT_SECONDS, ONEBOT_CLOSE_TIMEOUT_SECONDS,
     OneBotTransport, OneBotUnavailable,
 )
+from .type_check import NESTED_FORWARD_DETAIL, unsupported_card_content
 
 RECEIPT_VERIFY_TIMEOUT_SECONDS = 3.0
 RECEIPT_VERIFY_INTERVAL_SECONDS = 0.5
@@ -186,8 +187,9 @@ class SnowLumaClient:
             if shape == "mixed":
                 return PrepareRejected("source_shape_unsupported", "顶层卡片与其它内容混排，整条拒绝")
             if shape == "forward":
-                # 卡片链路：顶层唯一卡片段取平台卡片标识 → 只读展开查询 → 节点结构
-                # 校验；材料 = 节点数组，投递时平台按目标群上下文重建卡片。
+                # 卡片链路：顶层唯一卡片段取平台卡片标识 → 只读展开查询 → 发送前
+                # 类型检查 → 节点结构校验；材料 = 节点数组，投递时平台按目标群上下文
+                # 重建卡片。
                 card_id = forward_card_id(top_level[0])
                 if not card_id:
                     return PrepareRejected("forward_expand_unavailable", "源卡片标识不可确认，无法展开查询，发送前拒绝")
@@ -199,6 +201,12 @@ class SnowLumaClient:
                         "平台确认该卡片不存在或不可展开，发送前拒绝" if business_failure(response)
                         else "卡片展开查询无可用数据，发送前拒绝",
                     )
+                # 发送前类型检查（判定口径单点定义于 type_check）：嵌套内层卡片在
+                # 目标群客户端只能显示为降级空壳，命中即整条拒绝，不进入节点构造、
+                # 不退化为递归展开、拍平或摘要。
+                nested_reason = unsupported_card_content(expanded)
+                if nested_reason:
+                    return PrepareRejected(error=nested_reason, reason=NESTED_FORWARD_DETAIL)
                 nodes = build_card_nodes(expanded)
                 if isinstance(nodes, PrepareRejected):
                     return nodes
@@ -222,6 +230,53 @@ class SnowLumaClient:
             return PreparedSource(built, prepared.source.group_id, prepared.onebot_message_id,
                                   prepared.arguments.target_group_id, prepared.source.account_id,
                                   self._config_generation)
+
+    async def card_content_rejection(self, message_id: str) -> str | None:
+        """只读预识别卡片内容：命中嵌套内层卡片返回 reason，未命中或查询失败返回 None。
+
+        自动入口的只读缝隙（design D3）：与工具路径 `prepare_source` 卡片分支同一读取
+        序列——`get_msg` 取同账号源消息记录、顶层唯一卡片段取平台卡片标识、
+        `get_forward_msg` 按标识展开查询、交 `type_check` 单点判定。用 `message_id` 而非
+        宿主载荷里的卡片标识：标识经平台验证，不信任宿主载荷。
+
+        查询失败（信封非法、业务失败、超时、连接不可用）与「确认无嵌套」都返回
+        `None`：自动入口只关心是否命中，失败即放行（照常给判断机会），工具路径本来就
+        会在发送前独立复判，不会因预搜索放行而漏拒。取消不是失败：`asyncio.CancelledError`
+        照常向上传播，不放行、不改写为 `None`（与 `auto_entry._card_presearch_rejection`
+        的「取消照常传播」承诺一致）。本方法只读：不设置提交许可闸门、不提交任何发送
+        动作、不持有源正文；查询与其它动作共用同一有界预算与单实例串行锁，查询失败不重试。
+        """
+
+        if self._closed or not verbatim_identifier(message_id):
+            return None
+        try:
+            return await self._bounded(self._card_content_rejection(message_id),
+                                       self._clock.now() + ONEBOT_ACTION_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+
+    async def _card_content_rejection(self, message_id: str) -> str | None:
+        async with self._lock:
+            if self._closed:
+                return None
+            stored = response_data(await self._transport.get_msg(message_id))
+            if stored is None:
+                return None
+            # 判定顺序与 _prepare 卡片分支同一口径：顶层唯一卡片 → forward（按卡片标识
+            # 展开查询交类型检查）；非卡片、取不到标识或展开无数据一律放行。
+            raw_message = stored.get("message")
+            top_level: list[Any] = raw_message if isinstance(raw_message, list) else []
+            if not top_level or classify_top_level_shape(top_level) != "forward":
+                return None
+            card_id = forward_card_id(top_level[0])
+            if not card_id:
+                return None
+            expanded = response_data(await self._transport.get_forward_msg(card_id))
+            if expanded is None:
+                return None
+            return unsupported_card_content(expanded) or None
 
     async def send_source(self, request: SourceSendRequest, *, before_submit: Callable[[], bool]) -> SourceSendResult:
         """按准备阶段判定的 `kind` 分派唯一固定群动作，无替代通路、不重试。"""

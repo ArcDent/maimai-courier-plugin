@@ -9,8 +9,9 @@
 顶层合并转发卡片由 `classify_top_level_shape` 判定唯一形状后交给
 `build_card_nodes`：从 `get_forward_msg` 展开查询结果构造 `send_group_forward_msg`
 节点数组——节点 `uin` 取平台的 sender `user_id`、显示名取 `card` 优先回退
-`nickname` 并压平限长、内容段原样深拷贝，嵌套 forward 段原样保留（不递归展开、
-不重建、不因嵌套拒绝）；节点材料只来自展开查询，不接受调用者提交的资源 ID、
+`nickname` 并压平限长、内容段原样深拷贝；嵌套 forward 段在到达本函数前已被
+`type_check` 的发送前类型检查拒绝（本函数不再接收嵌套内容，函数行为未变：
+content 段仍原样深拷贝）。节点材料只来自展开查询，不接受调用者提交的资源 ID、
 正文或媒体地址。
 
 「本次未发送任何消息」定尾由工具入口的 `Rejected.not_sent` 统一补齐。
@@ -174,8 +175,11 @@ def build_card_nodes(expanded: object) -> tuple[dict[str, Any], ...] | PrepareRe
     是 bot 自己，`uin` + `name` 与 `user_id` + `nickname` 均保留原发送者。
     文字路径 `snowluma_client._text_card_node` 同口径使用 `uin`/`name`。
 
-    嵌套 forward 段随内容原样保留：不递归展开、不重建节点、不因嵌套拒绝（实测
-    外层投递正常、内层展示不作保证）。不设置 `summary`/`news`/`prompt`/`source`
+    嵌套 forward 段随内容原样深拷贝（函数口径不因调用方而变）；但生产链路上嵌套
+    内容在到达本函数前已被 `type_check` 的发送前类型检查拒绝——实测嵌套内层在
+    目标群客户端只能显示为降级空壳，与所引用资源的新旧无关（ADR 0011），故
+    `build_card_nodes` 不再接收嵌套内容，此处原样拷贝只是函数自身口径。不设置
+    `summary`/`news`/`prompt`/`source`
     预览参数；节点材料只来自本次展开查询，不接受调用者提交的资源 ID、消息正文
     或媒体地址。
     """

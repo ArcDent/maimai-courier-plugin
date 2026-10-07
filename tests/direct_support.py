@@ -35,6 +35,7 @@ from tests.support import (
     TARGET_GROUP_ID,
     FakeClock,
     enabled_config,
+    envelope,
     find_hook,
     forward_node,
     forward_segment,
@@ -56,6 +57,15 @@ DEFAULT_MEDIA_URL = "https://cdn.example.invalid/media.png"
 
 ACCEPTANCE_TOKEN = "synthetic-acceptance-only"
 """回环端点的合成令牌（只经认证头，不得进 URL、日志、账本或工具结果）。"""
+
+SHORT_WAIT_SECONDS = 0.5
+"""驱动辅助只推进的短等待上限（秒）：与生产就绪轮询间隔同口径的来源。
+
+口径来源是生产常量 `auto_entry.AUTO_READINESS_POLL_INTERVAL_SECONDS`（自动入口就绪
+轮询间隔，0.5 秒）：`drive_observe_hook` 与 `run_with_clock` 只把不超过该值的注入
+时钟等待当成立即可推进的就绪轮询间隔；动作级单动作预算（预搜索与工具路径共用的
+10 秒）不在这里推进，避免把内存平台上的真实只读查询判成超时放行。
+"""
 
 
 def media_url_for(ordinal: int) -> str:
@@ -124,10 +134,18 @@ class DirectOneBot(MemoryOneBotTransport):
     def __init__(self) -> None:
         super().__init__()
         self.gates = Gates()
+        self.expand_failure = False
+        """展开查询失败开关：置真时 `get_forward_msg` 按业务失败信封应答。
+
+        预搜索 fail-open 的注入点：命中时只读查询视为「平台确认该卡片不存在或不可
+        展开」，`card_content_rejection` 按查询失败放行，自动判断照常进行。
+        """
 
     async def _reply(self, action: str, params: Any) -> dict[str, Any]:
         if action in _SEND_ACTIONS:
             await self.gates.arrive("platform_commit")
+        if self.expand_failure and action == "get_forward_msg":
+            return envelope(None, status="failed", retcode=100, message="not found")
         return await super()._reply(action, params)
 
     @property
@@ -336,14 +354,29 @@ def wake_once(
     *,
     source_raw_message: list[dict[str, Any]] | None = None,
     config: dict[str, Any] | None = None,
+    onebot: Any = None,
     until: Any = None,
     ticks: int = 200,
 ) -> tuple[Any, Any]:
-    """一条候选从装载到驱动观察 Hook 的最小链路（公开工厂 + 注册 Hook）。"""
+    """一条候选从装载到驱动观察 Hook 的最小链路（公开工厂 + 注册 Hook）。
+
+    传输替身经公开工厂注入（单测零真实联网）：默认现场构造内存 `DirectOneBot`，并把
+    平台侧源消息播种为一张合并转发卡片（`message_id` 取本次载荷的消息 ID，与宿主侧
+    样本同一标识，供自动路径的只读预搜索命中展开查询）；传入 `onebot=` 时工厂直接复用
+    该实例（供调用方预置 `expanded` / `expand_failure`）。
+    """
 
     clock = FakeClock()
-    plugin, ctx = make_plugin(tmp_path, clock=clock, config=config or enabled_config())
     message_id = payload["message"]["message_id"]
+    if onebot is None:
+        onebot = DirectOneBot()
+        onebot.source = source_record(
+            message=[{"type": "forward", "data": {"id": DEFAULT_RESOURCE_ID}}],
+            message_id=message_id)
+    plugin, ctx = make_plugin(
+        tmp_path, clock=clock, config=config or enabled_config(),
+        transport_factory=lambda _connection: onebot,
+    )
     if source_raw_message is None:
         prepare_source(ctx, message_id=message_id)
     else:
@@ -363,7 +396,10 @@ async def drive_observe_hook(
     """模拟宿主后台分发一次观察 Hook，并推进注入时钟直到工作结束。
 
     宿主对 observe 处理器是后台任务分发，因此这里同样以任务方式驱动；每个 tick
-    让出事件循环一次并推进本次新登记的注入时钟等待（不真实等待）。
+    让出事件循环一次并推进本次新登记的**短等待**（≤0.5 秒的就绪轮询间隔），不真实
+    等待。动作级的单动作预算（10 秒，预搜索与工具路径共用）不在这里推进：内存平台
+    上的只读查询应当真实完成，推进预算只会把查询判成超时放行，并让去重时间窗被虚拟
+    时间跳过（与 `run_with_clock` 同一口径）。
     """
 
     task = asyncio.create_task(observe_hook_handler(plugin)(**payload))
@@ -371,7 +407,8 @@ async def drive_observe_hook(
     for _ in range(ticks):
         await asyncio.sleep(0)
         for seconds in clock.sleeps[advanced:]:
-            clock.advance(seconds)
+            if seconds <= SHORT_WAIT_SECONDS:
+                clock.advance(seconds)
         advanced = len(clock.sleeps)
         if until is not None and until():
             break
@@ -399,7 +436,7 @@ async def run_with_clock(plugin: Any, clock: Any, arguments: dict[str, Any]) -> 
         await asyncio.sleep(0)
         if index % 50 == 49:
             for seconds in clock.sleeps[advanced:]:
-                if seconds <= 0.5:
+                if seconds <= SHORT_WAIT_SECONDS:
                     clock.advance(seconds)
             advanced = len(clock.sleeps)
     raise AssertionError("工具调用在推进注入时钟后仍未结束")
@@ -565,6 +602,30 @@ def make_direct_plugin(path: Path, **kwargs: Any) -> DirectFixture:
     return DirectFixture(path, **kwargs)
 
 
+def make_auto_plugin(
+    tmp_path: Path,
+    *,
+    clock: Any = None,
+    config: dict[str, Any] | None = None,
+) -> tuple[Any, Any]:
+    """自动入口用例的本地装载助手：与 `make_plugin` 同签名面，注入内存传输替身。
+
+    合并转发候选就绪后的只读预搜索（`get_msg` / `get_forward_msg`）经 `DirectOneBot`
+    内存平台完成，预搜索只读查询落内存平台、不触真实网络；未播种的源消息 ID 落在
+    「非卡片」分支直接放行，与真实连接失败时的 fail-open 行为一致。`config` 缺省
+    `enabled_config()`。需要特定展开结果（命中嵌套内层卡片、展开查询失败等）的用例
+    用 `make_direct_plugin`（`DirectFixture` 可预置 `expanded` / `expand_failure`）
+    或直接调 `run_auto_entry` 注入 `presearch`，不走本助手。
+    """
+
+    return make_plugin(
+        tmp_path,
+        clock=clock,
+        config=enabled_config() if config is None else config,
+        transport_factory=lambda _connection: DirectOneBot(),
+    )
+
+
 __all__ = [
     "ACCEPTANCE_TOKEN",
     "DEFAULT_MEDIA_URL",
@@ -577,6 +638,7 @@ __all__ = [
     "forward_node",
     "image_segment",
     "intent_criteria_region",
+    "make_auto_plugin",
     "make_direct_plugin",
     "merged_forward_message",
     "onebot_segments",

@@ -15,6 +15,10 @@
 - **不掷骰、不签目标群决策票、不强制续轮**：意图只给源消息的实际类型、源消息 ID、
   合法目标群、工具用法与「值得分享才调用工具、可以沉默」的边界说明，外加单独标注的
   用户配置分享标准原文；不伪造聊天内容，也不对目标群唤起。
+- **卡片内容预搜索（可选注入）**：合并转发候选在可读性确认与配置初检之后、目标名称
+  查询之前，可经注入的只读 `presearch` 缝隙预识别卡片内容是否含嵌套内层卡片；命中
+  不提供判断机会（`triggered=False` + 可定位原因），未命中或查询失败照常放行。本模块
+  不导入客户端：缝隙在调用参数上，发送前的权威判定仍在工具路径。
 - 群名（源群与目标群）只是不可信显示文本，一律不参与路由判断。
 
 等待上限、去重窗口与容量都是代码常量，不做成配置项。
@@ -24,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Callable, Final, Mapping
+from typing import Any, Awaitable, Callable, Final, Mapping
 
 from .shared.clock import Clock
 from .config import CourierConfig, MessageType
@@ -37,6 +41,7 @@ from .send_material import is_forward_card
 from .shared.identifiers import (
     safe_identifier,
 )
+from .type_check import NESTED_FORWARD_DETAIL
 
 # 标识符规则的**唯一定义**在共享层 `shared/identifiers.py`：候选筛选按同一实现校验。
 
@@ -56,6 +61,15 @@ WAKE_REASON: Final[str] = "源群自动分享判断"
 """主动唤起的原因标签（宿主日志与任务元数据里用于定位本插件）。
 
 文案与多类型候选一致：候选可能是普通文字、图片或合并转发，不写死「合并转发」。
+"""
+
+AUTO_PRESEARCH_REJECTION_REASON: Final[str] = (
+    f"卡片内容只读预识别命中嵌套内层卡片（{NESTED_FORWARD_DETAIL}），不提供本次自动判断机会"
+)
+"""预搜索命中的对外原因：随 `WakeOutcome.reason` 交给组合根记录可定位日志。
+
+措辞片段引用 `type_check` 的固定对外措辞（单一来源，不复制字面量）；源消息与源群由
+调用方日志带上，本文案不含正文，也不承诺「已判定不可发送」之外的结论。
 """
 
 AUTO_READINESS_TIMEOUT_SECONDS: Final[float] = 10.0
@@ -140,6 +154,14 @@ class ForwardCandidate:
     group_name: str
     account_id: str
     message_type: CandidateType
+
+
+CardPresearch = Callable[[ForwardCandidate], Awaitable[str | None]]
+"""卡片内容预搜索缝隙：只读判定合并转发候选，命中返回拒绝原因，否则返回空串或 None。
+
+由组合根注入（design D4）：`None`（测试或未注入）表示跳过预搜索。本模块不导入
+`snowluma_client`：依赖方向保持单向，发送前的权威类型检查也仍在客户端内。
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,20 +521,49 @@ def _latest_valid_config(
     return config, ""
 
 
+async def _card_presearch_rejection(
+    candidate: ForwardCandidate,
+    presearch: CardPresearch | None,
+) -> str:
+    """预搜索拒绝原因：未注入、非合并转发候选、未命中与查询失败都返回空串（放行）。
+
+    只对合并转发候选调用：普通文字/图片没有卡片内容可预识别，不过问注入的缝隙。
+    调用异常按查询失败放行，不阻断本次判断机会（fail-open）；取消照常传播，不被
+    放行口径吞掉。返回非空串即命中，由调用方组成固定可定位文案并以
+    `WakeOutcome(triggered=False)` 收尾。
+    """
+
+    if presearch is None or candidate.message_type != "forward":
+        return ""
+    try:
+        rejection = await presearch(candidate)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return ""
+    return rejection or ""
+
+
 async def run_auto_entry(
     *,
     ctx: Any,
     candidate: ForwardCandidate,
     clock: Clock,
     current_config: Callable[[], CourierConfig | None],
+    presearch: CardPresearch | None = None,
 ) -> WakeOutcome:
     """确认消息可读取后唤起一次源群判断；任一环节不满足即放弃并给出可定位原因。
 
-    `current_config` 读取**最新**配置快照：消息可读后先做一次初检与目标名称查询，
-    查询结束后**再次**读取最新配置、重验候选（含候选类型）、重建合法目标集合并解析
-    最新标准，然后直接进入 `maisaka.proactive.trigger` 调用——中间不再插入其它异步
-    查询。因此查询期间的标准、同组目标与开关变更全部对本次提交生效；新增目标没有名称
-    时只列群号，已移除的目标不会从名称快照重新混入。
+    `current_config` 读取**最新**配置快照：消息可读后先做一次初检、（合并转发候选的）
+    卡片内容预搜索与目标名称查询，查询结束后**再次**读取最新配置、重验候选（含候选
+    类型）、重建合法目标集合并解析最新标准，然后直接进入 `maisaka.proactive.trigger`
+    调用——中间不再插入其它异步查询。因此查询期间的标准、同组目标与开关变更全部对
+    本次提交生效；新增目标没有名称时只列群号，已移除的目标不会从名称快照重新混入。
+
+    `presearch`（可选，design D5）在可读性确认与配置初检之后、目标名称查询之前执行：
+    只对合并转发候选调用，命中嵌套内层卡片即返回 `WakeOutcome(triggered=False, 可定位
+    原因)`，不唤起、不查目标名称；未命中或查询失败继续既有流程。去重登记已在观察 Hook
+    同步完成，预搜索不改变去重语义，同一消息在去重窗口内最多触发一次预搜索。
     """
 
     if not await confirm_readable(ctx, candidate, clock):
@@ -524,6 +575,11 @@ async def run_auto_entry(
     config, reason = _latest_valid_config(current_config, candidate)
     if config is None:
         return WakeOutcome(triggered=False, reason=reason)
+    rejection = await _card_presearch_rejection(candidate, presearch)
+    if rejection:
+        # 缝隙只回报「是否命中」：对外原因由本模块组装修辞面（固定文案，含定位片段），
+        # 内部 reason 码不进结果面。
+        return WakeOutcome(triggered=False, reason=AUTO_PRESEARCH_REJECTION_REASON)
     initial_target_ids = share_target_groups(config, candidate.group_id)
     names = await available_group_names(ctx, candidate, initial_target_ids)
 

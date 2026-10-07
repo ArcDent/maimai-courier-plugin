@@ -8,6 +8,9 @@
 卸载后到达的调用都不得再发送。另覆盖组合根的连接签名（SNOWLUMA 地址）替换：
 端点变化后旧客户端／旧 aiohttp 会话被关闭且新客户端独立投递；旧客户端关闭
 等待期间卸载不新建投递也不重复关闭，随后的投递改走新会话、不被旧会话续发。
+还覆盖预搜索的生命周期与预算：候选就绪后新开的只在读查询窗口内，在途只读查询
+可被卸载取消且任务有界退出，候选失效按既有口径取消，仅改标准不取消仍合法候选
+并按最新标准唤起。
 """
 
 from __future__ import annotations
@@ -17,9 +20,19 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from maimai_courier_plugin.shared.delivery import STATUS_SENT
 from maimai_courier_plugin.shared.result import COMMENT_DELAY_SECONDS
-from tests.direct_support import (DirectFixture, apply_config_update, merged_forward_message)
+from tests.direct_support import (
+    DirectFixture,
+    apply_config_update,
+    drive_observe_hook,
+    intent_criteria_region,
+    make_auto_plugin,
+    make_direct_plugin,
+    merged_forward_message,
+)
 from tests.fake_maibot_sdk import FakePluginContext
 from tests.snowluma_client_support import TARGET_MESSAGE_ID
 from tests.support import (
@@ -32,8 +45,9 @@ from tests.support import (
     TARGET_GROUP_ID,
     FakeClock,
     enabled_config,
+    forward_node,
+    forward_segment,
     issue_source_call,
-    make_plugin,
     open_test_ledger,
     source_message,
     source_stream,
@@ -112,7 +126,7 @@ class SwallowingClock(FakeClock):
 def test_卸载取消尚未发送的自动等待并等待任务退出(tmp_path: Path) -> None:
 
     clock = FakeClock()
-    plugin, ctx = make_plugin(tmp_path, clock=clock, config=enabled_config())
+    plugin, ctx = make_auto_plugin(tmp_path, clock=clock, config=enabled_config())
     prepare_candidate_source(ctx, message_id="m-broadcast-1")
     payload = merged_forward_message(message_id="m-broadcast-1")
     foreign_release = asyncio.Event()
@@ -265,7 +279,7 @@ def test_卸载等待超时告警定位投递任务且不再发起新的发送(t
 
 def test_卸载等待超时告警定位自动判断任务(tmp_path: Path) -> None:
     clock = FakeClock()
-    plugin, ctx = make_plugin(tmp_path, clock=clock, config=enabled_config())
+    plugin, ctx = make_auto_plugin(tmp_path, clock=clock, config=enabled_config())
     prepare_candidate_source(ctx, message_id="m-stuck")
     entered, release = asyncio.Event(), asyncio.Event()
     ctx.message.get_by_id = _uncooperative(entered, release)
@@ -654,7 +668,7 @@ def test_on_config_update只取消失效自动判断且不打断合法候选(tmp
         {"name": "研发", "source_groups": [SOURCE_GROUP_ID], "target_groups": [TARGET_GROUP_ID]},
         {"name": "运营", "source_groups": ["555"], "target_groups": ["666"]},
     ]
-    plugin, ctx = make_plugin(tmp_path, clock=clock, config=enabled_config(groups=groups))
+    plugin, ctx = make_auto_plugin(tmp_path, clock=clock, config=enabled_config(groups=groups))
     candidate_a = merged_forward_message(message_id="m-auto-a", group_id=SOURCE_GROUP_ID,
                                          session_id="s-a")
     candidate_b = merged_forward_message(message_id="m-auto-b", group_id="555", session_id="s-b")
@@ -691,3 +705,152 @@ def test_on_config_update只取消失效自动判断且不打断合法候选(tmp
 
     triggered = [call["metadata"]["source_message_id"] for call in ctx.maisaka.proactive.calls]
     assert triggered == ["m-auto-b"], "热更新只取消失效的自动判断，仍合法的候选照常唤起"
+
+
+# --------------------------------------------------------------------------- 组合根：预搜索的生命周期与预算
+# 预搜索是合并转发候选「就绪 → 目标名称查询」之间新增的只在读查询窗口（design D5）：
+# 卸载与热更新都必须在这个新窗口内保持既有口径——在途只读查询可被取消、任务有界
+# 退出；预搜索期间候选失效按既有口径取消、仅改标准不取消仍合法候选。断言只经公开
+# 入口（观察 Hook / 工厂装配）与宿主能力调用记录，平台动作走 `DirectFixture` 内存
+# 传输替身，单测零真实联网；其中私有任务表（`_tasks` / `_auto_tasks`）仅作辅助佐证，
+# 行为证据以公开入口断言为准。
+
+
+def inflight_expand_fixture(
+    tmp_path: Path,
+    *,
+    cancelled: list[bool] | None = None,
+) -> tuple[Any, dict[str, Any], asyncio.Event, asyncio.Event]:
+    """装配「预搜索在途」现场：候选就绪后的只在读展开查询挂在可取消等待上。
+
+    返回（插件夹具, 合并转发挥载, 已进入展开查询的事件, 放行展开查询的事件）。
+    展开查询等在一个可取消的真实异步等待上，取消须如实到达该查询（记录后再抛出），
+    再由场景放行；需要断言「查询被取消」的用例传入 `cancelled` 列表。
+    """
+
+    fixture = make_direct_plugin(tmp_path, raw_message=[forward_segment(forward_node())])
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold_expand(action: str, params: Any) -> Any:
+        # 只在读展开查询处挂起（预搜索在途）：等在一个可取消的真实异步等待上，
+        # 取消须如实到达该查询（记录后再抛出），测试收尾再放行。
+        if action == "get_forward_msg":
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                if cancelled is not None:
+                    cancelled.append(True)
+                raise
+        return None
+
+    fixture.onebot.on_action = hold_expand
+    return fixture, merged_forward_message(message_id=MESSAGE_ID), entered, release
+
+
+def test_卸载取消在途预搜索只读查询并有界退出(tmp_path: Path) -> None:
+    """预搜索只在读展开查询在途时卸载：查询被取消、任务有界退出、不留悬挂会话。"""
+
+    query_cancelled: list[bool] = []
+    fixture, payload, entered, release = inflight_expand_fixture(tmp_path, cancelled=query_cancelled)
+
+    async def scenario() -> None:
+        await drive_observe_hook(fixture.plugin, fixture.clock, payload, until=entered.is_set)
+        assert entered.is_set(), "候选就绪后应进入预搜索的只在读展开查询"
+
+        # 不推进注入时钟：任务必须靠取消自行退出，卸载才能在五秒预算内收尾，
+        # 而不是等注入时钟的定时器到点。
+        await asyncio.wait_for(fixture.plugin.on_unload(), timeout=2.0)
+        release.set()
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+        assert query_cancelled == [True], "在途预搜索只读查询须被卸载取消（取消如实到达展开查询）"
+        warnings = fixture.ctx.logger.texts("warning")
+        info = "\n".join(fixture.ctx.logger.texts("info"))
+        assert "已卸载" in info, (info, fixture.ctx.logger.records)
+        assert not any("未退出" in text for text in warnings), (
+            "预搜索只读查询可被取消，自动判断任务应在五秒预算内退出", warnings,
+        )
+        assert not any("超出五秒总预算" in text for text in warnings), warnings
+        assert not any("保持账本独占" in text for text in warnings), warnings
+        assert not any("不宣称全部退出" in text for text in warnings), warnings
+        assert fixture.plugin._tasks == {}, "卸载后本插件任务表无残留（预搜索任务有界退出）"
+        assert fixture.plugin._auto_tasks == {}, "卸载后无残留的自动判断任务"
+        assert fixture.ctx.maisaka.proactive.calls == [], "在途预搜索被取消，未提供判断机会"
+        assert fixture.onebot.sent == [], "预搜索只读，卸载不提交任何发送"
+        assert fixture.transport.closed is False, "卸载不关闭连接会话，也不留悬挂会话"
+
+        # 卸载后无新增常驻任务：后续候选被卸载标记拦在入口，不登记后台任务、不唤起。
+        await fixture.plugin.observe_received_message(**merged_forward_message(message_id="m-after-unload"))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert fixture.plugin._tasks == {}, "卸载后不得新增常驻任务"
+        assert fixture.ctx.maisaka.proactive.calls == [], "卸载后不提供新的判断机会"
+
+    asyncio.run(scenario())
+    fixture.ledger.close()
+
+
+@pytest.mark.parametrize(
+    "label, invalidated",
+    [
+        ("候选类型被移出", enabled_config(message_types=("text",))),
+        ("总开关关闭", {**enabled_config(), "plugin": {"enabled": False}}),
+        (
+            "分组收紧",
+            enabled_config(groups=[{"name": "研发", "source_groups": [SOURCE_GROUP_ID],
+                                    "target_groups": []}]),
+        ),
+    ],
+)
+def test_预搜索在途时热更新使候选失效则不唤起(
+    tmp_path: Path, label: str, invalidated: dict[str, Any],
+) -> None:
+    """预搜索只读查询在途期间候选失效（类型移出／开关关闭／分组收紧）：按既有口径取消，零唤起。"""
+
+    fixture, payload, entered, release = inflight_expand_fixture(tmp_path)
+
+    async def scenario() -> None:
+        await drive_observe_hook(fixture.plugin, fixture.clock, payload, until=entered.is_set)
+        assert entered.is_set()
+        await apply_config_update(fixture.plugin, invalidated)  # 预搜索在途：候选此刻失效
+        for _ in range(50):
+            await asyncio.sleep(0)
+        release.set()
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert fixture.ctx.maisaka.proactive.calls == [], (label, "失效候选零唤起")
+    assert fixture.plugin._auto_tasks == {}, (label, "失效的自动判断任务已被取消，无残留")
+    assert fixture.onebot.sent == [], (label, "取消预搜索不得提交任何发送")
+    fixture.close()
+
+
+def test_预搜索在途时仅改标准不取消候选且按最新标准唤起(tmp_path: Path) -> None:
+    """预搜索只读查询在途期间只改自动分享标准：候选仍合法、不被取消，照常按最新标准唤起。"""
+
+    fixture, payload, entered, release = inflight_expand_fixture(tmp_path)
+    latest = "只改标准：偏好工具与话题，保留换行"
+
+    async def scenario() -> None:
+        await drive_observe_hook(fixture.plugin, fixture.clock, payload, until=entered.is_set)
+        assert entered.is_set()
+        # 只改标准（不改总开关／候选类型／转发分组）：候选仍合法，热更新不得取消它。
+        await apply_config_update(fixture.plugin, enabled_config(share_criteria=latest))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert fixture.ctx.maisaka.proactive.calls == [], "预搜索在途期间尚未唤起"
+        release.set()  # 放行预搜索：展开无嵌套 → 进入既有唤起流程
+        for _ in range(100):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(fixture.ctx.maisaka.proactive.calls) == 1, "仅改标准仍按最新配置唤起一次"
+    intent = fixture.ctx.maisaka.proactive.calls[0]["intent"]
+    assert intent_criteria_region(intent) == latest, "唤起使用最新编辑后的标准原文"
+    assert fixture.onebot.sent == [], "自动判断只唤起，不提交任何发送"
+    fixture.close()

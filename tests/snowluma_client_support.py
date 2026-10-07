@@ -39,6 +39,22 @@ DEFAULT_EXPANDED_CARD: dict[str, Any] = {"messages": [
 节点材料；需要特定展开形态的用例可整体替换 `MemoryOneBotTransport.expanded`。
 """
 
+NESTED_EXPANDED_CARD: dict[str, Any] = {"messages": [
+    {"sender": {"user_id": "90001", "card": "群友甲", "nickname": "甲"},
+     "message": [{"type": "text", "data": {"text": "卡片节点正文"}}]},
+    {"sender": {"user_id": "90002", "nickname": "乙"},
+     "message": [{"type": "image", "data": {"url": "https://multimedia.example/x.png"}},
+                 {"type": "forward", "data": {"id": "old-res-id", "content": [
+                     {"type": "text", "data": {"text": "内层"}}]}}]},
+]}
+"""`get_forward_msg` 展开查询的嵌套应答：第二节点内容含内层 forward 段。
+
+预识别（`SnowLumaClient.card_content_rejection`）与发送前类型检查（`prepare_source`
+卡片分支）命中「嵌套内层卡片」时给出同一 reason（`type_check.NESTED_FORWARD_REASON`
+单点定义）。用例整体替换 `MemoryOneBotTransport.expanded` 时建议 `deepcopy` 本常量，
+避免共享可变样本；只读判定（`type_check.unsupported_card_content`）不改写输入。
+"""
+
 
 def host_message(message_id: str = SOURCE_MESSAGE_ID) -> dict[str, Any]:
     """保留链样本：平台 ID 原文、可信会话与入站账号元数据（预检输入）。"""

@@ -1,4 +1,4 @@
-"""客户端卡片分支（展开查询→节点校验→单次卡片发送）与文字/图片路径回归。
+"""客户端卡片分支（展开查询→发送前类型检查→节点校验→单次卡片发送）与文字/图片路径回归。
 
 断言面只经 `SnowLumaClient` 公开方法与 `OneBotTransport` 协议替身（内存替身实现
 协议，不 mock 任何内部协作者）；不触真实网络、不回显敏感正文。
@@ -14,24 +14,41 @@ import pytest
 
 from maimai_courier_plugin.snowluma_client import SnowLumaClient
 from maimai_courier_plugin.shared.send_steps import PrepareRejected, PreparedSource
+from maimai_courier_plugin.type_check import NESTED_FORWARD_DETAIL, NESTED_FORWARD_REASON
 from tests.snowluma_client_support import (
-    CARD_RESOURCE_ID, SOURCE_MESSAGE_ID, TARGET_MESSAGE_ID,
+    CARD_RESOURCE_ID, NESTED_EXPANDED_CARD, SOURCE_MESSAGE_ID, TARGET_MESSAGE_ID,
     MemoryOneBotTransport, trusted_forward,
 )
 from tests.support import SENDER_CARD, FakeClock, envelope, source_record, spin_until
 
 
 def expanded_card() -> dict[str, Any]:
-    """`get_forward_msg` 展开查询应答的 `data`：两节点，第二节点内容含嵌套 forward 段。"""
+    """`get_forward_msg` 展开查询应答的 `data`：两节点非嵌套卡片样本（第二节点含图片段）。
+
+    默认成功路径夹具不含嵌套 forward 段：按新契约嵌套内容必须在发送前整条拒绝
+    （见 `nested_card()` 专用夹具），成功路径用例只覆盖非嵌套材料。
+    """
 
     return {"messages": [
         {"sender": {"user_id": 90001, "card": "群友甲", "nickname": "甲"},
          "message": [{"type": "text", "data": {"text": "卡片节点正文"}}]},
         {"sender": {"user_id": 90002, "nickname": "乙"},
-         "message": [{"type": "image", "data": {"url": "https://multimedia.example/x.png"}},
-                     {"type": "forward", "data": {"id": "old-res-id", "content": [
-                         {"type": "text", "data": {"text": "内层"}}]}}]},
+         "message": [{"type": "image", "data": {"url": "https://multimedia.example/x.png"}}]},
     ]}
+
+
+def nested_card() -> dict[str, Any]:
+    """`get_forward_msg` 展开查询应答的 `data`：第二节点内容含嵌套 forward 段。
+
+    嵌套内层在目标群客户端只能显示为降级空壳（实测，见 API 目录第 6 节）：发送前
+    类型检查必须整条拒绝（固定 reason 与对外措辞以 `type_check` 常量为单一来源），
+    不进入节点构造、不提交任何发送、不递归展开或摘要。
+
+    样本取共享常量 `tests.snowluma_client_support.NESTED_EXPANDED_CARD` 的深拷贝：
+    嵌套样本单点定义，只读预识别与发送前类型检查共用同一形态。
+    """
+
+    return deepcopy(NESTED_EXPANDED_CARD)
 
 
 def expanded_nodes() -> tuple[dict[str, Any], ...]:
@@ -43,8 +60,6 @@ def expanded_nodes() -> tuple[dict[str, Any], ...]:
         {"type": "node", "data": {"uin": "90002", "name": "乙",
                                   "content": [
                                       {"type": "image", "data": {"url": "https://multimedia.example/x.png"}},
-                                      {"type": "forward", "data": {"id": "old-res-id", "content": [
-                                          {"type": "text", "data": {"text": "内层"}}]}},
                                   ]}},
     )
 
@@ -149,7 +164,7 @@ def test_准备按顶层形态判定发送路径kind(message: list[dict[str, obj
         assert result.material.kind == kind
         if kind == "forward":
             # 卡片材料 = 展开查询构造的节点数组：不取自源段 content、不持有调用者
-            # 资源引用；嵌套 forward 段随节点内容原样保留。
+            # 资源引用；内容段按展开查询结果原样（默认夹具非嵌套）。
             assert result.material.segments == expanded_nodes()
             assert ("get_forward_msg", {"id": CARD_RESOURCE_ID}) in transport.queries
         assert transport.source == original and transport.sent == []
@@ -182,12 +197,57 @@ def test_卡片准备按展开查询构造节点材料且只读() -> None:
         assert isinstance(result, PreparedSource)
         assert result.kind == "forward"
         # 材料 = 展开查询构造的节点数组：sender 标量、name 压平限长、content 段原样
-        # （含嵌套 forward 段），不取自源段 content、不持有调用者资源引用。
+        # （第二节点图片段），不取自源段 content、不持有调用者资源引用。
         assert result.material.segments == expanded_nodes()
         assert [name for name, _ in transport.queries] == [
             "get_login_info", "get_group_list", "get_msg", "get_forward_msg"]
         assert transport.queries[-1] == ("get_forward_msg", {"id": CARD_RESOURCE_ID})
         assert transport.sent == [] and transport.expanded == original
+    asyncio.run(scenario())
+
+
+def test_嵌套卡片展开内容发送前整条拒绝且零发送() -> None:
+    async def scenario() -> None:
+        transport = CardOneBotTransport()
+        transport.expanded = nested_card()
+        transport.source = source_record([{"type": "forward", "data": {"id": CARD_RESOURCE_ID}}])
+        original = deepcopy(transport.expanded)
+        result = await prepare(transport)
+        assert isinstance(result, PrepareRejected)
+        # 固定 reason 与对外措辞以 type_check 常量为单一来源：不复制字面量、不摘要
+        assert result.error == NESTED_FORWARD_REASON
+        assert result.reason == NESTED_FORWARD_DETAIL
+        # 拒绝点在展开查询之后、节点构造之前：只读查询仍发生，发送动作为零
+        assert ("get_forward_msg", {"id": CARD_RESOURCE_ID}) in transport.queries
+        assert transport.sent == [] and transport.expanded == original
+    asyncio.run(scenario())
+
+
+def test_非嵌套展开内容含reply与at与image照常准备() -> None:
+    async def scenario() -> None:
+        transport = CardOneBotTransport()
+        transport.expanded = {"messages": [
+            {"sender": {"user_id": "90003", "nickname": "丙"}, "message": [
+                {"type": "text", "data": {"text": "正文"}},
+                {"type": "reply", "data": {"id": "r1"}},
+                {"type": "at", "data": {"qq": "30001"}},
+                {"type": "image", "data": {"url": "https://images.example.org/a"}},
+            ]},
+        ]}
+        transport.source = source_record([{"type": "forward", "data": {"id": CARD_RESOURCE_ID}}])
+        result = await prepare(transport)
+        assert isinstance(result, PreparedSource)
+        assert result.kind == "forward"
+        # 嵌套检查只认 forward 段：reply / at / image 均随节点内容原样放行，不误拒
+        assert result.material.segments == ({"type": "node", "data": {
+            "uin": "90003", "name": "丙", "content": [
+                {"type": "text", "data": {"text": "正文"}},
+                {"type": "reply", "data": {"id": "r1"}},
+                {"type": "at", "data": {"qq": "30001"}},
+                {"type": "image", "data": {"url": "https://images.example.org/a"}},
+            ]}},)
+        assert ("get_forward_msg", {"id": CARD_RESOURCE_ID}) in transport.queries
+        assert transport.sent == []
     asyncio.run(scenario())
 
 
