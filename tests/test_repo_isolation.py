@@ -157,8 +157,9 @@ from isolated_courier.plugin import create_plugin
 
 plugin = create_plugin()
 components = plugin.get_components()
-assert len(components) == 3
-assert sum(component.get("chat_scope") == "group" for component in components) == 1
+# 两个群聊 Tool（forward_message / list_forward_friends）+ 两个 Hook。
+assert len(components) == 4
+assert sum(component.get("chat_scope") == "group" for component in components) == 2
 assert plugin.build_default_config()["snowluma"] == {"http_url": "", "token": "", "token_env_var": ""}
 from isolated_courier import delivery_ledger, forward_delivery, send_material
 from isolated_courier import shared

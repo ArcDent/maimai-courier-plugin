@@ -3,10 +3,10 @@
 本模块只做传输与端点安全判定，不感知消息类型语义（分派归 `snowluma_client`）。
 契约要点：无连接，按请求 `POST /{action}`；凭证仅经 `Authorization: Bearer` 头；
 禁跟随重定向；请求体自设 2MiB 上限，序列化后超限在发出前拒绝；明文建连前解析
-主机名判定可信网络；单实例串行执行且不重放动作。固定七动作加关闭，没有任意动作
-代理：只读 `get_login_info` / `get_group_list` / `get_msg` / `get_forward_msg`，
-发送 `send_msg` / `send_forward_msg` / `send_group_forward_msg`（卡片路径的实测
-契约见 `docs/snowluma-http-api-catalog.md`）。
+主机名判定可信网络；单实例串行执行且不重放动作。固定八动作加关闭，没有任意动作
+代理（卡片路径与私聊路由的实测契约见 `docs/snowluma-http-api-catalog.md` 6.10：
+私聊目标复用 `send_msg` / `send_forward_msg` 的 `message_type` / `user_id` 路由，
+不引入具名私聊发送动作）。
 """
 
 from __future__ import annotations
@@ -144,27 +144,46 @@ def _is_action_envelope(payload: object) -> bool:
             and isinstance(payload["data"], (dict, list, type(None))))
 
 
+def _send_route(
+    target_group_id: str, target_user_id: str, payload: dict[str, Any], *, typed: bool,
+) -> dict[str, Any]:
+    """发送动作的目标形态路由：按目标形态整组替换目标参数，只共用动作与载荷。
+
+    私聊目标按实测口径（API 目录 6.10）以 `message_type` / `user_id` 路由，复用
+    同一动作；群目标请求体逐字不变（平台按群号判定群目标）。不因目标形态更换
+    动作（design D3）。
+    """
+
+    if target_user_id:
+        return {"message_type": "private", "user_id": target_user_id, **payload}
+    if typed:
+        return {"message_type": "group", "group_id": target_group_id, **payload}
+    return {"group_id": target_group_id, **payload}
+
+
 @runtime_checkable
 class OneBotTransport(Protocol):
-    """固定动作访问面：七个动作加关闭；不提供任意动作代理，不建立长连接。
+    """固定动作访问面：八个动作加关闭；不提供任意动作代理，不建立长连接。
 
-    只读四个：`get_login_info` / `get_group_list` / `get_msg` / `get_forward_msg`
-    （后者按源卡片标识展开查询合并转发节点）；发送三个：`send_msg`（普通图片段与
-    评论）、`send_forward_msg`（普通文字单节点卡片）、`send_group_forward_msg`
-    （卡片展开节点重组投递）。
+    只读五个：`get_login_info` / `get_group_list` / `get_msg` / `get_forward_msg` /
+    `get_friend_list`（实测 `data` 为裸数组，条目字段 `user_id` / `nickname` /
+    `remark`）；发送三个：`send_msg` / `send_forward_msg` / `send_group_forward_msg`。
+    前两个发送动作按目标形态额外接收私聊路由参数 `target_user_id`（实测 6.10：
+    以 `message_type` / `user_id` 路由，不引入具名私聊发送动作）。
     """
 
     async def get_login_info(self) -> Mapping[str, Any]: ...
     async def get_group_list(self) -> Mapping[str, Any]: ...
     async def get_msg(self, message_id: str) -> Mapping[str, Any]: ...
     async def get_forward_msg(self, id: str) -> Mapping[str, Any]: ...
+    async def get_friend_list(self) -> Mapping[str, Any]: ...
     async def send_msg(
-        self, *, target_group_id: str, message: Sequence[Mapping[str, Any]],
-        before_submit: Callable[[], bool],
+        self, *, target_group_id: str = "", target_user_id: str = "",
+        message: Sequence[Mapping[str, Any]], before_submit: Callable[[], bool],
     ) -> Mapping[str, Any]: ...
     async def send_forward_msg(
-        self, *, target_group_id: str, messages: Sequence[Mapping[str, Any]],
-        before_submit: Callable[[], bool],
+        self, *, target_group_id: str = "", target_user_id: str = "",
+        messages: Sequence[Mapping[str, Any]], before_submit: Callable[[], bool],
     ) -> Mapping[str, Any]: ...
     async def send_group_forward_msg(
         self, *, target_group_id: str, messages: Sequence[Mapping[str, Any]],
@@ -215,30 +234,37 @@ class AiohttpOneBotTransport:
 
         return await self._call("get_forward_msg", {"id": id})
 
+    async def get_friend_list(self) -> Mapping[str, Any]:
+        """好友名册查询：只读，不设提交许可闸门，与其它只读动作共用同一套边界。
+
+        实测 `data` 是裸数组、条目字段 `user_id`（整数）/`nickname`/`remark`
+        （API 目录 6.10）；取值与匹配判定归 `send_material` 单点定义，不在本模块。
+        """
+
+        return await self._call("get_friend_list", {})
+
     async def send_msg(
-        self, *, target_group_id: str, message: Sequence[Mapping[str, Any]],
-        before_submit: Callable[[], bool],
+        self, *, target_group_id: str = "", target_user_id: str = "",
+        message: Sequence[Mapping[str, Any]], before_submit: Callable[[], bool],
     ) -> Mapping[str, Any]:
-        return await self._call("send_msg", {
-            "message_type": "group", "group_id": target_group_id,
-            "message": [dict(segment) for segment in message],
-        }, before_submit)
+        return await self._call("send_msg", _send_route(
+            target_group_id, target_user_id, {"message": [dict(segment) for segment in message]}, typed=True,
+        ), before_submit)
 
     async def send_forward_msg(
-        self, *, target_group_id: str, messages: Sequence[Mapping[str, Any]],
-        before_submit: Callable[[], bool],
+        self, *, target_group_id: str = "", target_user_id: str = "",
+        messages: Sequence[Mapping[str, Any]], before_submit: Callable[[], bool],
     ) -> Mapping[str, Any]:
         # 自定义节点卡片；不设置 summary/news/prompt/source 等预览类参数。
-        return await self._call("send_forward_msg",
-                                {"group_id": target_group_id, "messages": [dict(node) for node in messages]},
-                                before_submit)
+        return await self._call("send_forward_msg", _send_route(
+            target_group_id, target_user_id, {"messages": [dict(node) for node in messages]}, typed=False,
+        ), before_submit)
 
     async def send_group_forward_msg(
         self, *, target_group_id: str, messages: Sequence[Mapping[str, Any]],
         before_submit: Callable[[], bool],
     ) -> Mapping[str, Any]:
-        # 卡片展开节点重组投递：节点数组只来自 get_forward_msg 展开查询结果；
-        # 不设置预览类参数，外层预览由平台默认生成。
+        # 卡片展开节点重组投递：节点数组只来自 get_forward_msg 展开查询；不设预览类参数。
         return await self._call("send_group_forward_msg",
                                 {"group_id": target_group_id, "messages": [dict(node) for node in messages]},
                                 before_submit)
@@ -293,8 +319,7 @@ class AiohttpOneBotTransport:
                           on_timeout: Callable[[], OneBotUnavailable]) -> Any:
         """在注入时钟期限内等待工作完成；未完成即取消工作并按给定类别报错（不重放）。
 
-        取消与异常回收对本实例一切后台等待统一收口：动作与关闭两类等待共用，
-        期限先到不等待不合作的取消。
+        取消与异常回收到本实例一切后台等待统一收口：动作与关闭两类等待共用。
         """
 
         timer = asyncio.create_task(self._sleep_until(deadline))
@@ -389,10 +414,9 @@ class AiohttpOneBotTransport:
     async def _plaintext_target_allowed(self) -> bool:
         """明文端点只允许回环字面量与解析为回环/私有/链路本地的目标。
 
-        `https` 不做该判定（默认验证证书）；`http` 的主机名在发出请求前用运行循环
-        解析，要求**全部**解析结果为可信网络。解析失败、结果含公网地址或没有任何
-        结果一律拒绝，绝不因主机名（容器名）形态直接放行公网目标；`http` 公网 IP
-        字面量已在配置判定中拒绝。这里只做判定，不写出任何请求、不携带凭证。
+        `http` 主机名在发出请求前用运行循环解析，要求全部解析结果为可信网络；
+        解析失败、含公网地址或无结果一律拒绝，绝不因主机名形态放行公网目标
+        （公网 IP 字面量已在配置判定中拒绝）。只做判定，不写出请求、不携带凭证。
         """
 
         parts = urlsplit(self._connection.endpoint)

@@ -3,8 +3,9 @@
 只经 `OneBotTransport` 协议方法（新 HTTP 无连接接口）与客户端/预检公开入口进入：
 不访问客户端内部状态、不 mock 传输内部协作者、不导入 aiohttp（默认 pytest 档
 可运行）、不触真实网络。应答信封与实测口径同构（`docs/snowluma-http-api-catalog.md`
-第 6 节）：三个只读动作、四个发送动作都返回可核验 `message_id`（可为负），
-`send_forward_msg` 额外返回 `res_id` / `forward_id`。
+第 6 节）：固定八动作（五个只读动作、三个发送动作）都返回可核验 `message_id`（可为
+负），`send_forward_msg` 额外返回 `res_id` / `forward_id`；好友名册与私聊路由参数
+（`message_type`/对端）按实测口径（6.10）在基类单点提供，各模块只做差异注入。
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from maimai_courier_plugin.config import CourierConfig
 from maimai_courier_plugin.forward_precheck import precheck_forward_request
 from maimai_courier_plugin.source_binding import SourceBindingTable
 from maimai_courier_plugin.snowluma_transport import OneBotUnavailable
-from tests.support import envelope, source_record
+from tests.support import PRIVATE_FRIENDS, envelope, source_record
 
 SOURCE_MESSAGE_ID = "-12345"
 """可信源消息的平台消息标识（负数：平台 ID 可为负，不得假设符号）。"""
@@ -117,13 +118,17 @@ def target_receipt(
 
 
 class MemoryOneBotTransport:
-    """内存传输替身：实现 `OneBotTransport` 协议七个动作与 `close`。
+    """内存传输替身：实现 `OneBotTransport` 协议八个动作与 `close`。
 
     `queries` 只读登记 `(action, params)`，`sent` 只登记发送动作的
     `{"action", "params"}`（`before_submit` 是提交闸门回调，不作为平台参数）；
     `on_action` 可对单个动作覆盖应答或抛 `OneBotUnavailable`，用于注入
     retcode=100、缺 ID、负 ID 与取消竞态。`expanded` 是 `get_forward_msg` 的
-    展开查询应答：默认给合成节点样本，用例可整体替换。
+    展开查询应答：默认给合成节点样本，用例可整体替换。`friends` 是
+    `get_friend_list` 的好友名册应答（私聊目标准备阶段的好友核验输入，实测
+    `data` 为裸数组）；`send_msg` / `send_forward_msg` 按 `target_user_id`
+    是否非空分派群/私聊路由参数（私聊只改 `message_type` 与对端，不引入具名
+    私聊发送动作），群路径请求体与只有群目标时的口径逐字一致。
     """
 
     def __init__(self) -> None:
@@ -131,6 +136,7 @@ class MemoryOneBotTransport:
         self.groups: list[dict[str, Any]] = [{"group_id": 222}]
         self.source = source_record()
         self.expanded: dict[str, Any] = deepcopy(DEFAULT_EXPANDED_CARD)
+        self.friends: list[dict[str, Any]] = deepcopy(PRIVATE_FRIENDS)
         self.queries: list[tuple[str, Any]] = []
         self.sent: list[dict[str, Any]] = []
         self.on_action: Any = None
@@ -147,6 +153,9 @@ class MemoryOneBotTransport:
             return envelope({"user_id": self.account})
         if action == "get_group_list":
             return envelope(deepcopy(self.groups))
+        if action == "get_friend_list":
+            # 好友名册只读应答：裸数组原样上交（条目字段 user_id/nickname/remark）。
+            return envelope(deepcopy(self.friends))
         if action == "get_msg":
             if str(params["message_id"]) == str(self.source["message_id"]):
                 return envelope(deepcopy(self.source))
@@ -165,6 +174,12 @@ class MemoryOneBotTransport:
         self.queries.append(("get_group_list", {}))
         return await self._reply("get_group_list", {})
 
+    async def get_friend_list(self) -> dict[str, Any]:
+        """好友名册只读查询：私聊准备阶段的好友核验输入（design D6）。"""
+
+        self.queries.append(("get_friend_list", {}))
+        return await self._reply("get_friend_list", {})
+
     async def get_msg(self, message_id: str) -> dict[str, Any]:
         self.queries.append(("get_msg", {"message_id": message_id}))
         return await self._reply("get_msg", {"message_id": message_id})
@@ -176,11 +191,14 @@ class MemoryOneBotTransport:
         return await self._reply("get_forward_msg", {"id": id})
 
     async def send_msg(
-        self, *, target_group_id: str, message: Any, before_submit: Any,
+        self, *, target_group_id: str = "", target_user_id: str = "",
+        message: Any, before_submit: Any,
     ) -> dict[str, Any]:
         if self.closed or not before_submit():
             raise OneBotUnavailable("permission", submitted=False)
-        params = {"message_type": "group", "group_id": target_group_id, "message": deepcopy(list(message))}
+        params: dict[str, Any] = ({"message_type": "private", "user_id": target_user_id} if target_user_id
+                                  else {"message_type": "group", "group_id": target_group_id})
+        params["message"] = deepcopy(list(message))
         self.sent.append({"action": "send_msg", "params": params})
         return await self._reply("send_msg", params)
 
@@ -196,11 +214,14 @@ class MemoryOneBotTransport:
         return await self._reply("send_group_forward_msg", params)
 
     async def send_forward_msg(
-        self, *, target_group_id: str, messages: Any, before_submit: Any,
+        self, *, target_group_id: str = "", target_user_id: str = "",
+        messages: Any, before_submit: Any,
     ) -> dict[str, Any]:
         if self.closed or not before_submit():
             raise OneBotUnavailable("permission", submitted=False)
-        params = {"group_id": target_group_id, "messages": deepcopy(list(messages))}
+        params: dict[str, Any] = ({"message_type": "private", "user_id": target_user_id} if target_user_id
+                                  else {"group_id": target_group_id})
+        params["messages"] = deepcopy(list(messages))
         self.sent.append({"action": "send_forward_msg", "params": params})
         return await self._reply("send_forward_msg", params)
 

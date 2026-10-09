@@ -1,20 +1,20 @@
 """投递账本：宿主 `data_dir` 内的 SQLite 最小持久状态。
 
-- **唯一键**：机器人账号 + 源群 + 源消息 ID + 目标群；评论不参与键，评论结果作为
-  字段附属于源发送记录。
-- **状态**：`sending`（已占位、尚未确认）/ `sent`（已确认投递）/ `failed`（明确未
-  发送，允许后续显式重试）/ `unknown`（结果待核实，阻止重发）。
-- **SQL 全部参数绑定**；每次操作都是独立短事务（`BEGIN IMMEDIATE` + `COMMIT`），
-  绝不在网络等待期间持有事务；BEGIN、事务体与 COMMIT 任一失败都尝试有界回滚，
-  无法确认事务结束则停用连接并保留独占，绝不继续读写污染连接。
-- **不静默清理**：成功记录不按 TTL 或容量清除，本模块不提供任何删除接口。
-- **安全失败**：库文件损坏或路径不可用时返回 `LedgerUnavailable`，调用方必须关闭
-  发送；本模块不覆盖、不删除、也不把损坏库当作空库。
-- **失败可区分**：读失败、写失败与恢复失败一律抛 `LedgerUnavailableError`；
-  `None` 只表示「记录不存在」，`False` 只表示「没有可更新的在途占位」，两者不得
-  与存储故障混同。
-- **单实例独占**：打开数据库前取得本插件目录的非阻塞文件锁，关闭连接后释放；
-  第二实例不打开数据库，更不会恢复或修改活实例的在途状态。
+- **唯一键**：账号 + 源群 + 源消息 ID + 目标 + 目标形态；评论不参与键，作为字段
+  附属。目标形态进主键：群号与好友 QQ 号是两个重叠的数字空间（ADR 0012）。
+- **旧库一次性迁移**：四字段旧库在开库流程内单事务迁移为五字段（既有行记为群目标）；
+  任一校验不通过或写入未确认都保留原文件并按账本不可用关闭发送（ADR 0012）。
+- **状态**：`sending`（已占位）/ `sent`（已确认）/ `failed`（明确未发送，允许显式
+  重试）/ `unknown`（待核实，阻止重发）；成功记录不按 TTL 或容量清除，无删除接口。
+- **SQL 全部参数绑定**；每次操作独立短事务（`BEGIN IMMEDIATE` + `COMMIT`），绝不
+  在网络等待期间持有事务；BEGIN、事务体与 COMMIT 任一失败都最多两次回滚并核实
+  `in_transaction`，无法确认则停用连接并保留独占，绝不在状态不明的连接上继续读写。
+- **安全失败**：损坏库、路径不可用、状态类历史证据（服务收据、主库以外的数据库/
+  归档、导出临时名、归档扩展名、中文快照/归档/备份标记、孤立伴随文件、链接文件）
+  一律 `LedgerUnavailable`，调用方必须关闭发送；不覆盖、不删除、不当空历史。
+- **失败可区分**：读/写/恢复失败抛 `LedgerUnavailableError`；`None` 只表示记录
+  不存在，`False` 只表示没有可更新的在途占位。
+- **单实例独占**：打开数据库前取得本目录非阻塞文件锁，关闭连接后释放。
 
 账本只管持久状态，不做发送、不做权限判断：编排见 `forward_delivery.py`。
 """
@@ -39,20 +39,22 @@ from .shared.delivery import (
     STATUS_SENDING,
     STATUS_SENT,
     STATUS_UNKNOWN,
+    TARGET_KIND_GROUP,
+    TARGET_KIND_VALUES,
     DeliveryKey,
     LedgerStatus,
     LedgerUnavailable,
     LedgerUnavailableError,
 )
 
-# 投递身份、账本状态与账本错误类型的**唯一定义**在共享层 `shared/delivery.py`，
-# 本模块按自身签名需要直接导入子模块，不在顶层为调用方准备第二导入入口。
+# 投递身份、账本状态与账本错误类型的唯一定义在共享层 `shared/delivery.py`，
+# 本模块按自身签名需要直接导入子模块，不在顶层准备第二导入入口。
 
 LEDGER_FILE_NAME = "delivery_ledger.sqlite3"
 """账本文件名（固定落在宿主授予的 `ctx.paths.data_dir` 下）。"""
 
 STATE_LOCK_FILE_NAME = "delivery_ledger.lock"
-"""直连账本新增独占锁；保留空锁文件，不把它当作服务切换收据。"""
+"""独占锁文件名；保留空锁文件，不把它当作服务切换收据。"""
 
 _LEDGER_COMPANION_SUFFIXES = ("-wal", "-shm", "-journal")
 """SQLite 伴随文件后缀；只允许主库存在时按固定名出现。"""
@@ -61,7 +63,7 @@ _DEPLOYMENT_EXTENSIONS = (".py", ".md", ".toml", ".txt", ".rst", ".yaml", ".yml"
 """插件自身部署文件扩展名；带状态标记但属这些扩展名的条目不是账本证据。"""
 
 _STATE_NAME_MARKERS = ("ledger", "delivery", "courier", "snapshot", "receipt")
-"""状态类证据名字标记（忽略大小写）；用于识别旧账本归档、导出与快照痕迹。"""
+"""状态类证据名字标记（忽略大小写）。"""
 
 _CHINESE_STATE_MARKERS = ("快照", "归档", "备份")
 """中文状态标记；仅在不以部署类扩展名结尾时阻断。
@@ -74,19 +76,14 @@ _ARCHIVE_EXTENSIONS = (".tar", ".tgz", ".gz", ".zip", ".7z", ".rar", ".bak")
 """归档类扩展名；命中即阻断，不按部署文件放行。"""
 
 _TMP_EXPORT_NAME_PATTERN = re.compile(r"\.tmp-[0-9a-f]{8}\s*\Z")
-"""历史导出/半成品的临时名形态 `<目标>.tmp-<8位十六进制>`（忽略大小写）。
-
-`$` 只在「字符串末尾或结尾换行之前」匹配，`\\Z` 只认真正的字符串末尾：单用 `\\Z`
-会漏掉以换行结尾的异常名字，因此这里用 `\\s*\\Z` 容忍结尾空白，使
-`x.tmp-1234abcd\\n` 这类名字同样命中，不留下可按文件名差异绕过的空洞。
-"""
+"""历史导出/半成品的临时名形态 `<目标>.tmp-<8位十六进制>`（忽略大小写）。"""
 
 _DATABASE_NAME_SUFFIXES = (".sqlite3", ".sqlite", ".db")
-"""主库以外的数据库文件名后缀；带任一 SQLite 伴随后缀时按去掉后缀的名字判定。"""
+"""主库以外的数据库文件名后缀；带 SQLite 伴随后缀时按去掉后缀的名字判定。"""
 
 
 class _StateLock:
-    """非阻塞 flock；明确解锁与描述符关闭分别确认。"""
+    """非阻塞 flock；解锁与描述符关闭分别确认。"""
 
     def __init__(self, directory: Path) -> None:
         self._close_unconfirmed = False
@@ -143,7 +140,23 @@ LEDGER_COLUMNS = (
     "created_at",
     "updated_at",
 )
-"""`SELECT` 列顺序（与 `_fetch` 一一对应，避免 `SELECT *`）。"""
+"""`SELECT` 列顺序（与 `_fetch` 一一对应，避免 `SELECT *`）；键列不走本常量。"""
+
+
+_LEGACY_KEY_COLUMNS = ("account_id", "source_group_id", "source_message_id", "target_group_id")
+"""迁移前旧库的四字段主键列。"""
+
+_CURRENT_KEY_COLUMNS = _LEGACY_KEY_COLUMNS + ("target_kind",)
+"""当前五字段主键列：目标形态进键（ADR 0012）。"""
+
+_LEGACY_COLUMNS = _LEGACY_KEY_COLUMNS + LEDGER_COLUMNS
+"""旧库全部列（顺序与旧 DDL 一致）。"""
+
+_CURRENT_COLUMNS = _CURRENT_KEY_COLUMNS + LEDGER_COLUMNS
+"""当前库全部列（顺序与 `_create_table_sql` 一致）。"""
+
+_MIGRATION_TABLE = "delivery_ledger_migration"
+"""一次性迁移的新表名：提交前旧表仍在，任一步失败回滚即恢复原状。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +206,7 @@ def _close_storage(connection: sqlite3.Connection | None, lock: _StateLock | Non
 
 
 def _is_database_name(name: str) -> bool:
-    """名字是否形如数据库文件（含其 SQLite 伴随后缀形态，忽略大小写）。"""
+    """名字是否形如数据库文件（含 SQLite 伴随后缀形态，忽略大小写）。"""
 
     lowered = name.lower()
     for suffix in _LEDGER_COMPANION_SUFFIXES:
@@ -276,11 +289,9 @@ def _state_evidence_reason(entry: Path, *, main_exists: bool) -> str | None:
 def open_ledger(path: Path, *, clock: Clock | None = None) -> DeliveryLedger | LedgerUnavailable:
     """先独占、识别目录历史、只读核验原库，再打开写连接并恢复未完成阶段。
 
-    历史核对只阻断状态类证据（服务收据、主库以外的数据库与归档、导出临时名、
-    归档扩展名、中文快照/归档/备份标记、孤立伴随文件、链接文件及其子目录内一层
-    名字命中的同类证据），插件自身部署文件不阻断发送；只在本次新建锁且没有任何
-    状态类证据时按新装建库。拒绝符号链接、硬链接、未知状态条目或不兼容库，
-    不删除证据、不打开服务数据库。
+    只在本次新建锁且无任何状态类证据时按新装建库；不删除证据、不打开服务数据库。
+    既有四字段库在独占与只读验证通过后做一次性迁移（`_migrate_ledger`），任一步
+    失败都保留原文件并按账本不可用关闭发送（ADR 0012）。
     """
 
     time_source = clock or SystemClock()
@@ -309,33 +320,26 @@ def open_ledger(path: Path, *, clock: Clock | None = None) -> DeliveryLedger | L
             connection = sqlite3.connect(
                 f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=5.0, isolation_level=None, check_same_thread=False
             )
-            _validate_database(connection)
+            shape = _validate_database(connection)
             connection.close()
             connection = sqlite3.connect(
                 f"{path.absolute().as_uri()}?mode=rw", uri=True, timeout=5.0, isolation_level=None, check_same_thread=False
             )
+            if shape.needs_migration:
+                try:
+                    _migrate_ledger(connection)
+                except _LedgerDisabled:
+                    # 迁移回滚未能确认：连接已在迁移内停用，独占锁转入待清理表保留，
+                    # 通用失败清理路径不能再释放它（与账本停用路径同一口径）。
+                    with _CLEANUP_MUTEX:
+                        _PENDING_CLEANUP[path] = (None, lock)
+                    lock = None
+                    raise
         else:
             if not lock.created:
                 raise LedgerUnavailableError("原账本缺失但存在上次运行的独占锁或状态类证据，须人工核对")
             connection = sqlite3.connect(str(path), timeout=5.0, isolation_level=None, check_same_thread=False)
-            connection.execute(
-                f"""
-                CREATE TABLE {_TABLE} (
-                    account_id TEXT NOT NULL,
-                    source_group_id TEXT NOT NULL,
-                    source_message_id TEXT NOT NULL,
-                    target_group_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    target_message_id TEXT NOT NULL DEFAULT '',
-                    comment_status TEXT NOT NULL DEFAULT '',
-                    comment_message_id TEXT NOT NULL DEFAULT '',
-                    reason TEXT NOT NULL DEFAULT '',
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY (account_id, source_group_id, source_message_id, target_group_id)
-                )
-                """
-            )
+            connection.execute(_create_table_sql(_TABLE))
         ledger = DeliveryLedger(connection, time_source, lock=lock)
         ledger.recover_interrupted()
     except BaseException as error:
@@ -353,6 +357,28 @@ def open_ledger(path: Path, *, clock: Clock | None = None) -> DeliveryLedger | L
     return ledger
 
 
+def _create_table_sql(table: str) -> str:
+    """当前五字段主键的建表语句（新装与一次性迁移同一处定义，目标形态进键）。"""
+
+    return f"""
+        CREATE TABLE {table} (
+            account_id TEXT NOT NULL,
+            source_group_id TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            target_group_id TEXT NOT NULL,
+            target_kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            target_message_id TEXT NOT NULL DEFAULT '',
+            comment_status TEXT NOT NULL DEFAULT '',
+            comment_message_id TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (account_id, source_group_id, source_message_id, target_group_id, target_kind)
+        )
+    """
+
+
 def _wal_checksum(data: bytes, order: str, checksum: tuple[int, int] = (0, 0)) -> tuple[int, int]:
     """SQLite WAL 的双字累计校验；存储校验值始终使用大端序。"""
 
@@ -364,11 +390,11 @@ def _wal_checksum(data: bytes, order: str, checksum: tuple[int, int] = (0, 0)) -
 
 
 def _validate_wal(path: Path) -> None:
-    """在 SQLite 可能忽略坏日志或重建共享索引之前，只读核实全部 WAL 帧。
+    """在 SQLite 可能忽略坏日志之前，只读核实全部 WAL 帧。
 
-    格式依据 https://sqlite.org/fileformat.html#walformat（4.1–4.2）。
-    完整合法 WAL 与空 WAL 可用；截断、校验不符或代次不明的尾部不能证明无成功
-    事实，保留原文件并要求人工核实。按页读取，不复制数据库或建立迁移框架。
+    格式依据 https://sqlite.org/fileformat.html#walformat（4.1–4.2）。完整合法
+    WAL 与空 WAL 可用；截断、校验不符或代次不明的尾部不能证明无成功事实，保留
+    原文件并要求人工核实。按页读取，不复制数据库。
     """
 
     wal = path.with_name(path.name + "-wal")
@@ -411,33 +437,159 @@ def _validate_wal(path: Path) -> None:
                 raise LedgerUnavailableError(reason)
 
 
-def _validate_database(connection: sqlite3.Connection) -> None:
-    """沿用迁移的完整性检查，严格验证原列、主键、状态且不修补未知结构。"""
+@dataclass(frozen=True, slots=True)
+class _LedgerShape:
+    """`_validate_database` 的显式形状判定：键列与是否需要一次性迁移。
+
+    形状只有两种（四字段旧库 / 五字段新库），其余形状在列匹配阶段即被拒绝。
+    """
+
+    key_columns: tuple[str, ...]
+    needs_migration: bool
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        """按序取全部列（键列 + 记录列）：显式 SELECT 不依赖列在表中的位置。"""
+
+        return self.key_columns + LEDGER_COLUMNS
+
+
+def _current_record_is_compatible(record: dict[str, object]) -> bool:
+    """五字段新库的单条记录判定：键列非空、目标形态合法，其余字段自洽。"""
+
+    kind = record["target_kind"]
+    if not isinstance(kind, str) or kind not in TARGET_KIND_VALUES:
+        return False
+    return (_key_fields_are_compatible(record, _CURRENT_KEY_COLUMNS)
+            and _record_body_is_compatible(record))
+
+
+def _legacy_record_is_compatible(record: dict[str, object]) -> bool:
+    """四字段旧库的单条记录判定：没有目标形态列，其余与当前库同一口径。"""
+
+    return (_key_fields_are_compatible(record, _LEGACY_KEY_COLUMNS)
+            and _record_body_is_compatible(record))
+
+
+def _key_fields_are_compatible(record: dict[str, object], key_columns: tuple[str, ...]) -> bool:
+    """键列必须是非空白字符串：缺失、非文本或全空白都判不兼容。"""
+
+    for name in key_columns:
+        value = record[name]
+        if not isinstance(value, str) or not value.strip():
+            return False
+    return True
+
+
+def _record_body_is_compatible(record: dict[str, object]) -> bool:
+    """状态、目标/评论 ID、原因与时间戳的自洽性（键列与目标形态列之外的部分）。"""
+
+    status, target_message_id = record["status"], record["target_message_id"]
+    comment_status, comment_message_id = record["comment_status"], record["comment_message_id"]
+    reason, created_at, updated_at = record["reason"], record["created_at"], record["updated_at"]
+    if not (isinstance(status, str) and isinstance(target_message_id, str)
+            and isinstance(comment_status, str) and isinstance(comment_message_id, str)
+            and isinstance(reason, str)):
+        return False
+    states = (STATUS_SENDING, STATUS_SENT, STATUS_FAILED, STATUS_UNKNOWN)
+    if status not in states or comment_status not in ("", *states):
+        return False
+    if status == STATUS_SENT and not target_message_id.strip():
+        return False
+    if comment_status == STATUS_SENT and not comment_message_id.strip():
+        return False
+    if status != STATUS_SENT and comment_status != "":
+        return False
+    if comment_status == "" and comment_message_id != "":
+        return False
+    return isinstance(created_at, (int, float)) and isinstance(updated_at, (int, float))
+
+
+class _LedgerDisabled(LedgerUnavailableError):
+    """事务回滚未能确认：连接已停用，调用方按「停用连接并保留独占」收尾。"""
+
+
+def _rollback_quietly(connection: sqlite3.Connection) -> bool:
+    """最多两次回滚并核实事务真正结束；未确认时返回 False，由调用方停用连接。"""
+
+    for _ in range(2):
+        try:
+            connection.rollback()
+            if not connection.in_transaction:
+                return True
+        except (sqlite3.Error, OSError):
+            continue
+    return False
+
+
+@contextmanager
+def _atomic(connection: sqlite3.Connection) -> Iterator[sqlite3.Cursor]:
+    """短事务纪律（`BEGIN IMMEDIATE` + 提交/回滚核实）：账本与迁移共用同一套。
+
+    任一失败都最多两次回滚并核实 `in_transaction` 为假；仍不能确认时抛
+    `_LedgerDisabled`，由调用方按「停用连接并保留独占」收尾（账本标记停用并
+    保留独占至公开 `close()`；迁移路径把锁转入待清理表保留至下次打开）。存储
+    异常不在此翻译；绝不在状态不明的连接上继续读写。
+    """
+
+    cursor: sqlite3.Cursor | None = None
+    disabled = False
+    try:
+        cursor = connection.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        yield cursor
+        connection.commit()
+    except BaseException:
+        if not _rollback_quietly(connection):
+            disabled = True
+            raise _LedgerDisabled("状态库回滚未能确认，连接已停用并保留独占") from None
+        raise
+    finally:
+        if cursor is not None and not disabled:
+            cursor.close()
+
+
+def _validate_database(connection: sqlite3.Connection) -> _LedgerShape:
+    """严格验证库形状与既有记录，返回显式形状判定（键列与是否需要迁移）。
+
+    只接受四字段旧库与五字段新库；其余形状（缺列、多列、错类型、错主键、未知
+    比较规则、无法确认的 DDL）一律拒绝，绝不当空历史修补。既有记录按列名逐条
+    取自洽性判定。
+    """
 
     if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
         raise LedgerUnavailableError("状态库完整性检查失败，可能损坏，须人工核对")
     objects = connection.execute("SELECT type, name FROM sqlite_schema").fetchall()
     if set(objects) != {("table", _TABLE), ("index", "sqlite_autoindex_delivery_ledger_1")}:
         raise LedgerUnavailableError("状态库缺表或含未知结构，拒绝当作空历史")
-    key_columns = ("account_id", "source_group_id", "source_message_id", "target_group_id")
-    names = key_columns + LEDGER_COLUMNS
     columns = connection.execute(f"PRAGMA table_xinfo({_TABLE})").fetchall()
-    expected = [
-        (name, "REAL" if name in ("created_at", "updated_at") else "TEXT", 1,
-         "''" if name in ("target_message_id", "comment_status", "comment_message_id", "reason") else None,
-         index + 1 if index < 4 else 0, 0)
-        for index, name in enumerate(names)
-    ]
-    if [tuple(row[1:]) for row in columns] != expected:
-        raise LedgerUnavailableError("状态库列、类型或四字段主键与原 schema 不符，须人工核对")
+    matched: tuple[tuple[str, ...], list[tuple[str, str, int, str | None, int, int]], bool] | None = None
+    for candidate, needs_migration in ((_CURRENT_KEY_COLUMNS, False), (_LEGACY_KEY_COLUMNS, True)):
+        names = candidate + LEDGER_COLUMNS
+        expected = [
+            (name, "REAL" if name in ("created_at", "updated_at") else "TEXT", 1,
+             "''" if name in ("target_message_id", "comment_status", "comment_message_id", "reason") else None,
+             index + 1 if index < len(candidate) else 0, 0)
+            for index, name in enumerate(names)
+        ]
+        if [tuple(row[1:]) for row in columns] == expected:
+            # 匹配分支同时绑定键列、期望列与迁移需求：不再依赖 for 循环变量的生命周期。
+            matched = (candidate, expected, needs_migration)
+            break
+    if matched is None:
+        raise LedgerUnavailableError("状态库列、类型或主键结构与原 schema 不符，须人工核对")
+    key_columns, expected, needs_migration = matched
+    shape = _LedgerShape(key_columns=key_columns, needs_migration=needs_migration)
     # table_xinfo 不包含比较规则；由 SQLite 给出真正参与唯一性判定的索引列。
     primary_key = connection.execute("PRAGMA index_xinfo(sqlite_autoindex_delivery_ledger_1)").fetchall()
     # SQLite 排序规则名只按 ASCII 大小写等价；不折叠未知 Unicode 名称。
     if [(row[1], row[2], row[4].upper() if isinstance(row[4], str) and row[4].isascii() else row[4])
         for row in primary_key if row[5]] != [
-        (index, name, "BINARY") for index, name in enumerate(key_columns)
+        (index, name, "BINARY") for index, name in enumerate(shape.key_columns)
     ]:
-        raise LedgerUnavailableError("状态库四字段主键比较规则与原 schema 不符，须人工核对")
+        raise LedgerUnavailableError(
+            f"状态库{len(shape.key_columns)}字段主键比较规则与原 schema 不符，须人工核对"
+        )
     # 主键可显式覆盖列的 NOCASE/RTRIM，不能据 index_xinfo 推断 WHERE 的列规则。
     # 仅完整匹配原 DDL 与明确 BINARY 等价写法，不解析通用 SQL、不替换/执行库内文本。
     # 注释必须在第一个结束符停止，避免回溯吞掉真实的 COLLATE；未知结构一律关闭。
@@ -455,27 +607,74 @@ def _validate_database(connection: sqlite3.Connection) -> None:
         declarations.append(declaration)
     separator = gap + "," + gap
     declarations.append(gap.join(("PRIMARY", "KEY", r"\(",
-                                 separator.join(identifier(name) + binary for name in key_columns), r"\)")))
+                                 separator.join(identifier(name) + binary for name in shape.key_columns),
+                                 r"\)")))
     pattern = gap + gap.join(("CREATE", "TABLE", identifier(_TABLE), r"\(",
                               separator.join(declarations), r"\)")) + gap
     ddl = connection.execute("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?", (_TABLE,)).fetchone()
     if ddl is None or not isinstance(ddl[0], str) or re.fullmatch(pattern, ddl[0], re.IGNORECASE | re.ASCII) is None:
-        raise LedgerUnavailableError("状态库列及四字段主键比较规则无法确认为原 schema，须人工核对")
-    states = (STATUS_SENDING, STATUS_SENT, STATUS_FAILED, STATUS_UNKNOWN)
+        raise LedgerUnavailableError(
+            f"状态库列及{len(shape.key_columns)}字段主键比较规则无法确认为原 schema，须人工核对"
+        )
+    names = shape.columns
+    compatible = _legacy_record_is_compatible if shape.needs_migration else _current_record_is_compatible
     for row in connection.execute(f"SELECT {', '.join(names)} FROM {_TABLE}"):
-        if (not all(isinstance(value, str) for value in row[:9])
-                or not all(value.strip() for value in row[:4])
-                or row[4] not in states or row[6] not in ("", *states)
-                or (row[4] == STATUS_SENT and not row[5].strip())
-                or (row[6] == STATUS_SENT and not row[7].strip())
-                or (row[4] != STATUS_SENT and row[6] != "")
-                or (row[6] == "" and row[7] != "")
-                or not all(isinstance(value, (int, float)) for value in row[9:])):
+        if not compatible(dict(zip(names, row))):
             raise LedgerUnavailableError("状态库含不兼容记录，保留原历史并关闭发送")
+    return shape
+
+
+def _migrate_ledger(connection: sqlite3.Connection) -> None:
+    """把四字段旧库一次性迁移为五字段新库（ADR 0012）。
+
+    单事务内完成：建新表 → 按既有行回填（`target_kind` 一律 `group`）→ 校验
+    记录数与内容逐列一致 → 替换旧表 → 替换后再经一次只读形状复核 → 提交。
+    任一步校验不通过或写入未确认都回滚：原文件保持迁移前内容，调用方按账本
+    不可用关闭发送。迁移前的备份是运维前置条件，代码不做额外备份。
+    """
+
+    try:
+        with _atomic(connection) as cursor:
+            cursor.execute(_create_table_sql(_MIGRATION_TABLE))
+            cursor.execute(
+                f"INSERT INTO {_MIGRATION_TABLE} ({', '.join(_CURRENT_COLUMNS)}) "
+                f"SELECT {', '.join(_LEGACY_KEY_COLUMNS)}, ?, {', '.join(LEDGER_COLUMNS)} FROM {_TABLE}",
+                (TARGET_KIND_GROUP,),
+            )
+            comparison = ", ".join(_LEGACY_COLUMNS)
+            mismatch = cursor.execute(
+                f"SELECT (SELECT COUNT(*) FROM {_TABLE}) <> (SELECT COUNT(*) FROM {_MIGRATION_TABLE}) "
+                f"OR (SELECT COUNT(*) FROM (SELECT {comparison} FROM {_TABLE} "
+                f"EXCEPT SELECT {comparison} FROM {_MIGRATION_TABLE})) <> 0 "
+                f"OR (SELECT COUNT(*) FROM (SELECT {comparison} FROM {_MIGRATION_TABLE} "
+                f"EXCEPT SELECT {comparison} FROM {_TABLE})) <> 0 "
+                f"OR (SELECT COUNT(*) FROM {_MIGRATION_TABLE} WHERE target_kind <> ?) <> 0",
+                (TARGET_KIND_GROUP,),
+            ).fetchone()
+            if mismatch is None or mismatch[0]:
+                raise LedgerUnavailableError("账本迁移后记录数或状态校验不通过，保留原文件并关闭发送")
+            cursor.execute(f"DROP TABLE {_TABLE}")
+            cursor.execute(f"ALTER TABLE {_MIGRATION_TABLE} RENAME TO {_TABLE}")
+            # 替换之后、提交之前再过一次只读完整复核：迁移结果也要经「验证不通过即
+            # 关闭发送」的同一道闸口，不因新表由本模块构造就跳过（ADR 0012）。
+            try:
+                migrated = _validate_database(connection)
+            except LedgerUnavailableError as error:
+                raise LedgerUnavailableError(
+                    f"账本迁移后形状复核不通过（{error.reason}），保留原文件并关闭发送"
+                ) from None
+            if migrated.needs_migration:
+                raise LedgerUnavailableError("账本迁移后仍判定为旧形状，保留原文件并关闭发送")
+    except _LedgerDisabled:
+        raise _LedgerDisabled("账本迁移回滚未能确认，连接已停用并保留独占，保留原文件并关闭发送") from None
+    except (sqlite3.Error, OSError) as error:
+        raise LedgerUnavailableError(
+            f"账本迁移未能确认完成（{_describe(error)}），保留原文件并关闭发送"
+        ) from None
 
 
 def _describe(error: BaseException) -> str:
-    """给出可定位、不含用户数据的失败描述（供工具结果与日志共用）。"""
+    """可定位、不含用户数据的失败描述（供工具结果与日志共用）。"""
 
     if isinstance(error, sqlite3.DatabaseError) and "not a database" in str(error):
         return "状态库文件损坏或不是 SQLite 数据库"
@@ -489,8 +688,8 @@ def _describe(error: BaseException) -> str:
 class DeliveryLedger:
     """账本本体：短事务 + 参数绑定，由 `open_ledger` 构造。
 
-    返回 `None` 只表示「记录不存在」，返回 `False` 只表示「没有可更新的在途占位」；
-    读写与恢复的存储故障一律抛 `LedgerUnavailableError`。
+    `None` 只表示记录不存在，`False` 只表示没有可更新的在途占位；读写与恢复的
+    存储故障一律抛 `LedgerUnavailableError`。
     """
 
     def __init__(self, connection: sqlite3.Connection, clock: Clock, *, lock: _StateLock | None = None) -> None:
@@ -503,22 +702,17 @@ class DeliveryLedger:
     def reserve(self, key: DeliveryKey) -> Reservation:
         """尝试登记 `sending` 占位，原子决定本次调用是否获得发送资格。
 
-        - 无记录或既有记录是 `failed`（明确未发送）→ 登记/重置为 `sending` 并授予；
-        - 既有 `sent`（已投递）/ `sending`（在途）/ `unknown`（待核实）→ 不授予，
-          返回既有记录供调用方如实汇报；
-        - 存储失败抛 `LedgerUnavailableError`：调用方关闭发送（不发送）。
+        无记录或既有记录是 `failed` 才授予；`sent`/`sending`/`unknown` 不授予，
+        返回既有记录供调用方如实汇报。存储失败抛 `LedgerUnavailableError`。
         """
 
         now = self._clock.now()
         with self._transaction() as cursor:
             cursor.execute(
                 f"""
-                INSERT INTO {_TABLE} (
-                    account_id, source_group_id, source_message_id, target_group_id,
-                    status, target_message_id, comment_status, comment_message_id, reason,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, '', '', '', '', ?, ?)
-                ON CONFLICT (account_id, source_group_id, source_message_id, target_group_id)
+                INSERT INTO {_TABLE} ({', '.join(_CURRENT_COLUMNS)})
+                VALUES (?, ?, ?, ?, ?, ?, '', '', '', '', ?, ?)
+                ON CONFLICT ({', '.join(_CURRENT_KEY_COLUMNS)})
                 DO UPDATE SET
                     status = excluded.status,
                     target_message_id = '',
@@ -539,12 +733,9 @@ class DeliveryLedger:
     def recover_interrupted(self) -> int:
         """恢复遗留源/评论 sending 为 unknown，返回受影响阶段数。
 
-        `open_ledger` 已在独占且结构核对后自动调用；公开方法保留给启动兼容入口，
-        没有在途工作时重复调用返回零。不得在活跃发送过程中调用。
-        源与评论独立恢复，评论中断不能改变源 sent 或清空目标 ID。
-
-        恢复失败抛 `LedgerUnavailableError`（调用方至少告警一次）：失败与「归并
-        零条」必须可区分；失败时遗留 `sending` 仍会阻止重发，方向依旧安全。
+        `open_ledger` 已在独占且结构核对后自动调用；不得在活跃发送过程中调用。
+        源与评论独立恢复，评论中断不能改变源 sent 或清空目标 ID。恢复失败抛
+        `LedgerUnavailableError`（与「归并零条」可区分）。
         """
 
         with self._transaction() as cursor:
@@ -572,8 +763,8 @@ class DeliveryLedger:
     def mark_sent(self, key: DeliveryKey, target_message_id: str) -> bool:
         """把在途占位登记为成功（保存真实目标消息 ID）。
 
-        返回 `True` 表示已更新到在途占位；返回 `False` 表示没有可更新的 `sending`
-        记录（占位未命中）；存储失败抛 `LedgerUnavailableError`。
+        `True` 表示已更新在途占位；`False` 表示占位未命中；存储失败抛
+        `LedgerUnavailableError`。
         """
 
         if not isinstance(target_message_id, str) or not target_message_id.strip():
@@ -674,78 +865,54 @@ class DeliveryLedger:
         if row is None:
             return None
         if cursor.fetchone() is not None:
-            raise LedgerUnavailableError("状态库四字段键命中多条记录，关闭发送")
+            raise LedgerUnavailableError("状态库五字段键命中多条记录，关闭发送")
         return DeliveryRecord(key=key, **dict(zip(LEDGER_COLUMNS, row)))
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Cursor]:
-        """短事务：`BEGIN IMMEDIATE` → 提交/回滚；绝不跨越任何 `await`。
+        """短事务：只在本实例互斥下进入，绝不跨越任何 `await`。
 
-        BEGIN、事务体与 COMMIT 任一失败都显式回滚：连接若停在未结束事务，下一次
-        `BEGIN` 会报 `cannot start a transaction within a transaction`，把一次
-        存储故障扩散成整个账本不可用。游标创建与关闭统一放在 finally，任何分支
-        都不泄漏游标。存储异常在此统一转成安全中文错误，覆盖游标创建与关闭。
+        连接已停用即拒绝一切读写；回滚未能确认时标记停用、关闭污染连接并保留
+        独占至公开 `close()`。存储异常在此统一转成安全中文错误。
         """
 
-        try:
-            with self._mutex:
-                if self._unavailable:
-                    raise LedgerUnavailableError("状态库连接已停用，须关闭并重新核对后使用")
-                cursor: sqlite3.Cursor | None = None
-                try:
-                    cursor = self._connection.cursor()
-                    cursor.execute("BEGIN IMMEDIATE")
-                    yield cursor
-                    self._connection.commit()
-                except BaseException:
-                    self._rollback_quietly()
-                    raise
-                finally:
-                    if cursor is not None and not self._unavailable:
-                        cursor.close()
-        except (sqlite3.Error, OSError) as error:
-            raise LedgerUnavailableError(_describe(error)) from None
-
-    def _rollback_quietly(self) -> None:
-        """最多两次回滚并核实事务结束；仍失败则停用，保留独占直至公开关闭。
-
-        停用后只尝试关闭污染连接，不释放目录独占；连接关闭失败也不能恢复读写。
-        清理异常只给出安全类别，不能泄露存储错误原文。
-        """
-
-        for _ in range(2):
+        with self._mutex:
+            if self._unavailable:
+                raise LedgerUnavailableError("状态库连接已停用，须关闭并重新核对后使用")
             try:
-                self._connection.rollback()
-                if not self._connection.in_transaction:
-                    return
-            except (sqlite3.Error, OSError):
-                continue
-        self._unavailable = True
-        try:
-            _close_storage(self._connection, None)
-        except LedgerUnavailableError:
-            raise LedgerUnavailableError("状态库回滚失败且连接关闭未确认，已停用并保留独占") from None
-        raise LedgerUnavailableError("状态库回滚失败，连接已关闭停用，独占保留至公开关闭") from None
+                with _atomic(self._connection) as cursor:
+                    yield cursor
+            except _LedgerDisabled as error:
+                self._unavailable = True
+                try:
+                    _close_storage(self._connection, None)
+                except LedgerUnavailableError:
+                    raise LedgerUnavailableError("状态库回滚失败且连接关闭未确认，已停用并保留独占") from None
+                raise LedgerUnavailableError("状态库回滚失败，连接已关闭停用，独占保留至公开关闭") from error
+            except (sqlite3.Error, OSError) as error:
+                raise LedgerUnavailableError(_describe(error)) from None
 
 
 def _single_row_changed(cursor: sqlite3.Cursor) -> bool:
     """在事务提交前确认最多修改一个键；异常行数交由事务回滚。"""
 
     if cursor.rowcount not in (0, 1):
-        raise LedgerUnavailableError("状态库四字段键更新行数异常，关闭发送")
+        raise LedgerUnavailableError("状态库五字段键更新行数异常，关闭发送")
     return cursor.rowcount == 1
 
 
-def _key_values(key: DeliveryKey) -> tuple[str, str, str, str]:
-    """键值按固定列顺序展开（参数绑定用）。"""
+def _key_values(key: DeliveryKey) -> tuple[str, str, str, str, str]:
+    """键值按固定列顺序展开（参数绑定用）：账号/源群/源消息/目标/目标形态。"""
 
-    return (key.account_id, key.source_group_id, key.source_message_id, key.target_group_id)
+    return (key.account_id, key.source_group_id, key.source_message_id,
+            key.target_group_id, key.target_kind)
 
 
 def _key_where() -> str:
-    """键匹配条件（列名固定，值全部走参数绑定）。"""
+    """键匹配条件（列名固定，值全部走参数绑定；逐字 BINARY 比较）。"""
 
     return (
         "account_id COLLATE BINARY = ? AND source_group_id COLLATE BINARY = ? "
-        "AND source_message_id COLLATE BINARY = ? AND target_group_id COLLATE BINARY = ?"
+        "AND source_message_id COLLATE BINARY = ? AND target_group_id COLLATE BINARY = ? "
+        "AND target_kind COLLATE BINARY = ?"
     )

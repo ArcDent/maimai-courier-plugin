@@ -1,17 +1,8 @@
 """提及呈现：两条输入形态共用的唯一转换实现。
 
 个人与全体成员提及是「保持原消息形态」的唯一例外：转成不触发提醒的普通文本。
-两端的输入字段名不同（宿主形态 `target_user_id` / `target_user_cardname` /
-`target_user_nickname`，OneBot 形态 `qq` / `card` / `nickname` / `name`），但呈现
-格式与压平口径必须逐字一致，因此都收敛到本模块：
-
-- `flatten_mention_text`：不可打印字符转空格、折叠空白（只压平，不求值、不查询
-  成员信息、不做模板展开）；
-- `mention_display_text`：三种格式字面量——`［提及：显示名称（对象标识）］`、
-  `［提及：对象标识］`、`［提及：全体成员］`（对象标识恰为 `all` 时）。
-
-宿主与 OneBot 两侧只保留自己的字段映射与对象可确认性判定（例如只接受 `all`
-或正整数 uin）；本模块不读取任何来源字段，也不判断对象是否可确认。
+宿主与 OneBot 两侧输入字段名不同，但呈现格式与压平口径必须逐字一致，因此收敛到
+本模块；本模块不读取来源字段，对象可确认性判定归两侧各自负责。
 """
 
 from __future__ import annotations
@@ -34,9 +25,8 @@ MENTION_FORMAT: Final[str] = "［提及：{identifier}］"
 def flatten_mention_text(raw: object) -> str:
     """压平提及显示文本（显示名或对象标识）：不可打印字符转空格、折叠空白。
 
-    文本来自源消息、属不可信内容：只做压平，不做模板或命令求值，也不查询成员
-    信息。压平后可能是空串（原本只由控制字符／空白组成），空串的处置由调用方
-    决定：显示名回退到对象标识，对象标识整条拒绝。
+    文本来自源消息、属不可信内容：只压平，不求值、不查询成员信息。压平后可能是
+    空串，处置由调用方决定：显示名回退对象标识，对象标识整条拒绝。
     """
 
     if not isinstance(raw, str) or not raw:
@@ -48,9 +38,8 @@ def flatten_mention_text(raw: object) -> str:
 def mention_display_text(identifier: str, name: str = "") -> str:
     """按对象标识（与可选显示名称）给出不提醒的普通文本呈现。
 
-    调用方必须先确认对象可确认（非空标识）；`identifier` 恰为 `all` 时按全体成员
-    呈现（名称字段不参与），否则带名称给出 `［提及：名称（标识）］`、缺名称时给出
-    `［提及：标识］`。
+    调用方必须先确认对象可确认；`identifier` 恰为 `all` 时按全体成员呈现（名称
+    不参与），否则带名称给出 `［提及：名称（标识）］`、缺名称给出 `［提及：标识］`。
     """
 
     if identifier == ALL_MENTION_IDENTIFIER:

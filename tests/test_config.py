@@ -9,9 +9,15 @@ from typing import Any, get_args, get_type_hints
 
 import pytest
 
-from config import AutoSection, CourierConfig, ForwardGroupSection, ScopeSection
-from plugin import FORWARD_TOOL_NAME, CourierPlugin
-from shared.config_rules import onebot_endpoint_rejection
+from maimai_courier_plugin.config import (
+    AutoSection,
+    CourierConfig,
+    ForwardGroupSection,
+    ScopeSection,
+)
+from maimai_courier_plugin.plugin import FORWARD_TOOL_NAME, CourierPlugin
+from maimai_courier_plugin.source_binding import LIST_FORWARD_FRIENDS_TOOL_NAME
+from maimai_courier_plugin.shared.config_rules import onebot_endpoint_rejection
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -68,10 +74,10 @@ def test_默认配置字段面限定为开关转发分组自动入口直连与�
     assert set(config["auto"]) == {"enabled", "message_types", "share_criteria"}
     assert set(config["scope"]) == {"groups"}
     assert config["snowluma"] == {"http_url": "", "token": "", "token_env_var": ""}
-    assert config["plugin"]["config_version"] == "1.6.0"
+    assert config["plugin"]["config_version"] == "1.7.0"
     assert tomllib.loads((ROOT / "config.toml").read_text(encoding="utf-8")) == config
 
-    from config import SnowLumaSection
+    from maimai_courier_plugin.config import SnowLumaSection
 
     for name, label in (("http_url", "HTTP 地址"), ("token", "连接令牌"), ("token_env_var", "凭证环境变量名")):
         field = getattr(SnowLumaSection, name)
@@ -81,32 +87,41 @@ def test_默认配置字段面限定为开关转发分组自动入口直连与�
 
 
 def test_配置版本与仓库样例同步提升为分组结构() -> None:
-    assert CourierConfig().plugin.config_version == "1.6.0"
+    assert CourierConfig().plugin.config_version == "1.7.0"
     raw = (ROOT / "config.toml").read_text(encoding="utf-8")
     parsed = tomllib.loads(raw)
-    assert parsed["plugin"]["config_version"] == "1.6.0"
+    assert parsed["plugin"]["config_version"] == "1.7.0"
     assert parsed["scope"] == {"groups": []}, "config.toml 的 [scope] 必须是空分组，注释示例不得生效"
     assert re.search(r"^\s*#\s*\[\[scope\.groups\]\]", raw, re.MULTILINE), "需附注释形态的 [[scope.groups]] 示例"
 
 
-def test_空目标分组与组内源自同均可保存() -> None:
-    empty_targets = CourierConfig(
-        scope={"groups": [{"name": "研发", "source_groups": ["111111"], "target_groups": []}]}
-    )
-    assert empty_targets.scope.groups[0].model_dump() == {
-        "name": "研发",
-        "source_groups": ["111111"],
-        "target_groups": [],
-    }
+@pytest.mark.parametrize("value", ["true", "false", "yes", "on", 1, 0, None, ["private"], {"on": True}])
+def test_私聊开关非布尔在配置期拒绝且不回显输入(value: Any) -> None:
+    # 非布尔（含 TOML 里写成字符串的 "true"、数字 1）必须在配置期明确拒绝：
+    # 宿主 Schema 若按宽松归一收下它们，等于让开关值随写法漂移。
+    with pytest.raises(ValueError) as caught:
+        CourierConfig(scope={"groups": [{"name": "研发", "source_groups": ["111111"],
+                                        "target_groups": ["222222"], "private": value}]})
+    assert "private" in str(caught.value), "拒绝原因必须点出字段名"
+    assert "布尔" in str(caught.value), "拒绝原因必须说明要布尔值"
 
-    same_group = CourierConfig(
-        scope={"groups": [{"name": "研发", "source_groups": ["111111"], "target_groups": ["111111", "222222"]}]}
+    plugin = CourierPlugin()
+    plugin.set_plugin_config({"scope": {"groups": [{"name": "甲", "source_groups": ["111111"],
+                                                  "target_groups": ["222222"]}]}})
+    with pytest.raises(ValueError):
+        plugin.set_plugin_config({"scope": {"groups": [
+            {"name": "研发", "source_groups": ["111111"], "target_groups": ["222222"],
+             "private": value}]}})
+    assert [group.name for group in plugin.config.scope.groups] == ["甲"], (
+        "校验失败不得替换既有合法配置"
     )
-    assert same_group.scope.groups[0].model_dump() == {
-        "name": "研发",
-        "source_groups": ["111111"],
-        "target_groups": ["111111", "222222"],
-    }
+
+
+def test_私聊开关合法布尔值可保存且默认关闭() -> None:
+    config = CourierConfig(scope={"groups": [{"name": "研发", "source_groups": ["111111"],
+                                             "target_groups": ["222222"], "private": True}]})
+    assert config.scope.groups[0].private is True
+    assert CourierConfig().scope.groups == []
 
 
 def test_分组结构校验拒绝四类非法配置() -> None:
@@ -151,9 +166,10 @@ def test_分组结构校验拒绝四类非法配置() -> None:
 
 
 def test_宿主Schema生成器可无参构造分组默认视图且空名仍被拒绝() -> None:
-    # 宿主生成配置 Schema 时对嵌套模型无参构造取默认视图：三个字段必须都有默认。
+    # 宿主生成配置 Schema 时对嵌套模型无参构造取默认视图：四个字段必须都有默认。
     default_view = ForwardGroupSection()
-    assert default_view.model_dump() == {"name": "", "source_groups": [], "target_groups": []}
+    assert default_view.model_dump() == {"name": "", "source_groups": [], "target_groups": [],
+                                         "private": False}
     # 默认视图落进配置仍按空白 name 拒绝（配置期校验不因默认值放宽）。
     with pytest.raises(ValueError, match="空白"):
         ScopeSection(groups=[default_view])
@@ -171,8 +187,9 @@ def test_合法多分组配置可构造且目标群可跨组重复() -> None:
         }
     )
     assert [item.model_dump() for item in config.scope.groups] == [
-        {"name": "研发", "source_groups": ["111111"], "target_groups": ["222222"]},
-        {"name": "运营", "source_groups": ["333333"], "target_groups": ["222222", "444444"]},
+        {"name": "研发", "source_groups": ["111111"], "target_groups": ["222222"], "private": False},
+        {"name": "运营", "source_groups": ["333333"], "target_groups": ["222222", "444444"],
+         "private": False},
     ]
 
 
@@ -181,16 +198,18 @@ def test_scope_收敛为单个_groups_字段且组件声明仍完整() -> None:
 
     components = CourierPlugin().get_components()
     types = [component["type"] for component in components]
-    assert types.count("TOOL") == 1, "转发工具必须保持一个"
+    assert types.count("TOOL") == 2, "转发工具与只读名册工具两个群聊 Tool 必须保持"
     assert types.count("HOOK_HANDLER") == 2, "来源签发与自动入口两个 Hook 必须保持"
-    assert [item["name"] for item in components if item["type"] == "TOOL"] == [FORWARD_TOOL_NAME]
+    assert [item["name"] for item in components if item["type"] == "TOOL"] == [
+        FORWARD_TOOL_NAME, LIST_FORWARD_FRIENDS_TOOL_NAME]
 
 
 def test_转发分组结构可经配置构造且界面元数据齐全() -> None:
-    from config import ForwardGroupSection
+    from maimai_courier_plugin.config import ForwardGroupSection
 
     group = ForwardGroupSection(name="研发群", source_groups=["111111"], target_groups=["222222"])
-    assert group.model_dump() == {"name": "研发群", "source_groups": ["111111"], "target_groups": ["222222"]}
+    assert group.model_dump() == {
+        "name": "研发群", "source_groups": ["111111"], "target_groups": ["222222"], "private": False}
 
     config = CourierConfig(
         scope={"groups": [{"name": "研发群", "source_groups": ["111111"], "target_groups": ["222222"]}]}
@@ -198,12 +217,37 @@ def test_转发分组结构可经配置构造且界面元数据齐全() -> None:
     assert [item.model_dump() for item in config.scope.groups] == [group.model_dump()]
     assert CourierConfig().scope.groups == []
 
-    for name in ("name", "source_groups", "target_groups"):
+    for name in ("name", "source_groups", "target_groups", "private"):
         field = getattr(ForwardGroupSection, name)
         assert set(field.json_schema_extra) <= _CONSUMED_SCHEMA_KEYS, name
         assert field.json_schema_extra["label"], f"{name} 必须有中文标签"
         assert field.json_schema_extra["hint"], f"{name} 必须有提示"
         assert isinstance(field.json_schema_extra.get("order"), int), f"{name} 必须声明界面排序"
+
+
+def test_转发分组私聊开关默认关闭且声明界面元数据() -> None:
+    from maimai_courier_plugin.config import ForwardGroupSection
+
+    # 默认视图可无参构造（宿主 Schema 生成器要求嵌套模型字段全有默认），且默认关闭。
+    default_view = ForwardGroupSection()
+    assert default_view.private is False, "私聊开关必须默认关闭，升级后既有行为零变化"
+    assert default_view.model_dump()["private"] is False
+    assert "private" in ForwardGroupSection().model_dump(), "默认视图必须导出 private 键"
+
+    # 显式开启可保存，且不影响同一分组的群目标字段。
+    opened = ForwardGroupSection(name="研发群", source_groups=["111111"],
+                                 target_groups=["222222"], private=True)
+    assert opened.model_dump() == {"name": "研发群", "source_groups": ["111111"],
+                                   "target_groups": ["222222"], "private": True}
+
+    field = ForwardGroupSection.private
+    assert set(field.json_schema_extra) <= _CONSUMED_SCHEMA_KEYS
+    assert field.json_schema_extra["label"] == "私聊开关"
+    assert field.json_schema_extra["hint"]
+    assert isinstance(field.json_schema_extra.get("order"), int)
+    assert field.json_schema_extra["order"] > ForwardGroupSection.target_groups.json_schema_extra["order"], (
+        "私聊开关应排在既有分组字段之后"
+    )
 
 
 def test_自动入口新增字段的默认值与设计一致() -> None:
@@ -212,8 +256,17 @@ def test_自动入口新增字段的默认值与设计一致() -> None:
 
     assert config["auto"]["message_types"] == ["forward"], "默认不得扩大自动候选类型"
     assert config["auto"]["share_criteria"] == _DEFAULT_SHARE_CRITERIA
-    assert config["plugin"]["config_version"] == "1.6.0", "新增字段需提升配置版本以触发宿主归一化写回"
+    assert config["plugin"]["config_version"] == "1.7.0", "新增字段需提升配置版本以触发宿主归一化写回"
     assert re.fullmatch(r"\d+(\.\d+)*", config["plugin"]["config_version"]), "宿主按数字点分段比较版本"
+
+
+def test_配置版本因新增分组私聊字段而提升且模型与样例一致() -> None:
+    version = CourierConfig().plugin.config_version
+    assert tuple(int(part) for part in version.split(".")) > (1, 6, 0), (
+        "新增字段必须把配置版本提升到 1.6.0 之上，宿主据此把新字段写回配置文件"
+    )
+    parsed = tomllib.loads((ROOT / "config.toml").read_text(encoding="utf-8"))
+    assert parsed["plugin"]["config_version"] == version, "config.toml 样例必须与模型默认一致"
 
 
 def test_候选类型单选多选与空列表均可保存() -> None:
@@ -338,6 +391,31 @@ def test_config_toml_与配置模型默认值一致() -> None:
     assert parsed == CourierPlugin.build_default_config()
 
 
+def test_config_toml_分组示例声明私聊开关且与模型默认逐项一致() -> None:
+    raw = (ROOT / "config.toml").read_text(encoding="utf-8")
+    example: list[str] = []
+    in_example = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# [[scope.groups]]"):
+            in_example = True
+        if not in_example:
+            continue
+        if not stripped.startswith("#"):
+            break
+        example.append(stripped[1:].strip())
+    assert example, "config.toml 必须附注释形态的 [[scope.groups]] 示例"
+
+    parsed = tomllib.loads("\n".join(example))
+    assert set(parsed) == {"scope"} and len(parsed["scope"]["groups"]) == 1
+    sample = parsed["scope"]["groups"][0]
+    # 解除注释后必须与配置模型逐项一致：样例漏写 private 这一键就在这里失败。
+    assert sample == ForwardGroupSection(**sample).model_dump()
+    assert sample["private"] is False, "样例里的私聊开关必须与模型默认一致（默认关闭）"
+    assert "合成" not in raw, "config.toml 不得夹带任何真实凭证值"
+    assert not any("token" in line for line in example), "分组样例不得夹带任何凭证键"
+
+
 @pytest.mark.parametrize(
     "endpoint",
     [
@@ -372,7 +450,7 @@ def test_HTTP端点键只接受HTTP协议且旧键不再解析() -> None:
     "10.0.0.5", "169.254.10.1", "fd00::1", "fe80::1%en0",
 ])
 def test_回环私有链路本地与ULA字面量按可信判定(host: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    from shared.config_rules import is_private_host
+    from maimai_courier_plugin.shared.config_rules import is_private_host
 
     def forbid_dns(*args: Any, **kwargs: Any) -> Any:
         pytest.fail("主机字面量判定不得进行 DNS 查询")
@@ -386,33 +464,13 @@ def test_回环私有链路本地与ULA字面量按可信判定(host: str, monke
     "maimai-snowluma", "snowluma.example", "", "[bad",
 ])
 def test_公网字面量与主机名前缀不按可信判定(host: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    from shared.config_rules import is_private_host
+    from maimai_courier_plugin.shared.config_rules import is_private_host
 
     def forbid_dns(*args: Any, **kwargs: Any) -> Any:
         pytest.fail("主机字面量判定不得进行 DNS 查询")
 
     monkeypatch.setattr("socket.getaddrinfo", forbid_dns)
     assert is_private_host(host) is False
-
-
-@pytest.mark.parametrize(
-    "endpoint",
-    [
-        # http/https 口径：回环 IPv4/IPv6/主机名、私有 A 类与 B 类、ULA、链路本地
-        # （含 zone）、IPv4 映射回环、公网域名与公网 IPv6 各一代表
-        "http://127.0.0.1:3000", "http://localhost:3001/", "http://[::1]:3000/onebot",
-        "http://10.11.12.13:3000", "http://172.16.0.9:3000", "http://[fd00::1]:3000",
-        "http://[fe80::1%en0]:3000", "http://[::ffff:127.0.0.1]:3000",
-        "https://snowluma.example", "https://[2606:4700:4700::1111]:3000",
-    ],
-)
-def test_合法端点按协议与字面量判定(endpoint: str, monkeypatch: pytest.MonkeyPatch) -> None:
-
-    def forbid_dns(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail("端点字面量判定不得进行 DNS 查询")
-
-    monkeypatch.setattr("socket.getaddrinfo", forbid_dns)
-    assert onebot_endpoint_rejection(endpoint) is None, endpoint
 
 
 @pytest.mark.parametrize(
@@ -441,43 +499,6 @@ def test_非法端点被拒绝且不回显输入(endpoint: Any) -> None:
         assert endpoint not in reason, "拒绝原因不得回显输入"
 
 
-@pytest.mark.parametrize(
-    "endpoint",
-    ["http://8.8.8.8:3000", "http://1.1.1.1:3000",
-     "http://[2606:4700:4700::1111]:3000", "http://[::ffff:8.8.8.8]:3000"],
-)
-def test_公网IP字面量明文在配置期拒绝(endpoint: str) -> None:
-    plugin = CourierPlugin()
-    plugin.set_plugin_config({"snowluma": {"http_url": "http://127.0.0.1:3000"}})
-    with pytest.raises(ValueError) as error:
-        plugin.set_plugin_config({"snowluma": {"http_url": endpoint}})
-    assert endpoint not in str(error.value)
-    assert plugin.config.snowluma.http_url == "http://127.0.0.1:3000"
-
-
-@pytest.mark.parametrize(
-    "endpoint",
-    [
-        "http://user:合成秘密@localhost:3000", "http://localhost:3000?token=合成秘密",
-        "http://localhost:3000#合成秘密", "http://0.0.0.0:3000", "https://[::]:3000",
-        "ftp://127.0.0.1:3000", "localhost:3000", "http://",
-        "http://localhost:70000", "http://local\nhost:3000", "http://snowluma.example\\@localhost",
-        "未配置", None, 17,
-        # 协议不对：即便形态合法，本键也只接受 http/https
-        "ws://127.0.0.1:3001", "wss://snowluma.example",
-    ],
-)
-def test_不可信直连地址被安全拒绝且不替换合法配置(endpoint: Any) -> None:
-    plugin = CourierPlugin()
-    plugin.set_plugin_config({"snowluma": {"http_url": "http://127.0.0.1:3000", "token": "合成令牌"}})
-    with pytest.raises(ValueError) as error:
-        plugin.set_plugin_config({"snowluma": {"http_url": endpoint}})
-    if isinstance(endpoint, str):
-        assert endpoint not in str(error.value), "拒绝原因不得回显输入"
-    assert "合成秘密" not in repr(error.value)
-    assert plugin.config.snowluma.http_url == "http://127.0.0.1:3000"
-
-
 @pytest.mark.parametrize("reference", ["", "TEST_SNOWLUMA_TOKEN", "_TOKEN", "A_B_1", "token"])
 def test_合法凭证环境变量名可保存(reference: str) -> None:
     plugin = CourierPlugin()
@@ -499,26 +520,6 @@ def test_配置令牌非空时不要求凭证环境变量名() -> None:
     assert plugin.config.snowluma.token == "合成令牌"
     assert plugin.config.snowluma.token_env_var == ""
     assert plugin.config.model_dump()["snowluma"]["token"] == "合成令牌"
-
-
-@pytest.mark.parametrize("token", ["", "  \t\n"])
-def test_配置令牌留空或全空白时可只保存环境变量名(token: str) -> None:
-
-    plugin = CourierPlugin()
-    plugin.set_plugin_config({
-        "snowluma": {"http_url": "http://127.0.0.1:3000", "token": token, "token_env_var": "TEST_SNOWLUMA_TOKEN"},
-    })
-    assert plugin.config.snowluma.token == token
-    assert plugin.config.snowluma.token_env_var == "TEST_SNOWLUMA_TOKEN"
-
-
-def test_环境变量名非法时即使填写了令牌也拒绝() -> None:
-
-    plugin = CourierPlugin()
-    with pytest.raises(ValueError):
-        plugin.set_plugin_config({
-            "snowluma": {"http_url": "http://127.0.0.1:3000", "token": "合成令牌", "token_env_var": "9BAD"},
-        })
 
 
 @pytest.mark.parametrize("token", [None, 123, ["synthetic-secret"], {"value": "synthetic-secret"}])

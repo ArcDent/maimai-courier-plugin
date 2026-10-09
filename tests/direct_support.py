@@ -8,7 +8,8 @@
 
 装配口径与现行用例一致：账本用真实 SQLite 账本（`tests.support.open_test_ledger`），
 传输替身复用 `tests/snowluma_client_support.MemoryOneBotTransport`（`OneBotTransport`
-协议七动作 + `close`），平台源记录由宿主原始段经 `onebot_segments` 冻结映射得到。
+协议八动作 + `close`，好友名册与私聊路由参数由基类单点提供），平台源记录由宿主原始段
+经 `onebot_segments` 冻结映射得到。
 共享替身（可控时钟、几何常量、账本键、配置与工厂注入点、公共消息样本）一律取自
 `tests.support`，本模块只保留平台装配特有的部分。
 """
@@ -29,6 +30,7 @@ from tests.support import (
     HTTP_URL,
     MESSAGE_ID,
     OTHER_TARGET_GROUP_ID,
+    PRIVATE_USER_ID,  # 单一来源在 tests.support；经本模块转发给 test_lifecycle 的既有导入路径
     SOURCE_ACCOUNT_ID,
     SOURCE_GROUP_ID,
     SOURCE_SESSION_ID,

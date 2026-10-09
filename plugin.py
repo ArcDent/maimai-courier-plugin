@@ -7,7 +7,7 @@ import os
 from concurrent.futures import Future as WorkerFuture, ThreadPoolExecutor
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Callable, Final, Mapping
+from typing import Any, Awaitable, Callable, Final, Literal, Mapping
 
 from maibot_sdk import HookHandler, MaiBotPlugin, Tool
 
@@ -17,14 +17,22 @@ from .shared.clock import Clock, SystemClock
 from .config import CourierConfig
 from .delivery_ledger import LEDGER_FILE_NAME, DeliveryLedger, LedgerUnavailable, open_ledger
 from .forward_delivery import deliver_forward
-from .forward_precheck import PreparedForward, precheck_forward_request, shared_forward_group
-from .shared.result import DeliveryResult, STAGE_REJECTED, TOOL_STATUS_REJECTED, render_forward_result
-from .snowluma_client import SnowLumaClient
+from .forward_precheck import (PreparedForward, precheck_forward_request, resolve_source_session,
+                               shared_forward_group, source_group_is_allowed,
+                               source_group_private_allowed)
+from .shared.delivery import TARGET_KIND_GROUP, TARGET_KIND_PRIVATE, TargetKind
+from .shared.result import (DeliveryResult, STAGE_REJECTED, TOOL_STATUS_REJECTED,
+                            render_forward_result)
+from .send_material import friend_entry_identifier, friend_entry_nickname, friend_entry_remark
+from .snowluma_client import SnowLumaClient, business_failure, response_payload
 from .snowluma_transport import (AiohttpOneBotTransport, OneBotConnection, OneBotTransport,
-                                 OneBotUnresolved, resolve_onebot_connection)
+                                 OneBotUnavailable, OneBotUnresolved, resolve_onebot_connection)
 from .source_binding import (
+    FRIEND_LIST_TOOL_PARAMETERS,
     FORWARD_TOOL_NAME,
+    FORWARD_TOOL_NAMES,
     FORWARD_TOOL_PARAMETERS,
+    LIST_FORWARD_FRIENDS_TOOL_NAME,
     NOTHING_SENT_NOTE,
     Rejected,
     SourceBindingTable,
@@ -34,12 +42,7 @@ RECEIVE_AFTER_PROCESS_HOOK = "chat.receive.after_process"
 """观察已处理入站消息的宿主 Hook 名。"""
 
 PLANNER_AFTER_RESPONSE_HOOK = "maisaka.planner.after_response"
-"""签发一次性来源凭据的宿主 Hook。
-
-该 Hook 在模型输出工具调用后触发且允许改写 `output_items`
-（`allow_kwargs_mutation` 为 True），是工具侧唯一不可被模型伪造的来源：载荷由
-宿主构造，模型写不到 `session_id`。
-"""
+"""签发一次性来源凭据的宿主 Hook（允许改写 `output_items`，工具侧唯一不可伪造的来源）。"""
 
 BIND_FORWARD_SOURCE_HANDLER = "forward_message_source_binding"
 """来源绑定处理器组件名（模型不可见，仅供宿主分发与测试定位）。"""
@@ -59,16 +62,27 @@ TASK_EXIT_WAIT_SECONDS: Final[float] = 5.0
 MAX_INFLIGHT_DELIVERIES: Final[int] = 8
 """包括预检和等待在内的工具容量；不驱逐既有投递。"""
 
+MAX_FRIEND_ENTRIES: Final[int] = 500
+"""名册工具单次返回的条目上限（代码常量，不做成配置）：超出即截断并在结果中明示。"""
+
 TransportFactory = Callable[[OneBotConnection], OneBotTransport]
 LedgerFactory = Callable[[Path], DeliveryLedger | LedgerUnavailable]
 
 
-def _flattened_group_name(name: str) -> str:
-    """把分组名压平为单行定位文本（空白折叠为空格，剔除控制字符，其余原样保留）。
+def _target_label(target_group_id: str, target_user_id: str) -> str:
+    """任务表与告警里的目标定位文本：按目标形态区分「目标群=…」与「私聊=…」。
 
-    分组名不限长与字符集，但日志与任务描述必须保持单行；只压平显示形态，判定只认
-    群号，不用本函数的结果。
+    群号与好友 QQ 号是两个重叠的数字空间（ADR 0012），两种形态互斥、同一时刻只有
+    一个目标字段非空；两个目标字段都为空时按未知目标定位。名册备注与昵称从不进入。
     """
+
+    if not target_group_id.strip() and not target_user_id.strip():
+        return "目标=未知"
+    return f"私聊={target_user_id}" if target_user_id.strip() else f"目标群={target_group_id}"
+
+
+def _flattened_group_name(name: str) -> str:
+    """分组名压平为单行定位文本（空白折叠为空格、剔除控制字符）；判定只认群号。"""
 
     characters: list[str] = []
     for character in name:
@@ -82,7 +96,7 @@ def _flattened_group_name(name: str) -> str:
 
 
 class CourierPlugin(MaiBotPlugin):
-    """插件主类：三生命周期 + 一个群聊 Tool + 来源绑定与观察两个 Hook。"""
+    """插件主类：三生命周期 + 两个群聊 Tool + 来源绑定与观察两个 Hook。"""
 
     config_model = CourierConfig
 
@@ -130,15 +144,15 @@ class CourierPlugin(MaiBotPlugin):
         task.add_done_callback(self._forget_task)
 
     def get_components(self) -> list[dict[str, Any]]:
-        """把转发 Tool 的 `chat_scope` 提到组件声明**顶层**（承载性修正）。
+        """把两个群聊 Tool 的 `chat_scope` 提到组件声明顶层（承载性修正）。
 
-        Runner 只读组件声明顶层的 `chat_scope`（缺省回落 `"all"`），而
-        `@Tool(chat_scope=…)` 经 SDK 只会落进组件 metadata。不覆写这一层，群聊
-        专用的转发工具会在私聊会话中同样可见（可见性过滤失效）。
+        Runner 只读顶层 `chat_scope`（缺省回落 `"all"`），`@Tool(chat_scope=…)` 经
+        SDK 只落进 metadata；不覆写这一层，群聊专用工具会在私聊可见。按
+        `FORWARD_TOOL_NAMES` 清单统一判定，不逐个写死工具名。
         """
         components = super().get_components()
         for component in components:
-            if str(component.get("name") or "") != FORWARD_TOOL_NAME:
+            if str(component.get("name") or "") not in FORWARD_TOOL_NAMES:
                 continue
             component["chat_scope"] = "group"
             metadata = component.get("metadata")
@@ -242,12 +256,10 @@ class CourierPlugin(MaiBotPlugin):
                 self.config.snowluma.token)
 
     def _adopt_client(self, connection: OneBotConnection | OneBotUnresolved) -> SnowLumaClient | None:
-        """按连接构造客户端，并写入 `_client`/`_connection`/`_client_generation` 三字段。
+        """客户端实例的唯一写点：按连接构造并写入 `_client`/`_connection`/`_client_generation`。
 
-        客户端实例的唯一写点：工具路径连接替换尾段与自动路径惰性创建都经本方法落账；
-        刷新策略（工具路径的连接替换/关闭竞裁与代次比较）留在各自调用方，不在这里合并
-        语义。连接不可解析（端点未配置、地址非法或凭证缺失）时返回 `None`，不构造、
-        不改写既有实例。
+        连接不可解析（端点未配置、地址非法或凭证缺失）时返回 `None`，不构造、不改写
+        既有实例；刷新策略（连接替换与代次比较）留在各自调用方。
         """
 
         if isinstance(connection, OneBotUnresolved):
@@ -282,9 +294,7 @@ class CourierPlugin(MaiBotPlugin):
     def _auto_entry_invalid(self, candidate: ForwardCandidate) -> bool:
         """待执行自动判断是否已失效：已卸载，或最新配置不再允许对该候选唤起。
 
-        判定复用 `auto_entry.auto_entry_invalid_reason`（与等待结束后的重验同一谓词，
-        含候选类型：类型被移出自动候选类型同样失效）；本方法只决定「现在要不要取消」，
-        不负责取消时机之外的事情。
+        复用 `auto_entry.auto_entry_invalid_reason`（与等待结束后的重验同一谓词）。
         """
 
         return self._closed or bool(
@@ -300,31 +310,54 @@ class CourierPlugin(MaiBotPlugin):
     @Tool(
         FORWARD_TOOL_NAME,
         description=(
-            "把本群的一条消息转发到允许的目标群，可附带一条评论。"
-            "只接受 message_id、target_group_id 和可选 comment 三个字符串参数，"
-            "不支持或无法完整恢复的内容会被明确拒绝。"
+            "把本群的一条消息转发到允许的目标：目标群或私聊对端，可附带一条评论。"
+            "只接受 message_id、target_group_id 与 target_user_id 二选一，以及可选 comment "
+            "四个字符串参数，不支持或无法完整恢复的内容会被明确拒绝。"
         ),
         parameters=FORWARD_TOOL_PARAMETERS,
         chat_scope="group",
     )
     async def forward_message(self, **kwargs: Any) -> dict[str, Any]:
         """有限在途容量覆盖预检到结束；所有退出路径都释放名额。"""
+        return await self._inflight_guard(
+            f"投递繁忙：已有 {MAX_INFLIGHT_DELIVERIES} 个在途请求，本次未发送任何消息",
+            lambda reason: self._finish(self._render_rejection(reason, kwargs)),
+            lambda: self._forward_request(**kwargs),
+        )
+
+    async def _inflight_guard(
+        self,
+        busy_reason: str,
+        reject: Callable[[str], dict[str, Any]],
+        operation: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """有限在途容量（代码常量，不驱逐既有投递）：判满按调用方拒绝面返回。
+
+        预检与等待都算在途；转发工具与名册工具共用同一名额，拒绝面经 `reject` 工厂
+        由调用方给出。
+        """
+
         if self._inflight >= MAX_INFLIGHT_DELIVERIES:
-            return self._finish(self._render_rejection("投递繁忙：已有八个在途请求，本次未发送任何消息", kwargs))
+            return reject(busy_reason)
         self._inflight += 1
         try:
-            return await self._forward_request(**kwargs)
+            return await operation()
         finally:
             self._inflight -= 1
+
+    def _offline_reason(self) -> str:
+        """插件不可用的统一原因文案：卸载与总开关关闭共用一句，不各自复制。"""
+
+        return "插件已卸载" if self._closed else "插件总开关关闭"
 
     async def _forward_request(self, **kwargs: Any) -> dict[str, Any]:
         """可信来源预检后交给本地账本与直连编排；所有权限从最新配置读取。
 
-        连接替换只在旧投递结束后进行，关闭等待结束后仍须复验，不能借卸载竞态
-        创建新任务。发送的最后许可交给传输同步回调，而不是只靠本处预检。
+        连接替换只在旧投递结束后进行，关闭等待结束后仍须复验；发送的最后许可交给
+        传输同步回调，不只靠本处预检。
         """
         if not self._is_live():
-            reason = "插件已卸载" if self._closed else "插件总开关关闭"
+            reason = self._offline_reason()
             return self._finish(self._render_rejection(f"{reason}，{NOTHING_SENT_NOTE}", kwargs))
 
         signature = self._connection_signature()
@@ -336,6 +369,12 @@ class CourierPlugin(MaiBotPlugin):
         if isinstance(outcome, Rejected):
             return self._finish(self._render_rejection(outcome.reason, kwargs))
         group_label = self._group_label(outcome)
+        # 目标定位按形态展示：两个目标字段同一时刻只有一个非空（参数解析时已判
+        # 二选一），名册备注与昵称从不进入任务表。
+        target = _target_label(
+            outcome.arguments.target_group_id,
+            outcome.arguments.target_user_id,
+        )
         if (not self._send_allowed(outcome) or generation != self._config_generation
                 or signature != self._connection_signature()):
             return self._finish(self._render_rejection(Rejected.not_sent("源发送前权限复验未通过（插件已卸载、开关或配置变化）").reason, kwargs), group_label)
@@ -350,7 +389,7 @@ class CourierPlugin(MaiBotPlugin):
             self._client_refreshing = True
             try:
                 close_task = self._start_client_close(
-                    f"旧连接关闭（源消息={outcome.arguments.message_id}，目标群={outcome.arguments.target_group_id}，阶段=连接替换）")
+                    f"旧连接关闭（源消息={outcome.arguments.message_id}，{target}，阶段=连接替换）")
                 await asyncio.shield(close_task)
             except (Exception, asyncio.CancelledError):
                 return self._finish(self._render_rejection("旧连接关闭未确认，拒绝新投递", kwargs), group_label)
@@ -365,7 +404,7 @@ class CourierPlugin(MaiBotPlugin):
             self._adopt_client(connection)
         assert self._client is not None
         prefix = f"分组={group_label}，" if group_label else ""
-        label = f"投递（{prefix}源消息={outcome.arguments.message_id}，目标群={outcome.arguments.target_group_id}"
+        label = f"投递（{prefix}源消息={outcome.arguments.message_id}，{target}"
         def stage_changed(stage: str) -> None:
             description = f"{label}，阶段={stage}）"
             self._task_origin.set(description)
@@ -383,18 +422,27 @@ class CourierPlugin(MaiBotPlugin):
         self._register_task(task, f"{label}，阶段=源准备）")
         result = await task
         return self._finish(render_forward_result(result, material=outcome.material,
-            source_message_id=outcome.arguments.message_id, target_group_id=outcome.arguments.target_group_id),
+            source_message_id=outcome.arguments.message_id,
+            target_group_id=outcome.arguments.target_group_id,
+            target_kind=outcome.arguments.target_kind,
+            target_user_id=outcome.arguments.target_user_id),
             group_label)
 
     def _send_allowed(self, prepared: PreparedForward) -> bool:
-        """同步复验最新开关与同组判定；源和评论实际提交前均复用。
+        """同步复验最新开关与目标判定；源和评论实际提交前均复用（按形态分治）。
 
-        成对判定（`shared_forward_group`）从 `self.config` 现算：预检与复验不共享中间
-        缓存，分组收紧（目标被移出来源群所属分组）在评论提交前同样拦截，已提交的源
-        投递不回滚。
+        都从 `self.config` 现算，不共享中间缓存：群目标走成对判定
+        （`shared_forward_group`，目标被移出来源群所属分组在评论提交前同样拦截，
+        已提交的源投递不回滚）；私聊目标改判分组私聊开关（`source_group_private_allowed`，
+        与预检私聊分支同一单点判定）。私聊目标的 `target_group_id` 是空串，群成对
+        判定对它必然不命中；反过来，`private` 开关也不放宽任何群目标判定。
         """
 
-        return self._is_live() and shared_forward_group(
+        if not self._is_live():
+            return False
+        if prepared.arguments.target_kind == TARGET_KIND_PRIVATE:
+            return source_group_private_allowed(self.config, prepared.source.group_id)
+        return shared_forward_group(
             self.config,
             prepared.source.group_id,
             prepared.arguments.target_group_id,
@@ -403,10 +451,12 @@ class CourierPlugin(MaiBotPlugin):
     def _group_label(self, prepared: PreparedForward) -> str:
         """本次投递所属转发分组的压平显示名（得不到分组名时返回空串）。
 
-        分组名只作日志与任务描述定位：压平空白与控制字符成单行文本，不作为任何判定
-        输入（判定只认群号，`shared_forward_group` 返回的是原始去空白组名）。
+        分组名只作日志与任务描述定位，不作为任何判定输入；私聊目标没有目标群号，
+        成对判定必然不命中，直接早退空串。
         """
 
+        if prepared.arguments.target_kind == TARGET_KIND_PRIVATE:
+            return ""
         name = shared_forward_group(
             self.config,
             prepared.source.group_id,
@@ -417,47 +467,164 @@ class CourierPlugin(MaiBotPlugin):
     def _finish(self, rendered: dict[str, Any], group_label: str = "") -> dict[str, Any]:
         """记录可定位的失败信息并返回结果（完整成功不额外记录）。
 
-        日志只含分组名（压平后）、阶段、源消息 ID、目标群 ID、状态与中文原因：不回显
-        评论正文、不输出一次性来源凭据，也不生成任何摘要或评论副本。
+        日志只含压平分组名、阶段、源消息 ID、按形态的目标定位、状态与中文原因：
+        不回显评论正文、不输出一次性来源凭据。
         """
 
         if not rendered["success"]:
             prefix = f"分组={group_label}，" if group_label else ""
+            target = _target_label(
+                str(rendered["target_group_id"] or ""),
+                str(rendered["target_user_id"] or ""),
+            )
             self.ctx.logger.warning(
                 f"转发未完成：{prefix}阶段={rendered['stage'] or 'none'}，"
                 f"源消息={rendered['source_message_id'] or '未知'}，"
-                f"目标群={rendered['target_group_id'] or '未知'}，"
+                f"{target}，"
                 f"状态={rendered['status']}，原因={rendered['reason']}"
             )
         return rendered
 
     def _render_rejection(self, reason: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        """渲染拒绝结果：与投递结果同形，并尽力带回模型声明的源消息与目标群用于定位。
+        """渲染拒绝结果：与投递结果同形，并尽力带回模型声明的源消息与目标用于定位。
 
-        只读取调用参数里的字符串（模型声明值），不做任何取值、查询或发送；预检未
-        通过时没有任何已准备的材料，因此结果里不含材料键。
+        只读取调用参数里的字符串，不做任何取值、查询或发送；预检未通过时尚无材料，
+        结果不含材料键。目标按形态带回，两个目标参数都缺失或非法时形态留空、不猜测。
         """
 
+        target_group_id = _argument_text(arguments, "target_group_id")
+        target_user_id = _argument_text(arguments, "target_user_id")
+        target_kind: TargetKind | Literal[""] = (
+            TARGET_KIND_PRIVATE if target_user_id
+            else TARGET_KIND_GROUP if target_group_id
+            else ""
+        )
         return render_forward_result(
             DeliveryResult(status=TOOL_STATUS_REJECTED, stage=STAGE_REJECTED, reason=reason),
             source_message_id=_argument_text(arguments, "message_id"),
-            target_group_id=_argument_text(arguments, "target_group_id"),
+            target_group_id=target_group_id,
+            target_kind=target_kind,
+            target_user_id=target_user_id,
         )
+
+    # ------------------------------------------------------------------ 名册工具入口
+
+    @Tool(
+        LIST_FORWARD_FRIENDS_TOOL_NAME,
+        description=(
+            "只读列出当前 QQ 账号的好友名册：仅当本群所在转发分组开启私聊转发（private）时"
+            "可用，不发送任何消息。只返回好友 QQ 号、备注与昵称，不代做匹配、排序或候选收敛，"
+            "选择私聊转发目标由调用方自行完成。无参数。"
+        ),
+        parameters=FRIEND_LIST_TOOL_PARAMETERS,
+        chat_scope="group",
+    )
+    async def list_forward_friends(self, **kwargs: Any) -> dict[str, Any]:
+        """与转发工具共用同一在途容量；所有退出路径都释放名额，任何路径都不发送。"""
+        return await self._inflight_guard(
+            f"名册查询繁忙：已有 {MAX_INFLIGHT_DELIVERIES} 个在途请求",
+            self._friend_list_rejection,
+            lambda: self._list_forward_friends(**kwargs),
+        )
+
+    async def _list_forward_friends(self, **kwargs: Any) -> dict[str, Any]:
+        """凭据换可信来源 → 分组私聊开关 → 只读名册查询；所有拒绝都早于任何平台请求。
+
+        查询走固定只读动作 `get_friend_list`，只用一次即关（本次调用自建传输），
+        不进入任何发送阶段、不重试；条目数超过 `MAX_FRIEND_ENTRIES` 即截断并在
+        结果中明示。
+        """
+
+        if not self._is_live():
+            reason = self._offline_reason()
+            return self._friend_list_rejection(reason)
+        # 名册凭据只绑会话：哨兵消息 ID 收在凭据表内（`consume_roster`），调用方
+        # 不需要知道它，也不会把转发工具的 message_id 绑定语义带到名册路径上。
+        session_id = self._bindings.consume_roster(kwargs)
+        if session_id is None:
+            return self._friend_list_rejection(
+                "无法确认本次调用的可信来源（不接受模型提供的会话或授权字段）"
+            )
+        # 会话→来源群解析与转发预检共用 `resolve_source_session` 单点定义（查找、
+        # 字段归一、群聊/平台校验同一口径）；账号核对是转发侧步骤，名册不需要。
+        source = await resolve_source_session(self.ctx, session_id)
+        if isinstance(source, Rejected):
+            return self._friend_list_rejection(source.reason)
+        source_group_id = source.group_id
+        if not source_group_is_allowed(self.config, source_group_id):
+            return self._friend_list_rejection("调用来源群不在任何转发分组内")
+        # 私聊许可判定与预检私聊分支、提交前复验三处共用 `source_group_private_allowed`。
+        if not source_group_private_allowed(self.config, source_group_id):
+            return self._friend_list_rejection(
+                "来源群所属分组未开启私聊转发（private 开关为假），拒绝提供好友名册"
+            )
+        connection = resolve_onebot_connection(self.config, self._environ)
+        if isinstance(connection, OneBotUnresolved):
+            return self._friend_list_rejection(connection.reason)
+        transport = self._transport_factory(connection)
+        try:
+            response = await transport.get_friend_list()
+        except OneBotUnavailable as error:
+            return self._friend_list_rejection(f"好友名册查询不可用（类别={error.category}）")
+        finally:
+            await self._close_roster_transport(transport)
+        roster = response_payload(response)
+        if not isinstance(roster, list):
+            return self._friend_list_rejection(
+                "平台明确拒绝好友名册查询（业务失败）" if business_failure(response)
+                else "好友名册查询结果不可识别（未返回条目数组）"
+            )
+        entries: list[dict[str, str]] = []
+        for item in roster[:MAX_FRIEND_ENTRIES]:
+            identifier = friend_entry_identifier(item)
+            if not identifier:
+                return self._friend_list_rejection("好友名册条目字段不可识别（QQ 号不可确认）")
+            entries.append({
+                "user_id": identifier,
+                "remark": friend_entry_remark(item),
+                "nickname": friend_entry_nickname(item),
+            })
+        truncated = len(roster) > MAX_FRIEND_ENTRIES
+        # 名册数据最小暴露面：日志只记查询类别与条目数，不记任何条目字段。
+        self.ctx.logger.info(
+            f"好友名册只读查询：类别=好友名册，条目数={len(entries)}，已截断={truncated}"
+        )
+        result: dict[str, Any] = {"success": True, "friends": entries, "truncated": truncated}
+        if truncated:
+            result["note"] = (
+                f"名册共 {len(roster)} 条，仅返回前 {MAX_FRIEND_ENTRIES} 条（已截断）"
+            )
+        return result
+
+    async def _close_roster_transport(self, transport: OneBotTransport) -> None:
+        """名册查询的传输只用一次即关：关闭失败不影响已取得的数据，也不重试。"""
+
+        try:
+            await transport.close()
+        except Exception:
+            pass
+
+    def _friend_list_rejection(self, reason: str) -> dict[str, Any]:
+        """名册工具的拒绝面：只含可定位原因，不含任何名册条目。"""
+
+        located = Rejected.not_sent(reason).reason
+        self.ctx.logger.warning(f"好友名册查询未完成：原因={located}")
+        return {"success": False, "reason": located}
 
     # ------------------------------------------------------------------ Hook
 
     @HookHandler(
         PLANNER_AFTER_RESPONSE_HOOK,
         name=BIND_FORWARD_SOURCE_HANDLER,
-        description="模型输出工具调用后：为本轮 forward_message 签发一次性可信来源凭据。",
+        description="模型输出工具调用后：为本轮本插件工具调用（转发与名册）签发一次性可信来源凭据。",
         mode=BLOCKING_HOOK_MODE,
         order=EARLY_HOOK_ORDER,
     )
     async def bind_forward_source(self, **kwargs: Any) -> dict[str, Any]:
         """在本轮 Planner 输出上签发来源凭据（模型参数里带不进可信会话）。
 
-        载荷由宿主构造（`session_id` + `output_items`），处理器只把转发调用改写为
-        「公开参数 + 本次一次性凭据」；`modified_kwargs` 随后成为工具调用的参数。
+        载荷由宿主构造（`session_id` + `output_items`），只把指向本插件两个工具的
+        调用改写为「公开参数 + 本次一次性凭据」（同批其它工具原样保留且不获凭据）。
         插件关闭或已卸载时不改写、不签发，工具调用自然拒绝。
         """
         if not self._is_live():
@@ -479,10 +646,9 @@ class CourierPlugin(MaiBotPlugin):
     async def observe_received_message(self, **kwargs: Any) -> None:
         """观察已处理入站消息：筛选自动入口候选并在后台给出一次判断机会。
 
-        观察模式由宿主后台分发，返回值不参与聚合，因此这里既不拦截也不改写原
-        消息处理。默认关闭或自动入口关闭时直接返回，不产生任何宿主调用；候选
-        筛选与去重登记都在本协程内同步完成，随后把「确认可读取 → 唤起源群判断」
-        交给本插件自己的后台任务。
+        观察模式由宿主后台分发，返回值不参与聚合，因此既不拦截也不改写原消息
+        处理；候选筛选与去重登记都在本协程内同步完成，随后把「确认可读取 →
+        唤起源群判断」交给本插件自己的后台任务。
         """
         if self._auto_entry_config() is None:
             return
@@ -517,11 +683,9 @@ class CourierPlugin(MaiBotPlugin):
     def _auto_entry_client(self) -> SnowLumaClient | None:
         """自动路径只读查询用的客户端：复用工具路径实例，连接不符时按当前配置重建。
 
-        与 `_forward_request` 同一惰性创建口径：连接不可解析（端点未配置、地址非法或
-        凭证缺失）时返回 `None`，组合根据此跳过预搜索。创建后的客户端与工具路径复用
-        同一实例（连接相同不触发替换）；自动路径只创建/复用、不关闭旧连接——HTTP 无
-        长连接，旧客户端的在途请求由各自持有的引用自行收尾，连接替换与关闭竞裁仍只由
-        工具路径负责。构造与三字段写入都走 `_adopt_client` 单写点。
+        与 `_forward_request` 同一惰性创建口径；自动路径只创建/复用、不关闭旧连接
+        （HTTP 无长连接，旧客户端的在途请求由各自持有的引用自行收尾，连接替换与
+        关闭竞裁仍只由工具路径负责）。
         """
 
         connection = resolve_onebot_connection(self.config, self._environ)
@@ -532,10 +696,9 @@ class CourierPlugin(MaiBotPlugin):
     async def _presearch_card_content(self, candidate: ForwardCandidate) -> str | None:
         """自动入口的卡片内容预搜索（`run_auto_entry` 的 `presearch` 缝隙）。
 
-        命中嵌套内层卡片返回拒绝原因（据此不提供判断机会并记录可定位日志）；客户端
-        不可用（连接不可解析）与任何查询异常都返回 `None` 放行：照常给源群
-        一次判断机会，能否发送由工具路径在发送前权威拒绝。查询只读、有界，与工具路径
-        共用同一传输替身，不设置提交许可闸门。
+        命中嵌套内层卡片返回拒绝原因（据此不提供判断机会）；客户端不可用与任何
+        查询异常都返回 `None` 放行，能否发送由工具路径在发送前权威拒绝。查询只读、
+        有界，不设置提交许可闸门。
         """
 
         if self._closed:
@@ -589,8 +752,7 @@ class CourierPlugin(MaiBotPlugin):
         """等待结束后读一次最新配置快照；不可继续自动判断时返回 None。
 
         自动判断不缓存配置：等待期间的热更新必须对「还要不要唤起」生效，同组目标
-        的增删也按同一份最新快照重新计算。观察 Hook 入口也经本判定早退（与等待结束
-        后的判定同源），卸载标记同样在此生效。
+        的增删也按同一份最新快照重新计算；观察 Hook 入口也经本判定早退。
         """
 
         if not self._is_live() or not self.config.auto.enabled:

@@ -1,8 +1,7 @@
 """共享投递结果面：状态词汇、结果类型与唯一的结果渲染。
 
-结果状态与渲染口径只有这一份定义，编排与客户端都从这里导入。本模块不依赖
-插件侧模块：材料只按结构面（`kind` + `shape`）渲染，不导入 `send_material`，
-因此无 `maibot_sdk` 的解释器可以直接导入。
+状态与渲染口径只有这一份定义，编排与客户端都从这里导入。本模块不依赖插件侧
+模块：材料只按结构面（`kind` + `shape`）渲染，不导入 `send_material`。
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final, Literal, Protocol, Union
 
-from .delivery import LedgerStatus, SendStatus
+from .delivery import LedgerStatus, SendStatus, TargetKind
 
 ToolStatus = Union[
     LedgerStatus,
@@ -47,9 +46,8 @@ TOOL_STATUS_LEDGER_UNAVAILABLE: Final[ToolStatus] = "ledger_unavailable"
 class SourceSendResult:
     """源消息与评论共用的发送结果面。
 
-    - `sent`：拿到真实目标消息 ID（`target_message_id` 必须非空）；
-    - `failed`：明确没有发出任何消息；
-    - `unknown`：超时、取消、回执丢失等无法确认的结果（调用方按待核实处理）。
+    `sent` 必须带真实目标消息 ID；`failed` 是明确未发送；`unknown` 是超时、取消、
+    回执丢失等无法确认的结果（调用方按待核实处理）。
     """
 
     status: SendStatus
@@ -86,10 +84,9 @@ COMMENT_DELAY_SECONDS: Final[float] = 0.5
 class DeliveryResult:
     """投递结果：供工具入口组装结果字典。
 
-    `sent` 表示源消息**已确认投递**（本次或既有成功记录）；`delivered` 是其派生
-    视图（同一语义，避免两个字段恒等重复）；`already_forwarded` 表示本次没有产生
-    新的发送；`target_message_id` 是已取得的真实目标消息 ID；`comment_status` 是
-    本记录上已保存的评论结果。
+    `sent` 表示源消息已确认投递（本次或既有成功记录）；`delivered` 是其同语义派生
+    视图；`target_message_id` 是已取得的真实目标消息 ID；`comment_status` 是本记录
+    已保存的评论结果。
     """
 
     status: ToolStatus
@@ -112,7 +109,7 @@ class MaterialSummary(Protocol):
     """材料摘要的结构面：种类 + 结构指纹（只有段类型与嵌套、不含正文）。
 
     `send_material.SendMaterial` 天然满足本协议；渲染只读这两个属性，不导入插件侧
-    模块，也不复制材料正文。
+    模块。
     """
 
     @property
@@ -128,13 +125,18 @@ def render_forward_result(
     material: MaterialSummary | None = None,
     source_message_id: str = "",
     target_group_id: str = "",
+    target_kind: TargetKind | Literal[""] = "",
+    target_user_id: str = "",
 ) -> dict[str, Any]:
     """把投递结果组装成统一工具结果面（唯一的结果口径）。
 
     `success` 只在完整成功时为 true（`sent` / `already_forwarded`）；部分成功、
-    待核实与已知回执但未落盘都不是完整成功。`sent` / `delivered` 只表示源消息
-    已确认投递（含既有成功记录）。`material` 只在预检通过后传入：拒绝分支没有
+    待核实与已知回执但未落盘都不是。`material` 只在预检通过后传入：拒绝分支没有
     已准备的材料，不得声称材料完整。
+
+    结果面按目标形态标明目标标识：群目标走 `target_group_id`，私聊目标走
+    `target_user_id`，`target_kind` 由调用方按本次投递形态显式给出；好友名册条目
+    只进名册工具自己的结果，本渲染不夹带。
     """
 
     rendered: dict[str, Any] = {
@@ -148,6 +150,8 @@ def render_forward_result(
         "comment_message_id": result.comment_message_id,
         "source_message_id": source_message_id,
         "target_group_id": target_group_id,
+        "target_kind": target_kind,
+        "target_user_id": target_user_id,
         "stage": result.stage,
         "reason": result.reason,
     }

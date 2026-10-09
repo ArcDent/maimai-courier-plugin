@@ -2,10 +2,12 @@
 
 断言面只经 `forward_precheck` 公开导出（`precheck_forward_request` /
 `group_id_entries` / `forward_group_entries` / `shared_forward_group` /
-`source_group_is_allowed` / `PreparedForward`）：凭据换可信会话、转发分组与异群、
-顶层唯一卡片校验（混排拒绝）、按可信会话的源消息归属核验。卡片材料只取标识与归属核验（与客户端
+`source_group_is_allowed` / `source_group_private_allowed` / `PreparedForward`）与
+`source_binding.parse_forward_arguments` 及插件公共入口 `get_components()`：凭据换可信会话、双形态目标
+（`target_group_id` / `target_user_id` 二选一）与私聊分组开关、转发分组与异群、顶层唯一卡片校验
+（混排拒绝）、按可信会话的源消息归属核验。卡片材料只取标识与归属核验（与客户端
 `SnowLumaClient.prepare_source` 的判定口径一致，不重复构造材料）；普通消息仍走
-`send_material` 的完整内容预检。替身宿主按保留链样本构造
+`send_material` 的完整内容预检；好友核验不在本地预检内（由直连准备阶段完成）。替身宿主按保留链样本构造
 （`tests/snowluma_client_support` 的 `host_message`），不触真实网络。
 """
 
@@ -28,12 +30,21 @@ from maimai_courier_plugin.forward_precheck import (
     precheck_forward_request,
     shared_forward_group,
     source_group_is_allowed,
+    source_group_private_allowed,
     group_id_entries,
 )
-from maimai_courier_plugin.send_material import SendMaterial, UnsupportedContent, is_forward_card
-from maimai_courier_plugin.shared.identifiers import verbatim_identifier
+from maimai_courier_plugin.plugin import create_plugin
+from maimai_courier_plugin.send_material import SendMaterial, is_forward_card
 from maimai_courier_plugin.shared.send_steps import SOURCE_KIND_VALUES, PreparedSource
-from maimai_courier_plugin.source_binding import SourceBindingTable
+from maimai_courier_plugin.source_binding import (
+    NOTHING_SENT_NOTE,
+    PUBLIC_FORWARD_ARGUMENTS,
+    REQUIRED_FORWARD_ARGUMENTS,
+    ForwardArguments,
+    Rejected,
+    SourceBindingTable,
+    parse_forward_arguments,
+)
 from maimai_courier_plugin.snowluma_client import SnowLumaClient
 from tests.snowluma_client_support import (
     MemoryOneBotTransport, SOURCE_MESSAGE_ID, host_message, trusted_forward,
@@ -84,14 +95,18 @@ def enabled_config(
 
 def issue_call(
     bindings: SourceBindingTable, *, message_id: str = SOURCE_MESSAGE_ID,
-    target: str = "222", comment: str = "",
+    target: str = "222", user: str = "", comment: str = "",
 ) -> dict[str, Any]:
 
+    arguments: dict[str, Any] = {"message_id": message_id, "comment": comment}
+    if target:
+        arguments["target_group_id"] = target
+    if user:
+        arguments["target_user_id"] = user
     items = bindings.sanitize_and_bind_output_items(SOURCE_SESSION_ID, [{
         "item_type": "FunctionCallItem",
         "tool_call": {"func_name": "forward_message",
-                      "args": {"message_id": message_id, "target_group_id": target,
-                               "comment": comment}},
+                      "args": arguments},
     }])
     return items[0]["tool_call"]["args"]
 
@@ -129,7 +144,8 @@ def host_context(host: FakeMessageHost) -> Any:
 
 
 async def run_precheck(
-    stored: Any, *, message_id: str = SOURCE_MESSAGE_ID, target: str = "222", comment: str = "",
+    stored: Any, *, message_id: str = SOURCE_MESSAGE_ID, target: str = "222", user: str = "",
+    comment: str = "",
     streams: list[dict[str, Any]] | None = None, fail_streams: bool = False,
     fail_message: bool = False, source_groups: tuple[str, ...] = ("111",),
     target_groups: tuple[str, ...] = ("222", "111"), groups: list[dict[str, Any]] | None = None,
@@ -139,7 +155,7 @@ async def run_precheck(
 
     bindings = SourceBindingTable()
     arguments = issue_call(bindings, message_id=token_message_id or message_id,
-                           target=target, comment=comment)
+                           target=target, user=user, comment=comment)
     # 模型可以改写自己看到的参数：这里把 message_id 换成另一个值，模拟不一致调用。
     arguments["message_id"] = message_id
     if poison:
@@ -174,6 +190,91 @@ class ExpandingTransport(MemoryOneBotTransport):
     def __init__(self) -> None:
         super().__init__()
         self.expanded = {"messages": [deepcopy(node) for node in EXPANDED_NODES]}
+
+
+def tool_component() -> dict[str, Any]:
+    """经公共工厂读取 `forward_message` 的组件声明（Runner 同款入口）。"""
+
+    plugin = create_plugin()
+    for component in plugin.get_components():
+        if component.get("type") == "TOOL" and component.get("name") == "forward_message":
+            return component
+    raise AssertionError(f"未注册 forward_message 工具：{plugin.get_components()}")
+
+
+# --- 3.1：双形态目标参数声明 ------------------------------------------------------
+
+
+def test_转发工具参数声明为消息ID加二选一目标与可选评论() -> None:
+    tool = tool_component()
+
+    assert tool["chat_scope"] == "group"
+    schema = tool["metadata"]["parameters_raw"]
+    assert schema["type"] == "object"
+    assert set(schema["properties"]) == set(PUBLIC_FORWARD_ARGUMENTS), (
+        "声明的公开参数必须与 PUBLIC_FORWARD_ARGUMENTS 常量一致"
+    )
+    assert schema["required"] == list(REQUIRED_FORWARD_ARGUMENTS), (
+        "必填声明必须由 REQUIRED_FORWARD_ARGUMENTS 常量驱动"
+    )
+    assert schema["required"] == ["message_id"], "两个目标参数二选一，都不是必填"
+    for name in PUBLIC_FORWARD_ARGUMENTS:
+        assert schema["properties"][name]["type"] == "string", f"{name} 必须是字符串参数"
+    assert schema["properties"]["comment"].get("default") == "", "comment 默认空字符串"
+
+
+def test_目标参数二选一同缺同在均拒绝且不默认任一目标() -> None:
+    # 同缺：两个目标参数都没提供。
+    result = parse_forward_arguments({"message_id": SOURCE_MESSAGE_ID})
+    assert isinstance(result, Rejected)
+    assert "二选一" in result.reason
+    assert result.reason.endswith(f"，{NOTHING_SENT_NOTE}")
+
+    # 同在：两个目标参数同时提供。
+    result = parse_forward_arguments({"message_id": SOURCE_MESSAGE_ID,
+                                      "target_group_id": "222", "target_user_id": "30001"})
+    assert isinstance(result, Rejected)
+    assert "二选一" in result.reason
+    assert result.reason.endswith(f"，{NOTHING_SENT_NOTE}")
+
+    # 全空白同样按未提供处理，不默认选群也不默认选私聊。
+    result = parse_forward_arguments({"message_id": SOURCE_MESSAGE_ID,
+                                      "target_group_id": "  ", "target_user_id": ""})
+    assert isinstance(result, Rejected)
+    assert "二选一" in result.reason
+
+
+def test_目标参数非字符串拒绝且合法形态各自解析() -> None:
+    for name in ("target_group_id", "target_user_id"):
+        result = parse_forward_arguments({"message_id": SOURCE_MESSAGE_ID, name: 30001})
+        assert isinstance(result, Rejected)
+        assert f"参数 {name} 必须是字符串" in result.reason
+        assert result.reason.endswith(f"，{NOTHING_SENT_NOTE}")
+
+    group = parse_forward_arguments({"message_id": SOURCE_MESSAGE_ID, "target_group_id": " 222 ",
+                                     "comment": "评论"})
+    assert group == ForwardArguments(message_id=SOURCE_MESSAGE_ID, target_group_id="222",
+                                     target_user_id="", comment="评论")
+    assert group.target_kind == "group"
+
+    private = parse_forward_arguments({"message_id": SOURCE_MESSAGE_ID, "target_user_id": " 30001 "})
+    assert private == ForwardArguments(message_id=SOURCE_MESSAGE_ID, target_group_id="",
+                                       target_user_id="30001", comment="")
+    assert private.target_kind == "private"
+
+
+def test_二选一互斥在预检发送前拒绝且不查询宿主() -> None:
+    async def scenario() -> None:
+        stored = host_stored(SOURCE_MESSAGE_ID)
+        # 同缺：不查询会话与消息，直接拒绝。
+        result, host = await run_precheck(stored, target="")
+        assert rejection(result).startswith("target_group_id 与 target_user_id")
+        assert host.stream_calls == 0 and host.queried == []
+        # 同在：同样在参数解析时拒绝，不进入任何查询。
+        result, host = await run_precheck(stored, user="30001")
+        assert rejection(result).startswith("target_group_id 与 target_user_id")
+        assert host.stream_calls == 0 and host.queried == []
+    asyncio.run(scenario())
 
 
 # --- 4.1：凭据换会话、归属核验与顶层唯一卡片 ------------------------------------
@@ -522,9 +623,28 @@ def test_forward_group_entries归一全部分组并保持配置顺序() -> None:
 def test_forward_group_entries的群号归一与group_id_entries口径一致() -> None:
     # 空白丢弃、字符串逐字符、不可迭代回落空：与 `group_id_entries` 同一口径。
     stub = SimpleNamespace(scope=SimpleNamespace(groups=[SimpleNamespace(
-        name=" 研发 ", source_groups="111  ", target_groups=None)]))
+        name=" 研发 ", source_groups="111  ", target_groups=None, private=False)]))
     entries = forward_group_entries(stub)
-    assert entries == (ForwardGroup(name="研发", source_groups=("1", "1", "1"), target_groups=()),)
+    assert entries == (ForwardGroup(name="研发", source_groups=("1", "1", "1"),
+                                    target_groups=(), private=False),)
+
+
+def test_forward_group_entries透出私聊开关且不改写输入() -> None:
+    config = CourierConfig(scope={"groups": [
+        {"name": " 研发 ", "source_groups": ["111"], "target_groups": ["222"], "private": True},
+        {"name": "运营", "source_groups": ["444"], "target_groups": []},
+    ]})
+    before = [group.model_dump() for group in config.scope.groups]
+
+    entries = forward_group_entries(config)
+
+    # 归一视图按原值透出 private：开私聊的分组与不开的分组可区分，默认（缺键）为假。
+    assert entries == (
+        ForwardGroup(name="研发", source_groups=("111",), target_groups=("222",), private=True),
+        ForwardGroup(name="运营", source_groups=("444",), target_groups=(), private=False),
+    )
+    assert [group.model_dump() for group in config.scope.groups] == before, (
+        "归一视图不得原地修改配置分组")
 
 
 def test_群号归一与来源群判定共用同一份口径() -> None:
@@ -539,6 +659,109 @@ def test_群号归一与来源群判定共用同一份口径() -> None:
     assert source_group_is_allowed(config, "111") and source_group_is_allowed(config, " 111 ")
     assert source_group_is_allowed(config, "333")
     assert not source_group_is_allowed(config, "999")
+
+
+def test_来源群所属分组私聊许可为单点判定且与分组成员判定同源() -> None:
+    config = CourierConfig(scope={"groups": [
+        {"name": "研发", "source_groups": ["111"], "target_groups": ["222"], "private": True},
+        {"name": "运营", "source_groups": ["333"], "target_groups": ["222"], "private": False},
+    ]})
+    # 开关为真的分组：来源群（含带空白的同一归一口径）允许私聊目标。
+    assert source_group_private_allowed(config, "111") is True
+    assert source_group_private_allowed(config, " 111 ") is True
+    # 开关为假、或来源群不在任何分组内：一律不允许（默认空分组没有任何私聊目标）。
+    assert source_group_private_allowed(config, "333") is False
+    assert source_group_private_allowed(config, "999") is False
+    # 判定只读来源群所属分组的开关：目标群开不开私聊与该来源群无关。
+    other = CourierConfig(scope={"groups": [
+        {"name": "甲", "source_groups": ["111"], "target_groups": ["222"], "private": False},
+        {"name": "乙", "source_groups": ["333"], "target_groups": ["222"], "private": True},
+    ]})
+    assert source_group_private_allowed(other, "111") is False
+    assert source_group_private_allowed(other, "333") is True
+
+
+# --- 4.3：私聊目标的本地预检分支 --------------------------------------------------
+
+
+def test_私聊开关关闭时预检拒绝且不查询消息() -> None:
+    async def scenario() -> None:
+        # 分组未开启私聊（默认 private=False）：私聊目标在读取源消息前即拒绝
+        # （定位来源群仍需一次宿主会话查询，与群路径同序）。
+        stored = host_stored(SOURCE_MESSAGE_ID)
+        result, host = await run_precheck(stored, target="", user="30001")
+        assert rejection(result).startswith("来源群所属分组未开启私聊转发")
+        assert "私聊" in rejection(result)
+        assert host.queried == []
+
+        # 来源群不在任何分组内：按分组判定拒绝，同样不读取源消息。
+        result, host = await run_precheck(stored, target="", user="30001",
+                                          source_groups=("999",))
+        assert rejection(result).startswith("调用来源群不在任何转发分组内")
+        assert host.queried == []
+    asyncio.run(scenario())
+
+
+def test_私聊开关开启时预检通过且计划承载私聊目标() -> None:
+    async def scenario() -> None:
+        groups = [{"name": "研发", "source_groups": ["111"], "target_groups": ["222"],
+                   "private": True}]
+        stored = host_stored(SOURCE_MESSAGE_ID)
+        result, host = await run_precheck(stored, target="", user="30001", groups=groups)
+        assert isinstance(result, PreparedForward)
+        # 只开私聊、不配任何群目标同样合法：私聊分支不读 target_groups。
+        assert result.arguments.target_group_id == ""
+        assert result.arguments.target_user_id == "30001"
+        assert result.arguments.target_kind == "private"
+        # 源归属与材料校验照常（与群目标同一口径），且只查询宿主、零网络请求。
+        assert result.onebot_message_id == SOURCE_MESSAGE_ID
+        assert host.queried == [SOURCE_MESSAGE_ID]
+        assert host.stream_calls == 1
+    asyncio.run(scenario())
+
+
+def test_私聊开关不放宽群目标判定() -> None:
+    async def scenario() -> None:
+        # private=True 的分组里，群目标仍只按同组判定与异群规则拒绝。
+        groups = [{"name": "研发", "source_groups": ["111"], "target_groups": ["222"],
+                   "private": True}]
+        stored = host_stored(SOURCE_MESSAGE_ID)
+        result, _ = await run_precheck(stored, target="333", groups=groups)
+        assert rejection(result).startswith("目标群不在与来源群相同的转发分组内")
+        result, _ = await run_precheck(stored, target="111", groups=groups)
+        assert rejection(result).startswith("目标群不能是调用来源群自身")
+        # 同组群目标不受影响。
+        result, _ = await run_precheck(stored, target="222", groups=groups)
+        assert isinstance(result, PreparedForward)
+    asyncio.run(scenario())
+
+
+# --- 4.4：拒绝措辞的形态区分、统一定尾与最小暴露 ----------------------------------
+
+
+def test_两类目标拒绝原因可定位且均带定尾不泄露越权正文() -> None:
+    async def scenario() -> None:
+        stored = host_stored(SOURCE_MESSAGE_ID, raw_message=[{"type": "text", "data": "越权正文"}])
+        # 群目标拒绝（跨组）与私聊目标拒绝（开关关闭）走同一预检出口。
+        result, _ = await run_precheck(stored, target="333")
+        group_reason = rejection(result)
+        result, _ = await run_precheck(stored, target="", user="30001")
+        private_reason = rejection(result)
+
+        # 两类拒绝措辞可区分：不把一种目标形态说成另一种。
+        assert group_reason.startswith("目标群不在与来源群相同的转发分组内")
+        assert private_reason.startswith("来源群所属分组未开启私聊转发")
+        assert "私聊" not in group_reason
+        assert "目标群" not in private_reason
+        # 私聊拒绝点出分组私聊开关（配置键 private），操作者可按键定位。
+        assert "private" in private_reason
+        # 统一经既有定尾：两类拒绝都明确本次没有任何发送副作用。
+        for reason in (group_reason, private_reason):
+            assert reason.endswith(f"，{NOTHING_SENT_NOTE}")
+            # 不回显源正文，也不夹带名册条目（预检从不读取好友名册）。
+            assert "越权正文" not in reason
+            assert "备注" not in reason and "昵称" not in reason
+    asyncio.run(scenario())
 
 
 def test_预检不联网且不触碰平台凭证() -> None:
@@ -612,21 +835,6 @@ def test_混排判定与客户端准备口径一致() -> None:
             await trusted_forward(message_id=CARD_MESSAGE_ID))
         assert getattr(prepared, "error", None) == "source_shape_unsupported"
         assert transport.sent == []
-    asyncio.run(scenario())
-
-
-def test_拒绝措辞不越权读取平台身份证明字段() -> None:
-    async def scenario() -> None:
-        stored = host_stored(SOURCE_MESSAGE_ID)
-        stored["raw_message"] = [{"type": "text", "data": "越权正文"}]
-        stored.update({"message_info": {"group_info": {"group_id": "333"},
-                                        "additional_config": {"self_id": "10001",
-                                                              "napcat_message_type": "group",
-                                                              "client_type": "napcat"}}})
-        result, _ = await run_precheck(stored)
-        reason = rejection(result)
-        assert "越权正文" not in reason
-        assert "333" not in reason
     asyncio.run(scenario())
 
 
