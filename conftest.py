@@ -1,13 +1,15 @@
 """pytest 入口：把仓库根注册为合成包，并在导入插件前装入 fake `maibot_sdk`。
 
 插件目录名含连字符、无法作为模块名被测试引用，因此这里把仓库根注册成合成包
-`maimai_courier_plugin`，再以该包成员身份加载各模块，并给生产模块的顶层名建立
-别名，保证全程单实例。仅影响 pytest 运行，MaiBot 运行时不会加载本文件。
+`maimai_courier_plugin`。测试与生产一律经该包路径导入（`maimai_courier_plugin.config`、
+`maimai_courier_plugin.shared.delivery`），本文件不注册任何顶层别名：少一套名字映射，
+就少一条「两处 import 指向不同模块对象」的分叉路径。公共加载另由无 conftest 的
+子进程验证（`tests/test_repo_isolation.py`）。仅影响 pytest 运行，MaiBot 运行时不会
+加载本文件。
 """
 
 from __future__ import annotations
 
-import importlib
 import sys
 import types
 from pathlib import Path
@@ -27,42 +29,3 @@ if PKG_NAME not in sys.modules:
     pkg.__path__ = [str(ROOT)]
     pkg.__package__ = PKG_NAME
     sys.modules[PKG_NAME] = pkg
-
-# 生产模块显式清单（不用 ROOT.glob("*.py") 全量注册）：只给这些模块建顶层别名，
-# 避免未来新增文件把无关顶层名（甚至标准库同名模块）注册进 sys.modules 或产生双实例。
-# 名单随生产模块增加而扩展：测试要按顶层名引用生产常量/类型时，必须命中同一实例。
-# 时钟、投递类型等纯逻辑不放这里：它们只在 `shared/` 子模块单点定义，生产与测试
-# 一律显式走 `shared.clock` / `shared.delivery` 等子模块路径（0 兼容层）。
-PRODUCTION_MODULES = (
-    "config",
-    "source_binding",
-    "send_material",
-    "forward_precheck",
-    "delivery_ledger",
-    "forward_delivery",
-    "auto_entry",
-    "plugin",
-)
-for stem in PRODUCTION_MODULES:
-    module = importlib.import_module(f"{PKG_NAME}.{stem}")
-    sys.modules.setdefault(stem, module)
-
-# 共享层的顶层名与子模块名只兼容活跃测试的既有导入，全部指向插件包里的同一模块对象。
-# 身份统一靠这里显式登记（否则 `shared.clock` 与 `maimai_courier_plugin.shared.clock`
-# 会解析成两份模块对象）；`shared` 包顶层不重导出任何符号，生产导入不走包顶层。
-# 公共加载另由无 conftest 的子进程验证，生产导入不得依赖这里的别名或历史目录。
-SHARED_MODULES = (
-    "clock",
-    "config_rules",
-    "delivery",
-    "identifiers",
-    "mentions",
-    "result",
-    "send_steps",
-)
-"""共享层子模块名单（随 `shared/` 新增模块扩展；子包聚合 `shared/__init__.py` 除外）。"""
-shared_package = importlib.import_module(f"{PKG_NAME}.shared")
-sys.modules.setdefault("shared", shared_package)
-for stem in SHARED_MODULES:
-    module = importlib.import_module(f"{PKG_NAME}.shared.{stem}")
-    sys.modules.setdefault(f"shared.{stem}", module)

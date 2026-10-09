@@ -49,8 +49,12 @@ async def deliver_forward(*, prepared: PreparedForward, ledger: DeliveryLedger |
     if isinstance(ledger, LedgerUnavailable):
         return DeliveryResult(status=TOOL_STATUS_LEDGER_UNAVAILABLE, stage=STAGE_SOURCE_PERSIST,
                               reason="本地账本不可用，本次未发送任何消息")
+    # 五字段键（ADR 0012）：目标标识按形态取值——私聊存对端 QQ 号、群存群号；
+    # 同号群与私聊是两笔互不阻断的投递，先查、占位与落账都用同一把键。
     key = DeliveryKey(prepared.source.account_id, prepared.source.group_id,
-                      prepared.arguments.message_id, prepared.arguments.target_group_id)
+                      prepared.arguments.message_id,
+                      prepared.arguments.target_user_id or prepared.arguments.target_group_id,
+                      prepared.arguments.target_kind)
     try:
         existing = _existing(ledger.get(key))
         if existing is not None:

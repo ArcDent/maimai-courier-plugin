@@ -2,9 +2,15 @@
 
 无连接 HTTP 一次性请求-响应，按 `PreparedSource.kind` 分派固定发送动作：卡片
 `send_group_forward_msg` 展开节点重组 / 普通图片 `send_msg` 段直发 / 普通文字
-`send_forward_msg` 单节点卡片 / 评论 `send_msg` 普通文本。发送前的账号与归属
-核验在每次动作前以最新查询复验；回执核验只按 `get_msg` 四项证据比对、不重试、
-不外传资源 ID。
+`send_forward_msg` 单节点卡片 / 评论 `send_msg` 普通文本。发送前的账号与归属核验
+在每次动作前以最新查询复验；回执核验只按 `get_msg` 四项证据比对、不重试、不外传
+资源 ID。
+
+目标按形态分治（群 / 私聊，取值单点来自 `shared.delivery.TargetKind`）：群目标按
+群号核对同账号群名册；私聊目标在账号核对后查一次好友名册，确认对端是该账号好友
+（design D6）。发送动作按目标形态只改路由参数（私聊卡片与文字走 `send_forward_msg`、
+图片与评论走 `send_msg` 私聊路由），动作集合不变；回执「目标」一项按形态取值
+（design D4）。
 """
 
 from __future__ import annotations
@@ -18,9 +24,11 @@ from typing import Any, TypeVar
 from .forward_precheck import PreparedForward
 from .send_material import (
     build_card_nodes, build_source_material, card_node_name, card_node_sender,
-    classify_top_level_shape, forward_card_id, source_outbound_segments,
+    classify_top_level_shape, forward_card_id, friend_entry_identifier,
+    source_outbound_segments,
 )
 from .shared.clock import Clock
+from .shared.delivery import TARGET_KIND_PRIVATE
 from .shared.identifiers import verbatim_identifier
 from .shared.result import SourceSendResult
 from .shared.send_steps import (
@@ -31,6 +39,7 @@ from .snowluma_transport import (
     ONEBOT_ACTION_TIMEOUT_SECONDS, ONEBOT_CLOSE_TIMEOUT_SECONDS,
     OneBotTransport, OneBotUnavailable,
 )
+from .type_check import NESTED_FORWARD_DETAIL, unsupported_card_content
 
 RECEIPT_VERIFY_TIMEOUT_SECONDS = 3.0
 RECEIPT_VERIFY_INTERVAL_SECONDS = 0.5
@@ -77,6 +86,25 @@ def canonical_message_id(value: object) -> str:
     return verbatim_identifier(str(value))
 
 
+def receipt_target_matches(prepared: PreparedSource, data: Mapping[str, Any]) -> bool:
+    """回执核验的「目标」与「账号」两项：按目标形态分治，全模块单点定义（design D4）。
+
+    群目标核验 `message_type` 为群且群号与请求一致；私聊目标核验 `message_type`
+    为私聊、`target_id` 等于请求的私聊对端，且 `user_id` 为机器人自身账号。两种形态
+    都不引入私聊特例的成功判据：目标消息 ID 逐字比对（可为负）与正整数平台消息序列
+    由 `_verify_target` 同一口径处理（实测私聊回执带正整数 `message_seq`，API 目录
+    6.10），不为私聊放宽任何一项。
+    """
+
+    if canonical_message_id(data.get("user_id")) != prepared.account_id:
+        return False
+    if prepared.target_kind == TARGET_KIND_PRIVATE:
+        return (data.get("message_type") == "private"
+                and canonical_message_id(data.get("target_id")) == prepared.target_user_id)
+    return (data.get("message_type") == "group"
+            and canonical_message_id(data.get("group_id")) == prepared.target_group_id)
+
+
 def _consume_exception(task: asyncio.Future[Any]) -> None:
     """回收已取消工作异常，不回显原始载荷。"""
     if not task.cancelled():
@@ -86,12 +114,10 @@ def _consume_exception(task: asyncio.Future[Any]) -> None:
 def _text_card_node(stored: Mapping[str, Any], segments: tuple[dict[str, Any], ...]) -> dict[str, Any] | None:
     """文字单节点卡片载荷：`uin`/`name` 只来自源消息 sender，`content` 为源段原样。
 
-    署名取值与卡片路径共用 `card_node_sender` / `card_node_name`；差异只在空名
-    策略：`uin` 不可确认整条拒绝，显示名取不到按文字路径留空、由平台决定展示
-    ——卡片路径才整条拒绝，不把该拒绝带进本路径。
-
-    节点只设 `uin` / `name` / `content` 三个字段：不设置 `summary` / `news` /
-    `prompt` / `source` 等预览类参数（卡片展示完全由平台决定）。
+    署名取值与卡片路径共用 `card_node_sender` / `card_node_name`；差异只在空名策略：
+    `uin` 不可确认整条拒绝，显示名取不到按文字路径留空由平台决定展示——卡片路径才
+    整条拒绝，不把该拒绝带进本路径。只设 `uin` / `name` / `content` 三个字段，
+    不设置预览类参数（卡片展示完全由平台决定）。
     """
 
     uin = card_node_sender(stored.get("sender"))
@@ -110,6 +136,18 @@ class _Submission:
     stopped: bool = False
     submitted: bool = False
     candidate_id: str = ""
+
+
+def _target_route(prepared: PreparedSource, payload: dict[str, Any]) -> dict[str, Any]:
+    """发送载荷的目标形态路由：私聊带 `target_user_id`，群带 `target_group_id`。
+
+    目标形态与对端只在 `PreparedSource` 单点持有（`shared.send_steps`），路由参数
+    由该事实派生，不在此复制第二份目标值；动作集合不因形态改变（design D3）。
+    """
+
+    if prepared.target_kind == TARGET_KIND_PRIVATE:
+        return {"target_user_id": prepared.target_user_id, **payload}
+    return {"target_group_id": prepared.target_group_id, **payload}
 
 
 class SnowLumaClient:
@@ -143,15 +181,26 @@ class SnowLumaClient:
             timer.add_done_callback(_consume_exception)
 
     async def prepare_source(self, prepared: PreparedForward) -> PreparedSource | PrepareRejected:
-        """按账号→目标名册→同账号源记录只读准备；不会提交发送。"""
+        """按账号→目标名册→同账号源记录只读准备；不会提交发送。
+
+        目标按形态分治：群目标逐字沿用群号核对（与源群自身比较、按群号匹配群
+        名册）；私聊目标在账号核对后查好友名册确认对端为好友（design D6），源
+        消息仍是群消息，因此不做「目标=源群」比较（群号与 QQ 号是两个数字空间）。
+        """
+
+        target_user_id = prepared.arguments.target_user_id
+        # 二选一在参数解析期已校验；这里只确认恰有一个目标标识且形态合法（本地不查询）
+        target_identifier = target_user_id or prepared.arguments.target_group_id
         if (self._closed or not isinstance(prepared, PreparedForward)
                 or prepared.source.platform != "qq"
                 or not all(verbatim_identifier(value) for value in (
                     prepared.source.account_id, prepared.source.group_id,
-                    prepared.onebot_message_id, prepared.arguments.target_group_id))
+                    prepared.onebot_message_id, target_identifier))
                 or prepared.onebot_message_id != prepared.arguments.message_id):
             return PrepareRejected("source_unconfirmed", "无法确认可信源对应，发送前拒绝")
-        if prepared.arguments.target_group_id == prepared.source.group_id:
+        if not target_user_id and prepared.arguments.target_group_id == prepared.source.group_id:
+            # 群路径逐字不变：目标群不能是源群自身。私聊路径不做该比较——群号与
+            # 好友 QQ 号是两个数字空间，对端与源群同号也是两笔不同投递。
             return PrepareRejected("target_unavailable", "目标群不能是源群自身，发送前拒绝")
         try:
             return await self._bounded(self._prepare(prepared), self._clock.now() + ONEBOT_ACTION_TIMEOUT_SECONDS)
@@ -159,18 +208,36 @@ class SnowLumaClient:
             return PrepareRejected("source_query_unavailable", "可信源查询未完成，发送前拒绝")
 
     async def _prepare(self, prepared: PreparedForward) -> PreparedSource | PrepareRejected:
+        target_kind = prepared.arguments.target_kind
+        target_user_id = prepared.arguments.target_user_id
         async with self._lock:
             if self._closed:
                 return PrepareRejected("closed", "直连已关闭，发送前拒绝")
             login = response_data(await self._transport.get_login_info())
             if login is None or canonical_message_id(login.get("user_id")) != prepared.source.account_id:
                 return PrepareRejected("account_mismatch", "实际账号无法与可信宿主账号对应，发送前拒绝")
-            groups = response_payload(await self._transport.get_group_list())
-            if not isinstance(groups, list) or not any(
-                isinstance(group, Mapping) and canonical_message_id(group.get("group_id")) == prepared.arguments.target_group_id
-                for group in groups
-            ):
-                return PrepareRejected("target_unavailable", "目标群不在该账号可确认的群名册内，发送前拒绝")
+            if target_kind == TARGET_KIND_PRIVATE:
+                # 好友核验（design D6）：账号核对之后、源查询之前查一次名册，确认对端
+                # 是该账号好友；平台自身也拒非好友（retcode=100），但先核验名册才能给出
+                # 可定位拒绝、不把请求发到平台。
+                roster = response_payload(await self._transport.get_friend_list())
+                if not isinstance(roster, list):
+                    return PrepareRejected(
+                        "friend_list_unavailable", "好友名册查询结果不可识别，拒绝本次私聊投递")
+                identifiers = [friend_entry_identifier(entry) for entry in roster]
+                if not all(identifiers):
+                    return PrepareRejected(
+                        "friend_list_unavailable", "好友名册条目字段不可识别，拒绝本次私聊投递")
+                if target_user_id not in identifiers:
+                    return PrepareRejected(
+                        "target_unavailable", "私聊目标不在该账号的好友名册内，发送前拒绝")
+            else:
+                groups = response_payload(await self._transport.get_group_list())
+                if not isinstance(groups, list) or not any(
+                    isinstance(group, Mapping) and canonical_message_id(group.get("group_id")) == prepared.arguments.target_group_id
+                    for group in groups
+                ):
+                    return PrepareRejected("target_unavailable", "目标群不在该账号可确认的群名册内，发送前拒绝")
             stored = response_data(await self._transport.get_msg(prepared.onebot_message_id))
             if stored is None:
                 return PrepareRejected("source_not_found", "源消息缓存缺失或查询无数据，发送前拒绝")
@@ -178,16 +245,12 @@ class SnowLumaClient:
                     or stored.get("message_type") != "group"
                     or canonical_message_id(stored.get("group_id")) != prepared.source.group_id):
                 return PrepareRejected("source_mismatch", "源消息记录或群归属不一致，发送前拒绝")
-            # 判定顺序：顶层唯一卡片 → forward（按卡片标识展开查询构造节点材料）；
-            # 无卡片且含图片段 → image；否则 → text。
             raw_message = stored.get("message")
             top_level: list[Any] = raw_message if isinstance(raw_message, list) else []
             shape = classify_top_level_shape(top_level) if top_level else "plain"
             if shape == "mixed":
                 return PrepareRejected("source_shape_unsupported", "顶层卡片与其它内容混排，整条拒绝")
             if shape == "forward":
-                # 卡片链路：顶层唯一卡片段取平台卡片标识 → 只读展开查询 → 节点结构
-                # 校验；材料 = 节点数组，投递时平台按目标群上下文重建卡片。
                 card_id = forward_card_id(top_level[0])
                 if not card_id:
                     return PrepareRejected("forward_expand_unavailable", "源卡片标识不可确认，无法展开查询，发送前拒绝")
@@ -199,13 +262,20 @@ class SnowLumaClient:
                         "平台确认该卡片不存在或不可展开，发送前拒绝" if business_failure(response)
                         else "卡片展开查询无可用数据，发送前拒绝",
                     )
+                # 发送前类型检查（判定口径单点定义于 type_check）：嵌套内层卡片在
+                # 目标群客户端只能显示为降级空壳，命中即整条拒绝，不退化为递归展开、
+                # 拍平或摘要。
+                nested_reason = unsupported_card_content(expanded)
+                if nested_reason:
+                    return PrepareRejected(error=nested_reason, reason=NESTED_FORWARD_DETAIL)
                 nodes = build_card_nodes(expanded)
                 if isinstance(nodes, PrepareRejected):
                     return nodes
                 return PreparedSource(SourceMaterial(kind="forward", segments=nodes),
                                       prepared.source.group_id, prepared.onebot_message_id,
                                       prepared.arguments.target_group_id, prepared.source.account_id,
-                                      self._config_generation)
+                                      self._config_generation,
+                                      target_kind=target_kind, target_user_id=target_user_id)
             built = build_source_material(top_level)
             if isinstance(built, PrepareRejected):
                 return built
@@ -221,7 +291,50 @@ class SnowLumaClient:
                 built = SourceMaterial(kind="text", segments=(node,))
             return PreparedSource(built, prepared.source.group_id, prepared.onebot_message_id,
                                   prepared.arguments.target_group_id, prepared.source.account_id,
-                                  self._config_generation)
+                                  self._config_generation,
+                                  target_kind=target_kind, target_user_id=target_user_id)
+
+    async def card_content_rejection(self, message_id: str) -> str | None:
+        """只读预识别卡片内容：命中嵌套内层卡片返回 reason，未命中或查询失败返回 None。
+
+        自动入口的只读缝隙（design D3）：与工具路径 `prepare_source` 卡片分支同一读取
+        序列，用 `message_id` 而非宿主载荷里的卡片标识（标识经平台验证，不信任宿主
+        载荷）。查询失败即放行（照常给判断机会），发送前的权威判定仍在工具路径，不会
+        因预搜索放行而漏拒；取消不是失败，`CancelledError` 照常传播、不放行（与
+        `auto_entry._card_presearch_rejection` 的承诺一致）。本方法只读：不设提交许可
+        闸门、不提交发送动作、不持有源正文，失败不重试。
+        """
+
+        if self._closed or not verbatim_identifier(message_id):
+            return None
+        try:
+            return await self._bounded(self._card_content_rejection(message_id),
+                                       self._clock.now() + ONEBOT_ACTION_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+
+    async def _card_content_rejection(self, message_id: str) -> str | None:
+        async with self._lock:
+            if self._closed:
+                return None
+            stored = response_data(await self._transport.get_msg(message_id))
+            if stored is None:
+                return None
+            # 判定顺序与 _prepare 卡片分支同一口径：非卡片、取不到标识或展开无数据
+            # 一律放行。
+            raw_message = stored.get("message")
+            top_level: list[Any] = raw_message if isinstance(raw_message, list) else []
+            if not top_level or classify_top_level_shape(top_level) != "forward":
+                return None
+            card_id = forward_card_id(top_level[0])
+            if not card_id:
+                return None
+            expanded = response_data(await self._transport.get_forward_msg(card_id))
+            if expanded is None:
+                return None
+            return unsupported_card_content(expanded) or None
 
     async def send_source(self, request: SourceSendRequest, *, before_submit: Callable[[], bool]) -> SourceSendResult:
         """按准备阶段判定的 `kind` 分派唯一固定群动作，无替代通路、不重试。"""
@@ -267,30 +380,30 @@ class SnowLumaClient:
             login = response_data(await self._transport.get_login_info())
             if login is None or canonical_message_id(login.get("user_id")) != prepared.account_id:
                 return SourceSendResult("failed", reason="实际账号无法与可信源账号对应，未发送")
+            private = prepared.target_kind == TARGET_KIND_PRIVATE
             if comment:
                 send = self._transport.send_msg
-                params: dict[str, Any] = {
-                    "target_group_id": prepared.target_group_id,
-                    "message": [{"type": "text", "data": {"text": comment}}],
-                }
+                params: dict[str, Any] = _target_route(
+                    prepared, {"message": [{"type": "text", "data": {"text": comment}}]})
             elif prepared.kind == "forward":
                 if not segments:
                     return SourceSendResult("failed", reason="卡片发送材料缺失，未发送")
-                # 单次卡片发送只提交目标群与展开查询构造的节点数组；
+                # 单次卡片发送只提交目标与展开查询构造的节点数组；
                 # 不设 summary/news/prompt/source 预览参数，不接触 res_id/forward_id。
-                send = self._transport.send_group_forward_msg
-                params = {"target_group_id": prepared.target_group_id, "messages": segments}
+                # 私聊卡片走 send_forward_msg 私聊路由（实测 6.10），群卡片才走
+                # send_group_forward_msg 节点重组一步投递：动作集合不因形态扩张。
+                send = self._transport.send_forward_msg if private else self._transport.send_group_forward_msg
+                params = _target_route(prepared, {"messages": segments})
             elif prepared.kind == "image":
                 if segments is None:
                     return SourceSendResult("failed", reason="图片发送材料缺失，未发送")
                 send = self._transport.send_msg
-                params = {"target_group_id": prepared.target_group_id, "message": segments}
+                params = _target_route(prepared, {"message": segments})
             elif segments is None:
                 return SourceSendResult("failed", reason="文字发送材料缺失，未发送")
             else:
-                # kind == "text"：材料已是单节点卡片数组（content 含 at 原样）。
                 send = self._transport.send_forward_msg
-                params = {"target_group_id": prepared.target_group_id, "messages": segments}
+                params = _target_route(prepared, {"messages": segments})
 
             def permit() -> bool:
                 if (state.stopped or self._clock.now() >= deadline or not self._current(prepared)
@@ -315,11 +428,12 @@ class SnowLumaClient:
             return await self._verify_target(prepared, state.candidate_id)
 
     async def _verify_target(self, prepared: PreparedSource, message_id: str) -> SourceSendResult:
-        """只查本次候选ID；次数和总预算共同约束，四项证据与群消息形态缺一不可。
+        """只查本次候选ID；次数和总预算共同约束，四项证据与目标消息形态缺一不可。
 
-        目标消息 ID 可为负：`canonical_message_id` 按原值逐字比对，不假设符号。
-        回查得到平台业务失败（目标不存在）属明确业务结果，按明确失败登记；查询超时
-        或身份不符按待核实，绝不重发。
+        目标消息 ID 可为负：`canonical_message_id` 按原值逐字比对，不假设符号。回查
+        得到平台业务失败（目标不存在）属明确业务结果，按明确失败登记；查询超时或身份
+        不符按待核实，绝不重发。「目标」与「账号」按形态分治，判据单点定义于
+        `receipt_target_matches`（design D4）。
         """
 
         deadline = self._clock.now() + RECEIPT_VERIFY_TIMEOUT_SECONDS
@@ -338,9 +452,7 @@ class SnowLumaClient:
             if data is not None:
                 sequence = data.get("message_seq")
                 if (canonical_message_id(data.get("message_id")) == message_id
-                        and data.get("message_type") == "group"
-                        and canonical_message_id(data.get("group_id")) == prepared.target_group_id
-                        and canonical_message_id(data.get("user_id")) == prepared.account_id
+                        and receipt_target_matches(prepared, data)
                         and type(sequence) is int and sequence > 0):
                     return SourceSendResult("sent", target_message_id=message_id)
                 return SourceSendResult("unknown", target_message_id=message_id, reason="目标记录身份或平台群序列不符，按待核实处理")

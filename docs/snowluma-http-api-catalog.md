@@ -548,3 +548,101 @@ video + text 两节点），投递目标为授权测试群（780963243）。
    最终展示需在目标群目视确认（实测群中各变体卡片已按 A/B/C/D/E 标注供人工核对）。
 4. 本节结论限于该实例（1.14.17-node）、单账号、该测试群的一次快照，不替代
    真实 QQ 联验清单（`docs/real-qq-validation.md`）的逐项确认。
+
+### 6.9 嵌套卡片（卡片套卡片）三通道对比与段类型矩阵（2026-10-06）
+
+动机：2026-10-05 的「展开 + 节点重组」路径对嵌套内层卡片采取原样提交，契约只写
+「其在目标群展示不保证」。对同一实测实例（SnowLuma 1.14.17-node）的授权测试群中
+一张 15 节点、含 5 个内层 [聊天记录] 的源卡片做三通道对比，并对 16 种段类型 ×
+3 条发送路径做矩阵；证据数据（引用截断、无正文与媒体地址）见
+`.local/report/nested-forward-probe-20261006-115824.json` 与
+`.local/report/segment-type-matrix-20261006-121225.json`。
+
+**三通道对比**（同一张 15 节点源卡片，5 个内层引用）：
+
+| 形态 | 投递结果 | 目标群客户端实际展示 |
+| --- | --- | --- |
+| A：内层 forward 段按旧 res_id 原样提交（当时的现行契约） | 信封 ok，15 节点 | 内层**降级空壳**（`#000000 / 34 / 聊天记录 / function(){[native code]} / 查看转发消息`） |
+| B：递归展开、拍平为一层节点 | 信封 ok，72 节点 | 文本与图片内容全在，但**嵌套结构丢失**；内层 reply 段显示 `[原消息已过期]` |
+| C：`upload_forward_msg` 重传内层节点取新 res_id、外层引用 | 信封 ok，15 节点 | **同样空壳**，且内层 reply 段被静默丢弃（首个内层 3 条变 1 条） |
+
+只读结构核验：新旧两种内层引用（各 5 个）都能被 `get_forward_msg` 正常展开
+（节点数 6–18 不等、图片段俱在）——降级发生在客户端渲染层，与所引用资源的新旧
+无关。也就是说「原样提交」从未真正可用；继续放行只会产出「信封成功、四项回执
+核验全过、群内内容不可用」的投递。据此废弃原状提交，改为发送前整条拒绝
+（ADR 0011）。
+
+**16 种段类型 × 3 条路径矩阵**：
+
+路径定义：P1 `send_msg` 顶层段；P2 `send_forward_msg` 单节点；P3
+`send_group_forward_msg` 单节点。「回执序列」指回查 `message_seq` 为正整数。
+
+- **三路径全支持**：`text` / `face` / `at` / `json`（回读段类型一致、回执四项过）。
+- **`image`**：`hash`/`file` 引用（本地文件名形态）三条路径一律 `retcode=100`
+  `ENOENT` 拒收；https（含签名）URL 图片段可用（2026-10-04 实测，见 4.4），本节实测
+  源卡片创建约 8.3 小时后，其内部图片仍随节点重组的三个变体全部投递成功、回查
+  image 段均在。
+- **`reply`**：单独作节点内容（P2/P3）被 `retcode=1400`「message must contain at
+  least one sendable segment」拒；P1 顶层段可发；伴随可发段时可过（B 变体随拍平
+  内容投递的内层 reply 段即此形态）。
+- **`share` / `location` / `music` / `contact`**：平台一律转成 `json` 段投递
+  （回读为 `json`，原类型丢失）；其中 `share`/`contact` 作节点内容时回执
+  `message_seq=0`，`location`/`music` 作节点内容回执四项过但同样已转 `json`。
+- **`xml`**：P1 被平台拒（`result=46`）；作节点内容（P2/P3）信封 ok 但回执
+  `message_seq=0`、不进群历史，四项回执核验的序列项不可过。
+- **`poke`**：三路径均 `retcode=1400`「can only be sent in a direct private
+  chat」（仅私聊可发）。
+- **`market_face`**：三路径均 `retcode=1400`「unknown message segment type」。
+- **`video` / `file` / `record`**：无真实资源，本轮未测（占位资源触发 ENOENT，
+  不构成结论）。
+
+**结论与边界**：
+
+- 嵌套内层展示降级与资源新旧无关：旧 res_id 原样提交与重传取新 res_id 都是空壳，
+  递归拍平结构丢失；三种形态都无法保留内层信息，故契约改为发送前整条拒绝
+  （`type_check` 单点判定，固定对外措辞见主规格与 ADR 0011）。
+- `xml`/`share`/`contact` 作节点内容回执序列为 0、`poke`/`market_face` 被端点明确
+  拒收，均为单实例快照；本轮不据此阻断发送，留待以后按同一判定点与同一结果面扩充。
+- 本节为单一实例（1.14.17-node）、单账号、一个授权测试群、一次授权时段内的快照，
+  样本量有限，不替代 `docs/real-qq-validation.md` 的逐项联验，也不外推为全部客户端
+  或版本的行为。
+
+### 6.10 私聊（private）转发通道预研实测（2026-10-08）
+
+动机：规划「转发目标支持私聊」前，先把该路径所需的全部端点行为在真实实例上确认，
+避免规格写错再返工。同一实测实例（SnowLuma 1.14.17-node 容器，账号与授权测试群同
+6.5–6.9），私聊对象为操作者受权账号（已确认在账号好友名册内）；凭证只从容器内受控
+插件配置读，不回显、不进 argv。探针见 `.local/probes/private-route-probe.py`（默认
+只读，`--apply` 才发送），原始记录 `.local/report/private-route-probe-20261008-*.json`；
+本文不记录真实账号、群号、令牌、好友昵称备注与媒体地址。
+
+| 用例 | 动作与参数 | 结果 |
+| --- | --- | --- |
+| 名册读取 | `get_friend_list` | `ok`；`data` 为**裸数组**（非对象、无 `friends` 包装）；条目字段 `user_id`（整数）、`nickname`、`remark`；56 人 |
+| 好友核验 | 指定 QQ 号与名册 `user_id` 逐字比对 | 在名册即命中；`remark`/`nickname` 均可能存在（用于名册展示，不用于匹配） |
+| 私聊文字 | `send_msg` `{message_type:"private", user_id, message:[text]}` | `ok`；目标 ID 正数；`get_msg` 四项核验全过 |
+| 私聊单节点卡片 | `send_forward_msg` `{message_type:"private", user_id, messages:[node]}` | `ok`；目标 ID **负数**；四项核验全过 |
+| 私聊多节点卡片 | `send_forward_msg` 同上 + 多 `messages` | `ok`；目标 ID 负数；四项核验全过 |
+| 私聊图片（本地 file 引用） | `send_msg` `message:[text, image{file:<本地文件名>}]` | 拒绝：`retcode=100` `ENOENT …`（与 6.9 的 `hash`/`file` 形态一致） |
+| 私聊图片（https url 段） | `send_msg` `message:[text, image{url:<https 签名地址>}]`（= 插件 `send_material` 的真实提交形态） | `ok`；四项核验全过；回读段 `['text','image']` |
+| 非好友/不存在目标 | `send_msg` `message_type:"private"` 指向名册外 QQ 号 | 拒绝：`retcode=100` 「请先添加对方为好友」——**平台本身也拒** |
+| 备用动作对照 | `send_private_msg` / `send_private_forward_msg` | 均 `ok`、四项核验过（存在但不选，固定动作集不新增发送动作） |
+
+**私聊回执的字段语义**（`get_msg` 对私聊消息的返回）：`message_type="private"`；
+`user_id` 等于**机器人自身账号**，`target_id` 等于**对端 QQ**，`sender.user_id`
+同为机器人自身；`message_seq` 为**正整数**；其余字段与群消息同构
+（`message_id` 可为负值，按原值逐字比对命中）。
+
+**结论与边界**：
+
+1. **四项回执核验可整组复用到私聊**，只把「目标群」一项换成「`message_type=private`
+   且 `target_id` 等于请求的私聊目标」；无需为私聊放宽「正整数平台消息序列」的成功
+   判据（这是规划前最不确定的一项，实测判定为不需要特例）。
+2. **私聊卡片/文字用 `send_forward_msg`（`message_type:"private"`）、图片与评论用
+   `send_msg`**：固定动作集只需新增 `get_friend_list` 一个只读动作，`send_private_msg`
+   / `send_private_forward_msg` 虽可用但不引入。
+3. **好友核验是插件侧必需**：平台也会拒非好友，但先核验名册可给出可定位拒绝、不把
+   请求发到平台。
+4. 本节同 6.9 的边界：单实例、单账号、一个授权测试群、一次授权时段内的快照；私聊
+   对象的客户端侧展示（含头像）未做目视联验，不替代
+   `docs/real-qq-validation.md` 的逐项确认。

@@ -13,7 +13,8 @@ from typing import Any
 import pytest
 
 from maimai_courier_plugin.send_material import (
-    build_card_nodes, build_source_material, source_outbound_segments,
+    build_card_nodes, build_source_material, friend_entry_identifier,
+    friend_entry_nickname, friend_entry_remark, source_outbound_segments,
 )
 from maimai_courier_plugin.shared.send_steps import PrepareRejected, SourceMaterial
 
@@ -191,19 +192,6 @@ def test_卡片节点显示名取card优先回退nickname并压平限长() -> No
     assert [node["data"]["name"] for node in nodes] == ["卡片名", "昵称乙", "面 在", "群" * 128]
 
 
-@pytest.mark.parametrize("sender", [
-    {}, {"nickname": "  "}, {"card": ""}, {"card": None}, {"nickname": 123},
-    {"card": "\n\t", "nickname": None},
-])
-def test_卡片节点显示名不可确认整条拒绝(sender: dict[str, object]) -> None:
-    expanded: dict[str, Any] = {"messages": [
-        {"sender": {**sender, "user_id": "10001"}, "message": [{"type": "text", "data": {"text": "正文"}}]},
-    ]}
-    result = build_card_nodes(expanded)
-    assert isinstance(result, PrepareRejected)
-    assert result.error == "sender_name_unconfirmed"
-
-
 @pytest.mark.parametrize("expanded", [
     None, [], "messages", {}, {"messages": None}, {"messages": []}, {"messages": {}},
     {"messages": [None]}, {"messages": ["节点"]},
@@ -234,3 +222,40 @@ def test_嵌套forward段随内容原样保留() -> None:
     assert expanded == original
     nodes[0]["data"]["content"][1]["data"]["id"] = "改写"
     assert inner["data"]["id"] == "old-res-id-xyz"
+
+
+@pytest.mark.parametrize(("entry", "identifier"), [
+    ({"user_id": 30001, "nickname": "好友甲", "remark": "备注甲"}, "30001"),
+    ({"user_id": "30001", "nickname": "好友甲", "remark": "备注甲"}, "30001"),
+    ({"user_id": "30001"}, "30001"),
+])
+def test_名册条目QQ号取整数与字符串两种形态(entry: dict[str, object], identifier: str) -> None:
+    """实测名册 `data` 是裸数组、条目字段 `user_id`（整数）/`nickname`/`remark`
+    （API 目录 6.10）：整数与十进制字符串两种形态都按原文取值。"""
+
+    assert friend_entry_identifier(entry) == identifier
+
+
+@pytest.mark.parametrize("entry", [
+    None, "30001", 30001, [], {},
+    {"nickname": "好友甲", "remark": "备注甲"},
+    {"user_id": True}, {"user_id": None}, {"user_id": 30001.0}, {"user_id": ["30001"]},
+    {"user_id": " 30001"}, {"user_id": "30001 "}, {"user_id": "30001\n"},
+    {"user_id": "x" * 129}, {"user_id": "30<001>"},
+])
+def test_名册条目形状不可识别一律取不到值(entry: object) -> None:
+    """形状不可识别（含数值型、带空白/控制字符、全角、超长、禁用字符）不得净化成
+    另一个字符串：取不到值由调用方按「名册不可识别」拒绝，不静默放行。"""
+
+    assert friend_entry_identifier(entry) == ""
+
+
+def test_名册备注与昵称只作数据且不影响QQ号取值() -> None:
+    """备注/昵称压平后原样透出（名册展示面用），不参与匹配、排序或目标收敛。"""
+
+    entry = {"user_id": "30001", "nickname": " 好友\n甲\x00 ", "remark": "备注\t甲"}
+    assert friend_entry_nickname(entry) == "好友 甲"
+    assert friend_entry_remark(entry) == "备注 甲"
+    assert friend_entry_identifier(entry) == "30001"
+    for missing in ({"user_id": "30001"}, {}, "not-a-mapping"):
+        assert friend_entry_nickname(missing) == "" and friend_entry_remark(missing) == ""

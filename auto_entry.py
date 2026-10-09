@@ -1,21 +1,18 @@
 """源群自动判断入口：候选筛选、可读性确认、有界去重与分享判断意图。
 
-本模块只负责「给源群 Maisaka 一次自主判断机会」，不发送任何消息：真正的转发仍
-必须经 `forward_message` 工具与同一投递链。契约与取舍：
+本模块只给源群 Maisaka 一次自主判断机会，不发送任何消息：真正的转发仍必须经
+`forward_message` 工具与同一投递链。
 
-- **唯一可信来源是宿主的入站 Hook 载荷**（`chat.receive.after_process`）：载荷由
-  宿主构造、不经模型，因此会话、平台、群号与消息 ID 都按载荷取值；模型伪造不了，
-  也无需额外授权票据。
-- **候选口径**：白名单源群里的、非机器人自身、非通知的 QQ 消息，且其内容能分类成
-  配置 `auto.message_types` 已选中的候选类型（默认仅合并转发；文字与图片须显式选中）。
-  只含空白、只含提及、含不支持段或段结构非法的普通消息都不唤起；非 QQ 平台、
-  非白名单来源与自己发的消息也一样。未展开的合并转发（宿主没能恢复节点、被收成
-  `DictComponent`）同样进入判断：判断只需要消息 ID，实际发送仍由工具侧做完整
-  内容校验。
-- **不掷骰、不签目标群决策票、不强制续轮**：意图只给源消息的实际类型、源消息 ID、
-  合法目标群、工具用法与「值得分享才调用工具、可以沉默」的边界说明，外加单独标注的
-  用户配置分享标准原文；不伪造聊天内容，也不对目标群唤起。
-- 群名（源群与目标群）只是不可信显示文本，一律不参与路由判断。
+- 唯一可信来源是宿主入站 Hook 载荷（`chat.receive.after_process`，不经模型），
+  会话/平台/群号/消息 ID 都按载荷取值；
+- 候选口径：转发分组内源群、非机器人自身、非通知的 QQ 消息，内容能分类成
+  `auto.message_types` 已选中的类型（默认仅合并转发，文字与图片须显式选中）；
+  未展开的合并转发同样进入判断（判断只需消息 ID，发送仍由工具侧完整校验）；
+- 不掷骰、不签目标群决策票、不强制续轮：意图只给实际类型、源消息 ID、同组合法
+  目标、工具用法与「可以沉默」边界与用户标准原文，不伪造内容、不对目标群唤起；
+- 卡片内容预搜索是可选注入缝隙：命中嵌套内层卡片不提供判断机会，查询失败放行
+  （fail-open），发送前的权威判定仍在工具路径；本模块不导入客户端；
+- 群名只是不可信显示文本，一律不参与路由。
 
 等待上限、去重窗口与容量都是代码常量，不做成配置项。
 """
@@ -24,20 +21,20 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Callable, Final, Mapping
+from typing import Any, Awaitable, Callable, Final, Mapping
 
 from .shared.clock import Clock
 from .config import CourierConfig, MessageType
 from .forward_precheck import (
     QQ_PLATFORM,
+    forward_group_of,
     source_group_is_allowed,
-    target_is_allowed,
-    whitelist_entries,
 )
 from .send_material import is_forward_card
 from .shared.identifiers import (
     safe_identifier,
 )
+from .type_check import NESTED_FORWARD_DETAIL
 
 # 标识符规则的**唯一定义**在共享层 `shared/identifiers.py`：候选筛选按同一实现校验。
 
@@ -56,7 +53,16 @@ ACCOUNT_ID_KEYS: Final[tuple[str, ...]] = (
 WAKE_REASON: Final[str] = "源群自动分享判断"
 """主动唤起的原因标签（宿主日志与任务元数据里用于定位本插件）。
 
-文案与多类型候选一致：候选可能是普通文字、图片或合并转发，不写死「合并转发」。
+候选可能是文字、图片或合并转发，文案不写死「合并转发」。
+"""
+
+AUTO_PRESEARCH_REJECTION_REASON: Final[str] = (
+    f"卡片内容只读预识别命中嵌套内层卡片（{NESTED_FORWARD_DETAIL}），不提供本次自动判断机会"
+)
+"""预搜索命中的对外原因：随 `WakeOutcome.reason` 交给组合根记录可定位日志。
+
+措辞片段引用 `type_check` 的固定对外措辞（单一来源，不复制字面量）；源消息与源群
+由调用方日志带上，本文案不含正文。
 """
 
 AUTO_READINESS_TIMEOUT_SECONDS: Final[float] = 10.0
@@ -83,9 +89,7 @@ AUTO_DEDUP_MAX_ENTRIES: Final[int] = 4096
 AUTO_ENTRY_UNAVAILABLE_REASON: Final[str] = "等待期间插件已卸载，或总开关／自动入口已关闭"
 """等待期间无法继续自动判断的通用原因（卸载与开关关闭两种情形共用）。
 
-`_latest_valid_config` 在配置快照不可用时（已卸载、总开关关闭或自动入口关闭）与
-`auto_entry_invalid_reason` 的开关关闸分支落在同一失效面；两条路径共用本文案，
-避免同一场景出现两套说法。
+两条失效路径共用本文案，避免同一场景出现两套说法。
 """
 
 DEFAULT_SHARE_CRITERIA: Final[str] = CourierConfig().auto.share_criteria
@@ -127,11 +131,10 @@ class NotACandidate:
 class ForwardCandidate:
     """通过筛选的自动入口候选。
 
-    字段全部取自宿主载荷：`session_id` 是可信会话，`group_name` 只是不可信显示文本。
-    `session_id` 与 `source_message_id` 在筛选时已过 `safe_identifier` 的字符集与
-    长度关口，因此可以原样进入主动任务意图与宿主查询。`message_type` 是本次已确认
-    的候选类型（与配置枚举同一词汇），供判断意图与热更新复验使用；分类成功只表示
-    「值得给一次判断机会」，不承诺内容可完整发送。
+    字段全部取自宿主载荷：`session_id` 是可信会话，`group_name` 只是不可信显示文本；
+    `session_id` 与 `source_message_id` 在筛选时已过 `safe_identifier`，可原样进入
+    主动任务意图与宿主查询。`message_type` 是本次已确认的候选类型，供判断意图与热更新
+    复验使用；分类成功只表示「值得给一次判断机会」，不承诺内容可完整发送。
     """
 
     source_message_id: str
@@ -141,6 +144,14 @@ class ForwardCandidate:
     group_name: str
     account_id: str
     message_type: CandidateType
+
+
+CardPresearch = Callable[[ForwardCandidate], Awaitable[str | None]]
+"""卡片内容预搜索缝隙：只读判定合并转发候选，命中返回拒绝原因，否则返回空串或 None。
+
+由组合根注入（design D4）：`None` 表示跳过预搜索。本模块不导入 `snowluma_client`：
+依赖方向保持单向，发送前的权威类型检查也仍在客户端内。
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,20 +186,14 @@ def _pick_account_id(*mappings: Any) -> str:
 def _classify_candidate(raw_message: Any) -> CandidateType | None:
     """按段结构给出候选类型；不构成候选内容时返回 `None`。
 
-    合并转发优先：只要既有 `is_forward_card` 判据命中就归 `forward`（含宿主未展开
-    的 `dict` 包装形态），不另写一份卡片形状规则——自动入口（只需消息 ID 就能给
-    判断机会）与内容预检必须共用同一判据，否则宿主序列化形态变化时会一处放行、
-    一处拒绝。
+    合并转发优先：`is_forward_card` 命中即归 `forward`（含宿主未展开的 `dict`
+    包装）——自动入口与内容预检必须共用同一判据，否则宿主序列化形态变化时会一处
+    放行、一处拒绝。无卡片时只允许已识别的文字、图片与提及（附属）段参与：段
+    结构非法或出现其它类型（语音、文件、回复、未展开组件等）直接放弃；含图片归
+    `image`，不含图片但存在非空文字归 `text`，只有空白或仅提及不单独构成候选。
 
-    无卡片时只允许**已识别**的段参与普通分类：文字（内容必须是字符串）、图片、
-    提及（只作附属段）。段不是字典、段结构非法或出现其它类型（语音、文件、回复、
-    表情、未展开的其它组件等）都直接放弃候选，不只凭其中含文字或图片就入选。
-    含图片归 `image`（单图、多图、图文与附带提及的图片）；不含图片但存在非空文字
-    归 `text`；只有空白或仅提及不单独构成候选。
-
-    分类只看段类型、文字是否非空与段结构是否可以识别，不下载或恢复媒体、也不做
-    完整材料校验：图片缺二进制不阻塞入站 Hook，能否真正发送由工具侧预检决定
-    （分类不承诺可发送，提及对象是否可确认同样留给预检）。
+    分类不看媒体可恢复性与材料完整性：能否真正发送由工具侧预检决定（分类不承诺
+    可发送）。
     """
 
     if not isinstance(raw_message, list):
@@ -224,18 +229,19 @@ def _classify_candidate(raw_message: Any) -> CandidateType | None:
 
 
 def share_target_groups(config: CourierConfig, source_group_id: str) -> tuple[str, ...]:
-    """合法目标群：目标白名单里、不同于源群、去空白去重且保持配置顺序。
+    """同组合法目标群：来源群所属分组的全部目标，不同于源群、去重且保持配置顺序。
 
-    成员判定复用工具侧的 `forward_precheck.target_is_allowed`、归一复用同一
-    `whitelist_entries`，保证「自动判断列出的目标」与「工具实际接受的目标」是同一份
-    口径。群名不参与这里的判定：路由只认群号。
+    与工具预检的成对判定同源：先经 `forward_precheck.forward_group_of` 定位来源群
+    所属分组，只列举该分组的目标群号，绝不混入其它分组的目标。路由只认群号。
     """
 
+    entry = forward_group_of(config, source_group_id)
+    if entry is None:
+        return ()
+    source = str(source_group_id).strip()
     targets: list[str] = []
-    for group_id in whitelist_entries(config.scope.target_groups):
-        if group_id == source_group_id or group_id in targets:
-            continue
-        if not target_is_allowed(config, group_id):
+    for group_id in entry.target_groups:
+        if group_id == source or group_id in targets:
             continue
         targets.append(group_id)
     return tuple(targets)
@@ -248,11 +254,9 @@ def auto_entry_invalid_reason(
 ) -> str:
     """最新配置是否仍允许对来源群发起自动判断：允许返回空串，否则返回可定位原因。
 
-    总开关、自动入口开关、候选类型（仍被 `auto.message_types` 选中）、来源群白名单与
-    「仍存在合法且不同于源群的目标群」五项合一：热更新时的失效取消（组合根只把它当
-    布尔用）与等待结束后的重验共用本谓词，判定口径只有一处；原因措辞按「等待结束后
-    重验」的语境给出。只变更标准不在这里判定——仍合法的候选继续等待，等待结束后用
-    最新标准提交。
+    总开关、自动入口开关、候选类型、来源群分组归属与同组合法目标五项合一：热更新
+    失效取消（组合根只把它当布尔用）与等待结束后的重验共用本谓词，判定口径只有一处。
+    只变更标准不在这里判定——仍合法的候选继续等待，等待结束后用最新标准提交。
     """
 
     if not config.plugin.enabled or not config.auto.enabled:
@@ -260,17 +264,17 @@ def auto_entry_invalid_reason(
     if message_type not in config.auto.message_types:
         return f"等待期间候选类型 {message_type} 已移出自动候选类型"
     if not source_group_is_allowed(config, source_group_id):
-        return "等待期间来源群已移出源群白名单"
+        return "等待期间来源群已不在任何转发分组内"
     if not share_target_groups(config, source_group_id):
-        return "没有合法且不同于源群的目标群"
+        return "来源群所属转发分组内没有合法且不同于源群的目标群"
     return ""
 
 
 class AutoEntryDedup:
     """自动入口的有界内存去重：同一候选在时间窗内只唤起一次。
 
-    与持久投递账本完全分离：只抑制重复上报，不记录投递结果，也不会因时间或容量
-    上限动到任何已投递记录。容量按「逐出最早登记项」处理，窗口按注入时钟计算。
+    与持久投递账本完全分离：只抑制重复上报，不记录投递结果。容量按「逐出最早
+    登记项」处理，窗口按注入时钟计算。
     """
 
     def __init__(self, clock: Clock) -> None:
@@ -302,10 +306,9 @@ class AutoEntryDedup:
 def screen_forward_candidate(payload: Any, config: CourierConfig) -> ForwardCandidate | NotACandidate:
     """按宿主载荷筛选自动入口候选（不查询宿主、不产生任何副作用）。
 
-    所有判据都取自载荷本身：会话、群号、账号、消息 ID 一律按宿主构造的值读取；
-    无法确认机器人账号或发送者时按「无法排除自身消息」放弃候选。内容分类复用
-    与工具侧预检同一份卡片判据（`send_material.is_forward_card`），再核对本次
-    分类结果是否在配置 `auto.message_types` 里；未选中（含空列表）不产生候选。
+    所有判据都取自载荷本身：无法确认机器人账号或发送者时按「无法排除自身消息」
+    放弃候选。内容分类复用与工具侧预检同一份卡片判据（`is_forward_card`），再
+    核对分类结果是否在配置 `auto.message_types` 里；未选中（含空列表）不产生候选。
     """
 
     if not isinstance(payload, Mapping):
@@ -328,9 +331,9 @@ def screen_forward_candidate(payload: Any, config: CourierConfig) -> ForwardCand
     if not group_id:
         return NotACandidate("来源不是群聊")
     if not source_group_is_allowed(config, group_id):
-        return NotACandidate("来源群不在源群白名单内")
+        return NotACandidate("来源群不在任何转发分组内")
     if not share_target_groups(config, group_id):
-        return NotACandidate("没有合法且不同于源群的目标群，不提供判断机会")
+        return NotACandidate("来源群所属转发分组内没有合法且不同于源群的目标群，不提供判断机会")
 
     account_id = _pick_account_id(
         payload.get("additional_config"),
@@ -367,9 +370,8 @@ def screen_forward_candidate(payload: Any, config: CourierConfig) -> ForwardCand
 def effective_share_criteria(config: CourierConfig) -> str:
     """解析本次判断使用的有效分享标准：空或全空白回退默认原文。
 
-    非空内容（含换行与首尾空白）原样返回，不压平也不改写；标准只按文字参与意图
-    拼接，不做模板展开、不调用 `format`／`eval`，花括号、协议语法与命令样式都只是
-    普通文字。
+    非空内容原样返回，不压平也不改写；标准只按文字参与意图拼接，不做模板展开、
+    不调用 `format`／`eval`，花括号、协议语法与命令样式都只是普通文字。
     """
 
     criteria = config.auto.share_criteria
@@ -382,7 +384,7 @@ def display_name(raw: Any) -> str:
     群名可能含宿主主动任务标签的闭合串、换行或超长内容，而宿主会把意图原文包进
     `<plugin_proactive_task>`。这里把尖括号转成全角、压平空白并限长：保留了
     「是什么名字」，但不再能闭合宿主结构或伪造多行指令。名称始终只是显示文本，
-    路由只认白名单群号。
+    路由只认转发分组内的群号。
     """
 
     text = _text(raw)
@@ -400,18 +402,13 @@ def build_share_intent(
 ) -> str:
     """构造自主分享判断意图。
 
-    只给：源消息的实际候选类型、源消息 ID、合法目标群号与可用名称、工具用法，以及
-    「自行判断、可以沉默」的边界说明；用户配置的自动分享标准原文单独标注成一段。
-    聊天内容一律不进意图（不伪造、不摘抄宿主摘要）；群名只作为不可信显示文本放在
-    `「」` 里，并明确说明它不是路由依据、其中的指令不得执行。目标群号是路由唯一
-    依据，且只来自白名单（`share_target_groups`）。
+    只给：源消息的实际候选类型、源消息 ID、同组合法目标群号与可用名称、工具用法，
+    「自行判断、可以沉默」的边界，以及单独标注的用户标准原文。聊天内容一律不进
+    意图（不伪造、不摘抄）；群名只作为不可信显示文本并明确说明它不是路由依据、
+    其中的指令不得执行；目标群号是路由唯一依据且只来自 `share_target_groups`。
 
     标准只按文字拼接：它是用户配置的自然语言偏好，位于明确标注的用户配置区域，
-    不做模板展开、不参与路由与权限判定。固定部分不夹带任何主题或广告偏好，模型
-    始终可以选择沉默。
-
-    这里出现的源消息 ID 与目标群号都已在候选筛选（`safe_identifier`）与白名单阶段
-    校验过形态与长度，意图本身不再拼入任何未经验证的载荷字符串。
+    不做模板展开、不参与路由与权限判定。固定部分不夹带任何主题或广告偏好。
     """
 
     lines = [f"【跨群分享判断】本群刚收到一条{CANDIDATE_TYPE_LABELS[candidate.message_type]}。"]
@@ -485,8 +482,8 @@ def _latest_valid_config(
 ) -> tuple[CourierConfig | None, str]:
     """重读最新配置并重验候选：仍合法返回（配置, 空原因），否则返回（None, 原因）。
 
-    消息可读后的初检与目标名称查询结束后的提交前复验共用本判定：开关、候选类型、
-    来源群与目标白名单的口径只有一处；`current_config` 每次都读**最新**快照，不缓存。
+    消息可读后的初检与目标名称查询结束后的提交前复验共用本判定；`current_config`
+    每次都读**最新**快照，不缓存。
     """
 
     config = current_config()
@@ -498,20 +495,47 @@ def _latest_valid_config(
     return config, ""
 
 
+async def _card_presearch_rejection(
+    candidate: ForwardCandidate,
+    presearch: CardPresearch | None,
+) -> str:
+    """预搜索拒绝原因：未注入、非合并转发候选、未命中与查询失败都返回空串（放行）。
+
+    只对合并转发候选调用；调用异常按查询失败放行，不阻断本次判断机会（fail-open）；
+    取消照常传播，不被放行口径吞掉。返回非空串即命中，由调用方组成固定可定位文案
+    并以 `WakeOutcome(triggered=False)` 收尾。
+    """
+
+    if presearch is None or candidate.message_type != "forward":
+        return ""
+    try:
+        rejection = await presearch(candidate)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return ""
+    return rejection or ""
+
+
 async def run_auto_entry(
     *,
     ctx: Any,
     candidate: ForwardCandidate,
     clock: Clock,
     current_config: Callable[[], CourierConfig | None],
+    presearch: CardPresearch | None = None,
 ) -> WakeOutcome:
     """确认消息可读取后唤起一次源群判断；任一环节不满足即放弃并给出可定位原因。
 
-    `current_config` 读取**最新**配置快照：消息可读后先做一次初检与目标名称查询，
-    查询结束后**再次**读取最新配置、重验候选（含候选类型）、重建合法目标集合并解析
-    最新标准，然后直接进入 `maisaka.proactive.trigger` 调用——中间不再插入其它异步
-    查询。因此查询期间的标准、白名单与开关变更全部对本次提交生效；新增目标没有名称
-    时只列群号，已移除的目标不会从名称快照重新混入。
+    `current_config` 读取**最新**配置快照：消息可读后初检、（合并转发候选的）卡片
+    预搜索与目标名称查询，查询结束后**再次**读取最新配置、重验候选、重建合法目标
+    集合并解析最新标准，然后直接进入 `maisaka.proactive.trigger`——中间不再插入
+    其它异步查询，查询期间的标准、同组目标与开关变更全部对本次提交生效。
+
+    `presearch`（可选，design D5）在可读性确认与配置初检之后、目标名称查询之前
+    执行：只对合并转发候选调用，命中即返回 `WakeOutcome(triggered=False, 可定位
+    原因)`，不唤起、不查目标名称；未命中或查询失败继续既有流程。去重登记已在观察
+    Hook 同步完成，预搜索不改变去重语义。
     """
 
     if not await confirm_readable(ctx, candidate, clock):
@@ -523,6 +547,11 @@ async def run_auto_entry(
     config, reason = _latest_valid_config(current_config, candidate)
     if config is None:
         return WakeOutcome(triggered=False, reason=reason)
+    rejection = await _card_presearch_rejection(candidate, presearch)
+    if rejection:
+        # 缝隙只回报「是否命中」：对外原因由本模块组装修辞面（固定文案，含定位片段），
+        # 内部 reason 码不进结果面。
+        return WakeOutcome(triggered=False, reason=AUTO_PRESEARCH_REJECTION_REASON)
     initial_target_ids = share_target_groups(config, candidate.group_id)
     names = await available_group_names(ctx, candidate, initial_target_ids)
 
@@ -543,8 +572,7 @@ async def confirm_readable(ctx: Any, candidate: ForwardCandidate, clock: Clock) 
     """以源消息 ID 有限确认消息可读取（最多 `AUTO_READINESS_TIMEOUT_SECONDS`）。
 
     等待一律经注入时钟（可确定性推进），并在每次轮询前检查剩余额度：额度耗尽即
-    返回 `False`，绝不无限等待。查询限定可信来源会话；读取失败按「还没就绪」处理，
-    在额度内继续重试。
+    返回 `False`，绝不无限等待。读取失败按「还没就绪」处理，在额度内继续重试。
     """
 
     deadline = clock.now() + AUTO_READINESS_TIMEOUT_SECONDS
