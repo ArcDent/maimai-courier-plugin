@@ -1,11 +1,11 @@
-"""离线验收：公共 Hook/Tool 经真实 aiohttp 回环 **HTTP** 端点与本地合成 OneBot 互证。
+"""离线验收：公共 Tool 经真实 aiohttp 回环 **HTTP** 端点与本地合成 OneBot 互证。
 
 除以太替身（`aiohttp.web` 回环服务端）外全程真实：插件经公开工厂装配（真实
-`AiohttpOneBotTransport`、注入时钟与真实 `open_ledger`），宿主上下文用 fake SDK
-替身，账本用真实 SQLite 临时目录账本。回环服务端只按冻结协议返回合成信封；实际
-请求、占位时序与落账全部从公共边界（工具结果、账本记录、请求日志）断言，不访问
-任何客户端私有状态。端点只绑 `127.0.0.1`；每个用例自建临时目录、端点与账本，
-用例间无共享状态。默认 pytest 档（无 `aiohttp`）在导入期跳过本文件。
+`AiohttpOneBotTransport`、注入时钟与真实 SQLite 临时目录账本），宿主上下文用
+fake SDK 替身。回环服务端只按冻结协议返回合成信封；实际请求、占位时序与落账
+全部从公共边界（工具结果、账本记录、请求日志）断言，不访问任何客户端私有状态。
+端点只绑 `127.0.0.1`；每个用例自建临时目录、端点与账本，用例间无共享状态。
+默认 pytest 档（无 `aiohttp`）在导入期跳过本文件。
 """
 
 from __future__ import annotations
@@ -23,12 +23,13 @@ import pytest
 pytest.importorskip("aiohttp")
 from aiohttp import web
 
-from maimai_courier_plugin.shared.delivery import LedgerUnavailable
-from maimai_courier_plugin.delivery_ledger import LEDGER_FILE_NAME, open_ledger
+from maimai_courier_plugin.shared.delivery import (
+    TARGET_KIND_GROUP,
+    TARGET_KIND_PRIVATE,
+)
 from maimai_courier_plugin.snowluma_transport import (
     ONEBOT_ACTION_TIMEOUT_SECONDS,
     AiohttpOneBotTransport,
-    OneBotConnection,
 )
 from maimai_courier_plugin.type_check import NESTED_FORWARD_DETAIL, NESTED_FORWARD_REASON
 from tests.direct_support import (
@@ -40,7 +41,6 @@ from tests.direct_support import (
     forward_node,
     forward_segment,
     image_segment,
-    merged_forward_message,
     onebot_segments,
     prepare_source,
 )
@@ -49,6 +49,8 @@ from tests.snowluma_transport_support import http_endpoint
 from tests.support import (
     MESSAGE_ID,
     OTHER_TARGET_GROUP_ID,
+    PRIVATE_FRIENDS,
+    PRIVATE_USER_ID,
     SOURCE_ACCOUNT_ID,
     SOURCE_GROUP_ID,
     SOURCE_SESSION_ID,
@@ -108,33 +110,6 @@ MATERIALS = [
         id="单图",
     ),
     pytest.param(
-        [image_segment(), image_segment()],
-        {"action": "send_msg", "params": {
-            "message_type": "group", "group_id": TARGET_GROUP_ID,
-            "message": [{"type": "image", "data": {"url": DEFAULT_MEDIA_URL}},
-                        {"type": "image", "data": {"url": DEFAULT_MEDIA_URL.replace(".png", "-2.png")}}]}},
-        id="多图",
-    ),
-    pytest.param(
-        [text_segment("前"), image_segment(), text_segment("后")],
-        {"action": "send_msg", "params": {
-            "message_type": "group", "group_id": TARGET_GROUP_ID,
-            "message": [{"type": "text", "data": {"text": "前"}},
-                        {"type": "image", "data": {"url": DEFAULT_MEDIA_URL}},
-                        {"type": "text", "data": {"text": "后"}}]}},
-        id="图文",
-    ),
-    pytest.param(
-        [text_segment("甲"), at_segment("30001", nickname="乙"), at_segment("30002"), at_segment("all")],
-        {"action": "send_forward_msg", "params": {"group_id": TARGET_GROUP_ID, "messages": [
-            {"type": "node", "data": {"uin": "90001", "name": "群友", "content": [
-                {"type": "text", "data": {"text": "甲"}},
-                {"type": "at", "data": {"qq": "30001", "nickname": "乙"}},
-                {"type": "at", "data": {"qq": "30002"}},
-                {"type": "at", "data": {"qq": "all"}}]}}]}},
-        id="提及",
-    ),
-    pytest.param(
         [forward_segment(forward_node(content=[
             at_segment("all"), {"type": "reply", "data": "内部回复"}, {"type": "unknown", "data": "内部未知"}]))],
         {"action": "send_group_forward_msg", "params": {"group_id": TARGET_GROUP_ID, "messages": [
@@ -158,10 +133,58 @@ def comment_wire(comment: str) -> dict[str, Any]:
         "message": [{"type": "text", "data": {"text": comment}}]}}
 
 
+PRIVATE_MATERIALS = [
+    pytest.param(
+        [text_segment("甲\n乙")],
+        {"action": "send_forward_msg", "params": {"message_type": "private", "user_id": PRIVATE_USER_ID,
+         "messages": [{"type": "node", "data": {"uin": "90001", "name": "群友",
+                                                "content": [{"type": "text", "data": {"text": "甲\n乙"}}]}}]}},
+        id="私聊文字",
+    ),
+    pytest.param(
+        [image_segment()],
+        {"action": "send_msg", "params": {
+            "message_type": "private", "user_id": PRIVATE_USER_ID,
+            "message": [{"type": "image", "data": {"url": DEFAULT_MEDIA_URL}}]}},
+        id="私聊单图",
+    ),
+    pytest.param(
+        [forward_segment(forward_node(content=[
+            at_segment("all"), {"type": "reply", "data": "内部回复"}, {"type": "unknown", "data": "内部未知"}]))],
+        {"action": "send_forward_msg", "params": {"message_type": "private", "user_id": PRIVATE_USER_ID,
+         "messages": [
+             {"type": "node", "data": {"uin": "90001", "name": "群友",
+                                       "content": [{"type": "text", "data": {"text": "合成展开节点一"}}]}},
+             {"type": "node", "data": {"uin": "90002", "name": "名片乙", "content": [
+                 {"type": "image", "data": {"url": DEFAULT_MEDIA_URL}},
+                 {"type": "text", "data": {"text": "合成展开节点二"}}]}}]}},
+        id="私聊原卡片",
+    ),
+]
+"""三类源到私聊的期望发送线路（实测 6.10）：卡片与文字走 `send_forward_msg` 私聊
+路由、图片走 `send_msg` 私聊路由；只有路由参数（`message_type`/对端）按形态替换，
+段与节点内容和群路径同一构造（不引入具名私聊发送动作）。"""
+
+
+def private_comment_wire(comment: str) -> dict[str, Any]:
+
+    return {"action": "send_msg", "params": {
+        "message_type": "private", "user_id": PRIVATE_USER_ID,
+        "message": [{"type": "text", "data": {"text": comment}}]}}
+
+
+def private_ledger_key() -> Any:
+    """私聊五字段键：目标标识存对端 QQ 号，目标形态 `private`（ADR 0012）。"""
+
+    return ledger_key(target_group_id=PRIVATE_USER_ID, target_kind=TARGET_KIND_PRIVATE)
+
+
 async def bound_call(plugin: Any, *, comment: Any = None, target: str = TARGET_GROUP_ID,
-                     message_id: str = MESSAGE_ID) -> dict[str, Any]:
+                     target_user_id: str = "", message_id: str = MESSAGE_ID) -> dict[str, Any]:
 
     arguments: dict[str, Any] = {"message_id": message_id, "target_group_id": target}
+    if target_user_id:
+        arguments["target_user_id"] = target_user_id
     if comment is not None:
         arguments["comment"] = comment
     bound = await plugin.bind_forward_source(
@@ -184,7 +207,8 @@ class LocalOneBot:
                  ledger: Any = None, account: str = SOURCE_ACCOUNT_ID,
                  targets: tuple[str, ...] = (TARGET_GROUP_ID, OTHER_TARGET_GROUP_ID),
                  token: str = ACCEPTANCE_TOKEN, negative_ids: bool = False,
-                 expanded: dict[str, Any] | None = None, expand_failure: bool = False) -> None:
+                 expanded: dict[str, Any] | None = None, expand_failure: bool = False,
+                 friends: list[dict[str, Any]] | None = None) -> None:
         self.clock = clock
         self.raw = raw
         self.fault = fault
@@ -198,6 +222,8 @@ class LocalOneBot:
         """展开查询失败注入（与 `tests/direct_support.DirectOneBot.expand_failure` 同口径）：
         置真时 `get_forward_msg` 按业务失败信封应答（平台确认该卡片不存在或不可展开），
         自动入口只读预识别必须 fail-open、照常提供判断机会。"""
+        self.friends = deepcopy(PRIVATE_FRIENDS) if friends is None else friends
+        """好友名册：只读裸数组，条目字段原样上交（私聊目标准备阶段的好友核验读取）。"""
         self.requests: list[dict[str, Any]] = []
         self.sent: list[dict[str, Any]] = []
         self.receipts: dict[str, dict[str, Any]] = {}
@@ -234,6 +260,9 @@ class LocalOneBot:
                          else {"user_id": self.account})
         elif action == "get_group_list":
             data = [{"group_id": value} for value in self.targets]
+        elif action == "get_friend_list":
+            # 只读好友名册：私聊目标准备阶段确认对端为同账号好友。
+            data = deepcopy(self.friends)
         elif action == "get_msg":
             data = self._record_for(params["message_id"])
         elif action == "get_forward_msg":
@@ -257,21 +286,29 @@ class LocalOneBot:
             record = deepcopy(self.receipts[message_id])
             if self.fault == "wrong_record":
                 record["message_id"] = "another-record"
-            elif self.fault == "wrong_target":
+            elif self.fault == "wrong_target" and "group_id" in record:
                 record["group_id"] = "99999"
             return record
         return None
 
     async def _send(self, request: web.Request, action: str, params: dict[str, Any]) -> web.Response:
         self.sent.append({"action": action, "params": params})
+        private = params.get("message_type") == "private"
         if self.ledger is not None:
-            row = self.ledger.get(ledger_key(target_group_id=params["group_id"]))
+            row = self.ledger.get(ledger_key(
+                target_group_id=params["user_id"] if private else params["group_id"],
+                target_kind=TARGET_KIND_PRIVATE if private else TARGET_KIND_GROUP))
             self.observations.append((row.status, row.comment_status, self.clock.now()))
         message_id = f"-wire-target-{len(self.sent)}" if self.negative_ids else f"wire-target-{len(self.sent)}"
-        self.receipts[message_id] = {
-            "message_id": message_id, "message_type": "group", "group_id": params["group_id"],
-            "user_id": self.account, "message_seq": len(self.sent),
-        }
+        # 回执按目标形态分治（实测 6.10）：群回执核验群号，私聊回执核验
+        # `message_type=private` + 对端 + 机器人自身 + 正整数平台序列。
+        receipt: dict[str, Any] = {"message_id": message_id, "user_id": self.account,
+                                   "message_seq": len(self.sent)}
+        if private:
+            receipt.update({"message_type": "private", "target_id": params["user_id"]})
+        else:
+            receipt.update({"message_type": "group", "group_id": params["group_id"]})
+        self.receipts[message_id] = receipt
         if self.fault == "after_send":
             # 平台已受理但连接中断：客户端必须保持待核实，不得重发。
             request.transport.abort()
@@ -395,24 +432,40 @@ def _revoke_all_targets(config: dict[str, Any]) -> None:
 
 # --------------------------------------------------------------------------- 主互证
 
+PRIVATE_GROUPS: list[dict[str, Any]] = [
+    {"name": "研发", "source_groups": [SOURCE_GROUP_ID],
+     "target_groups": [TARGET_GROUP_ID], "private": True},
+]
+"""开启私聊开关的转发分组：私聊端到端场景的合法装配（群目标判定不受影响）。"""
 
-@pytest.mark.parametrize("raw,expected", MATERIALS)
-@pytest.mark.parametrize("comment", ["", " \n\t", "[CQ:at,qq=all] 本次评论"], ids=["空", "空白", "非空"])
-def test_公共工具经真实HTTP按类型分派完整材料评论与冷目标(raw, expected, comment, tmp_path):
-    async def scenario():
+
+def drive_delivery_scenario(*, tmp_path: Path, raw: list[dict[str, Any]], expected: Any,
+                            comment: str, target_kind: str) -> None:
+    """群与私聊两种目标形态共用的端到端场景：固定动作分派、发送前占位与落账互证。
+
+    `target_kind` 只改变装配（私聊分组开关）、调用参数（私聊路由对端）与好友核验/
+    名册最小暴露面断言；固定 0.5 秒评论延迟、发送前持久占位、请求洁净、防泄漏与
+    「目标没有宿主活动会话也可发送」两侧逐字相同，不各自复制第二份场景。
+    """
+
+    async def scenario() -> None:
         clock = FakeClock()
         ledger = open_test_ledger(tmp_path, clock=clock)
         server = LocalOneBot(clock, raw, ledger=ledger)
+        private = target_kind == "private"
         async with http_endpoint(server.handler) as url:
-            assembly = assemble(tmp_path, url, raw, clock, ledger=ledger)
+            assembly = assemble(tmp_path, url, raw, clock, ledger=ledger,
+                                groups=PRIVATE_GROUPS if private else None)
             try:
                 await assembly.plugin.on_load()
                 assert server.requests == []
-                task = asyncio.create_task(bound_call(assembly.plugin, comment=comment))
+                task = asyncio.create_task(bound_call(
+                    assembly.plugin, comment=comment, target="" if private else TARGET_GROUP_ID,
+                    target_user_id=PRIVATE_USER_ID if private else ""))
                 if comment.strip():
                     await spin_until(lambda: 0.5 in clock.sleeps)
                     assert len(server.sent) == 1 and not task.done()
-                    assert ledger.get(ledger_key()).status == "sent"
+                    assert ledger.get(private_ledger_key() if private else ledger_key()).status == "sent"
                     clock.advance(0.49)
                     for _ in range(20):
                         await asyncio.sleep(0)
@@ -421,12 +474,17 @@ def test_公共工具经真实HTTP按类型分派完整材料评论与冷目标(
                 else:
                     assert 0.5 not in clock.sleeps, "空白评论不等待、不占位、不提交授权"
                 result = await asyncio.wait_for(task, 5)
-                expected_sends = [expected] + ([comment_wire(comment)] if comment.strip() else [])
+                expected_sends = [expected] + ([(private_comment_wire(comment) if private
+                                                 else comment_wire(comment))] if comment.strip() else [])
                 assert server.sent == expected_sends, "三类 kind 与评论按固定动作分派"
-                assert result["status"] == "sent" and result["success"] and result["delivered"]
+                assert result["status"] == "sent" and result["success"] and result["delivered"], result
+                assert result["target_kind"] == target_kind, result
+                if private:
+                    assert result["target_user_id"] == PRIVATE_USER_ID, result
                 assert result["target_message_id"] == "wire-target-1"
-                row = ledger.get(ledger_key())
-                assert (row.status, row.target_message_id) == ("sent", "wire-target-1")
+                row = ledger.get(private_ledger_key() if private else ledger_key())
+                assert (row.status, row.target_message_id) == ("sent", "wire-target-1"), (
+                    "成功必须按五字段键落账并保存真实目标消息 ID")
                 assert (row.comment_status, row.comment_message_id) == (
                     ("sent", "wire-target-2") if comment.strip() else ("", ""))
                 assert (result["comment_status"], result["comment_message_id"]) == (
@@ -434,6 +492,16 @@ def test_公共工具经真实HTTP按类型分派完整材料评论与冷目标(
                 assert server.observations == (
                     [("sending", "", 0.0), ("sent", "sending", 0.5)] if comment.strip()
                     else [("sending", "", 0.0)]), "发送前必须已持久占位"
+                if private:
+                    # 好友核验（design D6）：账号核对后只读名册一次，确认对端为同账号好友；
+                    # 私聊目标不查群名册。
+                    actions = [item["body"]["action"] for item in server.requests]
+                    assert actions.count("get_friend_list") == 1, "好友核验只在准备阶段查询一次名册"
+                    assert "get_group_list" not in actions, "私聊目标不查群名册"
+                assert [item["body"]["params"]["message_id"] for item in server.requests
+                        if item["body"]["action"] == "get_msg"] == (
+                            [MESSAGE_ID, "wire-target-1", "wire-target-2"] if comment.strip()
+                            else [MESSAGE_ID, "wire-target-1"]), "回查只针对本次返回的目标标识"
                 assert_clean_requests(server)
                 assert DEFAULT_RESOURCE_ID not in json.dumps(server.sent, ensure_ascii=False), (
                     "源卡片资源 ID 不得进入发送载荷（展开查询按标识读取，发送只交节点数组）")
@@ -450,10 +518,21 @@ def test_公共工具经真实HTTP按类型分派完整材料评论与冷目标(
                 assert assembly.ctx.send.calls == [] and assembly.api_calls == []
                 assert len(assembly.ctx.chat.streams) == 1, "目标没有宿主活动会话也可发送（不保证历史同步）"
                 assert_no_leak(result, assembly.ctx)
+                if private:
+                    # 名册数据最小暴露面：备注与昵称不进结果与日志（3.6）。
+                    observed = json.dumps([result, assembly.ctx.logger.records], ensure_ascii=False)
+                    assert "好友甲" not in observed and "备注甲" not in observed, "名册条目不得进入结果或日志"
             finally:
                 await close_assembly(assembly, ledger)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("raw,expected", MATERIALS)
+@pytest.mark.parametrize("comment", ["", "[CQ:at,qq=all] 本次评论"], ids=["空", "非空"])
+def test_公共工具经真实HTTP按类型分派完整材料评论与冷目标(raw, expected, comment, tmp_path):
+    drive_delivery_scenario(tmp_path=tmp_path, raw=raw, expected=expected, comment=comment,
+                            target_kind="group")
 
 
 def test_负数目标消息ID经真实HTTP按原值核验落账(tmp_path):
@@ -481,22 +560,29 @@ def test_负数目标消息ID经真实HTTP按原值核验落账(tmp_path):
     asyncio.run(scenario())
 
 
+# ------------------------------------------------------- 私聊路径端到端互证（design D1/D3/D6/D12）
+# 三类源与评论经真实 aiohttp 回环端点投递到私聊对端：准备阶段好友核验、私聊路由
+# 参数、私聊形态回执四项与五字段账本键全部从公共边界（工具结果、账本记录、请求
+# 日志）互证；名册数据（备注/昵称）不进结果与日志。与群路径共用同一场景助手
+# （`drive_delivery_scenario`），只按目标形态改注入点。
+
+
+@pytest.mark.parametrize("raw,expected", PRIVATE_MATERIALS)
+@pytest.mark.parametrize("comment", ["", "本次私聊评论"], ids=["空", "非空"])
+def test_私聊三类源经真实HTTP端到端成功并落账(raw, expected, comment, tmp_path):
+    drive_delivery_scenario(tmp_path=tmp_path, raw=raw, expected=expected, comment=comment,
+                            target_kind="private")
+
+
 # --------------------------------------------------------------------------- 故障互证
 
 
 @pytest.mark.parametrize("fault,status,source_state,comment_state,send_count,stage", [
     pytest.param("login_unavailable", "failed", "failed", "", 0, "source_send", id="登录查询断连"),
     pytest.param("after_send", "unknown", "unknown", "", 1, "source_send", id="受理后断连"),
-    pytest.param("no_response", "unknown", "unknown", "", 1, "source_send", id="应答挂起超时"),
     pytest.param("no_id", "unknown", "unknown", "", 1, "source_send", id="缺目标ID"),
     pytest.param("business_failed", "failed", "failed", "", 1, "source_send", id="业务失败"),
     pytest.param("wrong_account", "rejected", None, "", 0, "rejected", id="账号不符"),
-    pytest.param("wrong_record", "unknown", "unknown", "", 1, "source_send", id="回查记录不符"),
-    pytest.param("wrong_target", "unknown", "unknown", "", 1, "source_send", id="回查目标不符"),
-    pytest.param("reserve", "ledger_unavailable", None, "", 0, "source_persist", id="源占位失败"),
-    pytest.param("mark_sent", "unknown", "sending", "", 1, "source_persist", id="源落账失败"),
-    pytest.param("reserve_comment", "partial", "sent", "", 1, "comment_persist", id="评论占位失败"),
-    pytest.param("record_comment", "partial", "sent", "sending", 2, "comment_persist", id="评论落账失败"),
 ])
 def test_真实HTTP故障互证工具账本线路且重启不补发(tmp_path, fault, status, source_state,
                                                   comment_state, send_count, stage):
@@ -607,143 +693,12 @@ def test_真实HTTP评论等待撤权保留本次结果与持久字段边界(tmp
     asyncio.run(scenario())
 
 
-def test_真实HTTP多客户端并存关闭隔离且另一目标独立(tmp_path):
-    async def scenario():
-        clock, raw = FakeClock(), [text_segment("仅指定目标")]
-        ledger = open_test_ledger(tmp_path, clock=clock)
-        server = LocalOneBot(clock, raw, ledger=ledger)
-        async with http_endpoint(server.handler) as url:
-            assembly = assemble(tmp_path, url, raw, clock, ledger=ledger)
-            peer = AiohttpOneBotTransport(
-                OneBotConnection(url, "ACCEPTANCE_TOKEN", ACCEPTANCE_TOKEN), clock=clock,
-                environ={"ACCEPTANCE_TOKEN": ACCEPTANCE_TOKEN})
-            try:
-                first, peer_reply = await asyncio.gather(
-                    bound_call(assembly.plugin), peer.get_login_info())
-                assert first["target_message_id"] == "wire-target-1"
-                assert peer_reply["data"]["user_id"] == SOURCE_ACCOUNT_ID
-                second = await bound_call(assembly.plugin, target=OTHER_TARGET_GROUP_ID)
-                assert second["target_message_id"] == "wire-target-2"
-                assert [item["params"]["group_id"] for item in server.sent] == [
-                    TARGET_GROUP_ID, OTHER_TARGET_GROUP_ID]
-                assert ledger.get(ledger_key()).target_message_id == "wire-target-1"
-                assert ledger.get(ledger_key(target_group_id=OTHER_TARGET_GROUP_ID)).target_message_id == (
-                    "wire-target-2")
-                assert ledger.get(ledger_key()).comment_status == ""
-                assert 0.5 not in clock.sleeps, "评论参数缺省不等待也不占位"
-                await assembly.plugin.on_unload()
-                assert (await peer.get_login_info())["data"]["user_id"] == SOURCE_ACCOUNT_ID, (
-                    "卸载只结束本插件自己的在途请求，不影响同一端点的其他客户端")
-                assert len(server.sent) == 2
-                assert assembly.ctx.send.calls == []
-                assert assembly.ctx.maisaka.proactive.calls == [] and assembly.api_calls == []
-            finally:
-                await close_assembly(assembly, unload=False)
-                await peer.close()
-                ledger.close()
-
-    asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("history_name", ["service_binding.json", "service_binding.json.tmp",
-                                          "old-ledger.snapshot"])
-def test_真实端点可用但服务历史痕迹使公共工具闭锁(tmp_path, history_name):
-    async def scenario():
-        evidence = tmp_path / history_name
-        evidence.write_bytes(b"synthetic-history-not-new-install")
-        clock, raw = FakeClock(), [text_segment("不发送")]
-        server = LocalOneBot(clock, raw)
-        async with http_endpoint(server.handler) as url:
-            assembly = assemble(tmp_path, url, raw, clock)
-            try:
-                result = await bound_call(assembly.plugin)
-                assert result["status"] == "ledger_unavailable" and result["sent"] is False
-                assert server.requests == [] and server.sent == []
-                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
-                assert evidence.read_bytes() == b"synthetic-history-not-new-install"
-                assert not (tmp_path / LEDGER_FILE_NAME).exists()
-                assert isinstance(open_ledger(tmp_path / LEDGER_FILE_NAME), LedgerUnavailable)
-            finally:
-                await close_assembly(assembly)
-
-    asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("change", ["关闭", "撤销目标", "卸载"])
-def test_真实HTTP源账号查询等待后复验权限(tmp_path, change):
-    async def scenario():
-        clock, raw = FakeClock(), [text_segment("未提交源")]
-        ledger = open_test_ledger(tmp_path, clock=clock)
-        server = LocalOneBot(clock, raw, ledger=ledger)
-        server.pause_login = 2
-        async with http_endpoint(server.handler) as url:
-            assembly = assemble(tmp_path, url, raw, clock, ledger=ledger)
-            try:
-                task = asyncio.create_task(bound_call(assembly.plugin, comment="不应发送"))
-                await asyncio.wait_for(server.entered.wait(), 5)
-                if change == "卸载":
-                    # 先启动卸载使许可失效，释放模拟服务端以允许有限关闭。
-                    stop = asyncio.create_task(assembly.plugin.on_unload())
-                    await asyncio.sleep(0)
-                    server.release.set()
-                    await stop
-                else:
-                    config = assembly.plugin.config.model_dump()
-                    if change == "关闭":
-                        config["plugin"]["enabled"] = False
-                    else:
-                        _revoke_all_targets(config)
-                    assembly.plugin.set_plugin_config(config)
-                    await assembly.plugin.on_config_update("self", config, "test")
-                    server.release.set()
-                result = await asyncio.wait_for(task, 5)
-                assert (result["status"], result["stage"], result["sent"]) == ("rejected", "rejected", False), (
-                    "复验未通过按明确未发送拒绝")
-                assert server.sent == []
-                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
-            finally:
-                server.release.set()
-                await close_assembly(assembly, ledger)
-            reopened = open_test_ledger(tmp_path, clock=clock)
-            try:
-                assert reopened.get(ledger_key()).status == "failed"
-            finally:
-                reopened.close()
-
-    asyncio.run(scenario())
 
 
-def test_宿主Hook与真实端点并存只有源群判断且沉默不发送(tmp_path):
-
-    async def scenario():
-        clock, raw = FakeClock(), [forward_segment(forward_node())]
-        ledger = open_test_ledger(tmp_path, clock=clock)
-        server = LocalOneBot(clock, raw, ledger=ledger)
-        async with http_endpoint(server.handler) as url:
-            assembly = assemble(tmp_path, url, raw, clock, ledger=ledger)
-            try:
-                assert (await bound_call(assembly.plugin))["status"] == "sent"
-                before = len(server.requests)
-                payload = merged_forward_message(message_id=MESSAGE_ID, raw_message=raw)
-                await asyncio.gather(assembly.plugin.observe_received_message(**payload),
-                                     assembly.plugin.observe_received_message(**payload))
-                await spin_until(lambda: len(assembly.ctx.maisaka.proactive.calls) == 1)
-                for _ in range(100):
-                    await asyncio.sleep(0)
-                assert len(assembly.ctx.maisaka.proactive.calls) == 1
-                assert assembly.ctx.maisaka.proactive.calls[0]["stream_id"] == SOURCE_SESSION_ID
-                # 新契约：自动入口对合并转发候选先做只读预识别（`get_msg` 取同账号源
-                # 消息、`get_forward_msg` 按卡片标识展开）。沉默的判断仍不发送，平台
-                # 侧新增的只有这一次只读查询序列，不得出现任何发送或其它动作。
-                assert [item["body"]["action"] for item in server.requests[before:]] == [
-                    "get_msg", "get_forward_msg"], "沉默的判断只产生只读预识别查询"
-                assert len(server.sent) == 1
-                assert ledger.get(ledger_key()).status == "sent"
-                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
-            finally:
-                await close_assembly(assembly, ledger)
-
-    asyncio.run(scenario())
 
 
 def test_同组命名分组经真实HTTP端到端成功并落账(tmp_path):
@@ -809,9 +764,9 @@ def test_跨组目标经真实HTTP发送前拒绝且传输层零请求(tmp_path)
 
 
 # ----------------------------------------------------------- 嵌套卡片类型检查互证（design D6）
-# 卡片展开应答含嵌套内层卡片时，工具路径发送前整条拒绝、自动入口只读预识别跳过；
-# 展开查询失败时自动入口 fail-open。两条链都走真实 aiohttp 回环端点与公开入口
-# （`forward_message` 工具、观察 Hook），不 mock 客户端或其它内部协作者。
+# 卡片展开应答含嵌套内层卡片时，工具路径发送前整条拒绝：拒绝点在展开查询之后、
+# 节点构造之前。全链走真实 aiohttp 回环端点与公开入口（`forward_message` 工具），
+# 不 mock 客户端或其它内部协作者。
 
 
 def test_嵌套卡片经真实HTTP展开后发送前整条拒绝且零发送(tmp_path):
@@ -845,67 +800,3 @@ def test_嵌套卡片经真实HTTP展开后发送前整条拒绝且零发送(tmp
     asyncio.run(scenario())
 
 
-def test_嵌套卡片自动候选经真实HTTP预识别跳过且展开失败照常唤起(tmp_path):
-    """自动入口预识别的两种结局：命中嵌套不唤起（留可定位日志），展开查询业务失败放行。"""
-
-    async def scenario_nested() -> None:
-        clock = FakeClock()
-        raw = [forward_segment(forward_node())]
-        data_dir = tmp_path / "nested"
-        data_dir.mkdir()
-        ledger = open_test_ledger(data_dir, clock=clock)
-        server = LocalOneBot(clock, raw, ledger=ledger, expanded=deepcopy(NESTED_EXPANDED_CARD))
-        async with http_endpoint(server.handler) as url:
-            assembly = assemble(data_dir, url, raw, clock, ledger=ledger)
-            try:
-                payload = merged_forward_message(message_id=MESSAGE_ID, raw_message=raw)
-                await assembly.plugin.observe_received_message(**payload)
-                await spin_until(lambda: any(
-                    "未提供分享判断机会" in text for text in assembly.ctx.logger.texts("warning")))
-                for _ in range(50):
-                    await asyncio.sleep(0)
-                assert assembly.ctx.maisaka.proactive.calls == [], (
-                    "预识别命中嵌套内层卡片，不提供本次自动判断机会")
-                warnings = "\n".join(assembly.ctx.logger.texts("warning"))
-                assert MESSAGE_ID in warnings, warnings
-                assert "嵌套" in warnings, warnings
-                assert [item["body"]["params"] for item in server.requests
-                        if item["body"]["action"] == "get_forward_msg"] == [
-                    {"id": DEFAULT_RESOURCE_ID}], "命中前仍按源卡片标识展开查询（只读、不重试）"
-                assert server.sent == [] and ledger.get(ledger_key()) is None, (
-                    "预识别只读：任何结局都不得提交发送或落账")
-                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
-                assert_clean_requests(server)
-            finally:
-                await close_assembly(assembly, ledger)
-
-    async def scenario_expand_failed() -> None:
-        clock = FakeClock()
-        raw = [forward_segment(forward_node())]
-        data_dir = tmp_path / "expand-failed"
-        data_dir.mkdir()
-        ledger = open_test_ledger(data_dir, clock=clock)
-        server = LocalOneBot(clock, raw, ledger=ledger, expand_failure=True)
-        async with http_endpoint(server.handler) as url:
-            assembly = assemble(data_dir, url, raw, clock, ledger=ledger)
-            try:
-                payload = merged_forward_message(message_id=MESSAGE_ID, raw_message=raw)
-                await assembly.plugin.observe_received_message(**payload)
-                await spin_until(lambda: len(assembly.ctx.maisaka.proactive.calls) == 1)
-                for _ in range(50):
-                    await asyncio.sleep(0)
-                assert len(assembly.ctx.maisaka.proactive.calls) == 1, (
-                    "展开查询失败（平台确认该卡片不可展开）按放行处理，照常提供一次判断机会")
-                assert assembly.ctx.maisaka.proactive.calls[0]["stream_id"] == SOURCE_SESSION_ID
-                assert [item["body"]["params"] for item in server.requests
-                        if item["body"]["action"] == "get_forward_msg"] == [
-                    {"id": DEFAULT_RESOURCE_ID}], "查询失败不重试：展开查询只发生一次"
-                assert server.sent == [] and ledger.get(ledger_key()) is None, (
-                    "自动入口只唤起源群判断，任何结局都不得提交发送或落账")
-                assert assembly.ctx.send.calls == [] and assembly.api_calls == []
-                assert_clean_requests(server)
-            finally:
-                await close_assembly(assembly, ledger)
-
-    asyncio.run(scenario_nested())
-    asyncio.run(scenario_expand_failed())

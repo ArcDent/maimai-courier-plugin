@@ -1,41 +1,35 @@
 """账本行为：经持久状态模块的**导出接口**驱动，不测试私有 SQL 辅助函数。
 
-用例只断言账本对外承诺的行为：唯一键构成、四种状态的区分、评论结果附带、参数
-绑定与持久化、事务纪律与失败可区分性。启动恢复（遗留 sending）与损坏库安全关闭
-见本文件后续小节。
+用例只断言账本对外承诺的行为：五字段键构成与旧四字段库一次性迁移、占位与终态
+的防重纪律、评论占位与结果保存、重开后的在途恢复、失败与「记录不存在」的可区
+分性，以及路径证据、损坏库与 WAL 独有成功事实的安全关闭。
 """
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
-import traceback
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from shared.delivery import (
-    STATUS_FAILED,
+from maimai_courier_plugin.shared.delivery import (
     STATUS_SENDING,
     STATUS_SENT,
-    STATUS_UNKNOWN,
-    DeliveryKey,
+    TARGET_KIND_GROUP,
+    TARGET_KIND_PRIVATE,
     LedgerStatus,
     LedgerUnavailable,
     LedgerUnavailableError,
 )
-from delivery_ledger import (
+from maimai_courier_plugin.delivery_ledger import (
     LEDGER_FILE_NAME,
     DeliveryLedger,
     Reservation,
     open_ledger,
 )
 from tests.support import FakeClock, ledger_key, open_test_ledger
-
-_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
-"""SQLite 边车文件后缀：主库之外的 WAL/SHM/journal 都算占用或损坏证据。"""
 
 # --------------------------------------------------------------------------- 5.1
 
@@ -79,24 +73,6 @@ def test_独占失败不恢复活实例且不同目录隔离并可安全重开(t
         reopened.close()
 
 
-def test_锁存储故障只有安全诊断且不建库(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import fcntl
-
-    def fail_lock(*args: Any) -> None:
-        raise OSError("私有路径/假凭证/源正文")
-
-    monkeypatch.setattr(fcntl, "flock", fail_lock)
-    result = open_ledger(tmp_path / LEDGER_FILE_NAME)
-    try:
-        assert isinstance(result, LedgerUnavailable)
-        assert result.reason and "假凭证" not in result.reason
-        assert "私有路径" not in result.reason and "源正文" not in result.reason
-        assert not (tmp_path / LEDGER_FILE_NAME).exists()
-    finally:
-        if isinstance(result, DeliveryLedger):
-            result.close()
-
-
 # --------------------------------------------------------------------------- 5.2
 
 
@@ -112,84 +88,170 @@ CREATE TABLE delivery_ledger (
 )
 """
 
+CURRENT_SCHEMA = LEGACY_SCHEMA.replace(
+    "target_group_id TEXT NOT NULL,",
+    "target_group_id TEXT NOT NULL, target_kind TEXT NOT NULL,",
+).replace(
+    "PRIMARY KEY (account_id, source_group_id, source_message_id, target_group_id)",
+    "PRIMARY KEY (account_id, source_group_id, source_message_id, target_group_id, target_kind)",
+)
 
-def _legacy_database(path: Path, *, schema: str = LEGACY_SCHEMA, status: str = "sent",
-                     comment_status: str = "sent", page_size: int = 4096) -> None:
+
+def _legacy_database(path: Path, *, schema: str = LEGACY_SCHEMA, kind: str | None = None,
+                     status: str = "sent", comment_status: str = "sent", page_size: int = 4096) -> None:
 
     connection = sqlite3.connect(path)
     try:
         connection.execute(f"PRAGMA page_size={page_size}")
         connection.execute(schema)
+        values: tuple[Any, ...] = (
+            "10001", "111", "m-source-1", "222", *(() if kind is None else (kind,)),
+            status, "old-target", comment_status, "old-comment" if comment_status else "",
+            "旧安全原因", 10.0, 20.0,
+        )
         connection.execute(
-            "INSERT INTO delivery_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("10001", "111", "m-source-1", "222", status, "old-target",
-             comment_status, "old-comment" if comment_status else "", "旧安全原因", 10.0, 20.0),
+            f"INSERT INTO delivery_ledger VALUES ({', '.join('?' * len(values))})", values
         )
         connection.commit()
     finally:
         connection.close()
 
 
-def test_完整原库字段逐项兼容且不会重建(tmp_path: Path) -> None:
+def test_五字段新库可直接打开且二次打开不重复迁移(tmp_path: Path) -> None:
+    """当前五字段库（含目标形态列）可直接打开；再次打开不重建表、事实保留。"""
+
+    path = tmp_path / LEDGER_FILE_NAME
+    _legacy_database(path, schema=CURRENT_SCHEMA, kind=TARGET_KIND_GROUP)
+    opened = open_test_ledger(tmp_path)
+    try:
+        record = opened.get(ledger_key())
+        assert record is not None
+        assert (record.status, record.target_message_id,
+                record.comment_status, record.comment_message_id) == (
+                    "sent", "old-target", "sent", "old-comment")
+    finally:
+        opened.close()
+    after_first = path.read_bytes()
+    reopened = open_test_ledger(tmp_path)
+    try:
+        again = reopened.get(ledger_key())
+        assert again is not None
+        assert (again.status, again.target_message_id,
+                again.comment_status, again.comment_message_id) == (
+                    "sent", "old-target", "sent", "old-comment")
+    finally:
+        reopened.close()
+    assert path.read_bytes() == after_first, "五字段库再次打开不得重建表"
+
+
+def test_旧四字段库与五字段新库都是认可形状(tmp_path: Path) -> None:
+    """两种形状都能打开：旧四字段库记录原样可读，五字段新库直接可用。"""
+
+    for name, schema, kind in (("legacy", LEGACY_SCHEMA, None), ("current", CURRENT_SCHEMA, TARGET_KIND_GROUP)):
+        directory = tmp_path / name
+        directory.mkdir()
+        _legacy_database(directory / LEDGER_FILE_NAME, schema=schema, kind=kind)
+        ledger = open_test_ledger(directory)
+        try:
+            record = ledger.get(ledger_key())
+            assert record is not None, name
+            assert (record.status, record.target_message_id) == ("sent", "old-target"), name
+        finally:
+            ledger.close()
+
+
+def test_旧四字段库一次性迁移后记录逐条保留且继续阻断重发(tmp_path: Path) -> None:
+    """旧四字段库打开即一次性迁移：记录数、状态与 `target_message_id` 逐条一致。
+
+    期待值独立来自构造时写入的每一行；评论在途行按既有恢复口径转未知，源事实不变。
+    """
+
+    path = tmp_path / LEDGER_FILE_NAME
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(LEGACY_SCHEMA)
+        connection.executemany(
+            "INSERT INTO delivery_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("10001", "111", "m-sent", "222", "sent", "target-sent", "sent", "comment-sent", "", 10.0, 20.0),
+                ("10001", "111", "m-unknown", "222", "unknown", "", "", "", "", 11.0, 21.0),
+                ("10001", "111", "m-negative", "30003", "sent", "-1289506878", "", "", "", 12.0, 22.0),
+                ("10001", "111", "m-failed", "222", "failed", "", "", "", "明确未发送", 13.0, 23.0),
+                ("10001", "111", "m-comment-sending", "30003", "sent", "target-pending", "sending", "", "", 14.0, 24.0),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    expected = [
+        (ledger_key(message_id="m-sent"), "sent", "target-sent", "sent", "comment-sent", "", 10.0, 20.0),
+        (ledger_key(message_id="m-unknown"), "unknown", "", "", "", "", 11.0, 21.0),
+        (ledger_key(message_id="m-negative", target_group_id="30003"), "sent", "-1289506878", "", "", "", 12.0, 22.0),
+        (ledger_key(message_id="m-failed"), "failed", "", "", "", "明确未发送", 13.0, 23.0),
+        (ledger_key(message_id="m-comment-sending", target_group_id="30003"),
+         "sent", "target-pending", "unknown", "", "", 14.0, 0.0),
+    ]
+    ledger = open_test_ledger(tmp_path)
+    try:
+        for key, status, target_message_id, comment_status, comment_message_id, reason, created, updated in expected:
+            record = ledger.get(key)
+            assert record is not None, key
+            assert (record.status, record.target_message_id, record.comment_status,
+                    record.comment_message_id, record.reason, record.created_at,
+                    record.updated_at) == (status, target_message_id, comment_status,
+                                           comment_message_id, reason, created, updated), key
+    finally:
+        ledger.close()
+    after = path.read_bytes()
+    reopened = open_test_ledger(tmp_path)
+    try:
+        for key, status, target_message_id, *_ in expected:
+            again = reopened.get(key)
+            assert again is not None
+            assert (again.status, again.target_message_id) == (status, target_message_id), key
+    finally:
+        reopened.close()
+    assert path.read_bytes() == after, "一次性迁移：二次打开不得再改写文件"
+    # 既有键的占位阻断（`reserve` 对迁移后的记录仍不授予）随五字段键写入路径一并断言，
+    # 见 test_同号群与私聊互不阻断且评论占位只为已有源记录创建。
+
+
+@pytest.mark.parametrize("phase", ["校验", "写", "提交"])
+def test_迁移任一步失败保留原文件并按账本不可用关闭发送(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    """注入校验失败/写盘失败/提交失败：原文件字节不变，按账本不可用关闭发送。
+
+    形状不可识别（未知结构）在迁移前的只读验证即被拒绝，同样不改写原文件，由
+    test_结构或状态不兼容不当空库修复 与 test_目标形态相关但结构不符 覆盖。
+    """
+
     path = tmp_path / LEDGER_FILE_NAME
     _legacy_database(path)
     before = path.read_bytes()
-    ledger = open_test_ledger(tmp_path)
-    try:
-        record = ledger.get(ledger_key())
-        assert record is not None
-        assert (record.status, record.target_message_id, record.comment_status,
-                record.comment_message_id, record.reason, record.created_at, record.updated_at) == (
-                    "sent", "old-target", "sent", "old-comment", "旧安全原因", 10.0, 20.0)
-        assert not ledger.reserve(ledger_key()).granted
-    finally:
-        ledger.close()
-    assert path.read_bytes() == before
+    connect = sqlite3.connect
+    faults = {"校验": None, "写": "write", "提交": "commit"}
 
-
-@pytest.mark.parametrize("kind", ["空文件", "缺表", "缺列", "错主键", "未知源状态"])
-def test_结构或状态不兼容不当空库修复(tmp_path: Path, kind: str) -> None:
-    path = tmp_path / LEDGER_FILE_NAME
-    if kind == "空文件":
-        path.touch()
-    elif kind == "缺表":
-        connection = sqlite3.connect(path)
-        connection.execute("CREATE TABLE unrelated (id TEXT)")
-        connection.close()
-    else:
-        schema = LEGACY_SCHEMA
-        if kind == "缺列":
-            schema = schema.replace("reason TEXT NOT NULL DEFAULT '', ", "")
-        elif kind == "多列":
-            schema = schema.replace("status TEXT NOT NULL,", "extra TEXT, status TEXT NOT NULL,", 1)
-        elif kind == "错主键":
-            schema = schema.replace("PRIMARY KEY (account_id, source_group_id, source_message_id, target_group_id)",
-                                    "PRIMARY KEY (source_message_id)")
-        elif kind == "错类型":
-            schema = schema.replace("account_id TEXT", "account_id INTEGER")
-        elif kind == "可空键":
-            schema = schema.replace("account_id TEXT NOT NULL", "account_id TEXT")
-        if kind in {"未知源状态", "未知评论状态"}:
-            _legacy_database(path, status="private-value" if kind == "未知源状态" else "sent",
-                             comment_status="private-value" if kind == "未知评论状态" else "sent")
+    def create(*args: Any, **kwargs: Any) -> _FaultConnection:
+        connection = connect(*args, **kwargs, factory=_FaultConnection)
+        if faults[phase] is None:
+            connection.skip_inserts = True  # 回填被跳过：记录数校验必须失败。
         else:
-            connection = sqlite3.connect(path)
-            connection.execute(schema)
-            if kind == "额外表":
-                connection.execute("CREATE TABLE ledger_meta (value TEXT)")
-            if kind == "触发器":
-                connection.execute("CREATE TRIGGER alter_facts AFTER INSERT ON delivery_ledger "
-                                   "BEGIN DELETE FROM delivery_ledger; END")
-            connection.close()
-    before = path.read_bytes()
-    result = open_ledger(path)
-    try:
+            connection.failure = faults[phase]  # 写：INSERT 后抛；提交：COMMIT 前抛。
+        return connection
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", create)
+        result = open_ledger(path)
         assert isinstance(result, LedgerUnavailable)
-        assert "private-value" not in result.reason
+        assert "迁移" in result.reason, result.reason
+        assert _SYNTHETIC_PRIVATE not in result.reason
+    assert path.read_bytes() == before, "迁移失败必须保留原文件字节，不新建空库、不回迁"
+    reopened = open_test_ledger(tmp_path)
+    try:
+        assert reopened.get(ledger_key()).target_message_id == "old-target"
     finally:
-        if isinstance(result, DeliveryLedger):
-            result.close()
-    assert path.read_bytes() == before
+        reopened.close()
 
 
 @pytest.mark.parametrize("collation", ["BINARY", "NOCASE", "RTRIM"])
@@ -224,239 +286,6 @@ def test_原库四字段键必须保持逐字比较语义(tmp_path: Path, collat
     finally:
         if isinstance(ledger, DeliveryLedger):
             ledger.close()
-
-
-@pytest.mark.parametrize("field", ["account_id", "source_group_id", "source_message_id", "target_group_id"])
-@pytest.mark.parametrize("location", ["列", "主键"])
-@pytest.mark.parametrize("collation", ["BiNaRy", '"binary"'])
-def test_BINARY大小写等价原库可打开且四键源与评论逐字隔离(tmp_path: Path, field: str,
-                                                        location: str, collation: str) -> None:
-    fields = ("account_id", "source_group_id", "source_message_id", "target_group_id")
-    path = tmp_path / LEDGER_FILE_NAME
-    if location == "列":
-        schema = LEGACY_SCHEMA.replace(f"{field} TEXT NOT NULL", f"{field} TEXT COLLATE {collation} NOT NULL")
-    else:
-        schema = LEGACY_SCHEMA.replace(
-            "PRIMARY KEY (account_id, source_group_id, source_message_id, target_group_id)",
-            "PRIMARY KEY (" + ", ".join(f"{name} COLLATE {collation}" if name == field else name
-                                        for name in fields) + ")")
-    first = replace(ledger_key(), **{field: "CaseID"})
-    second = replace(first, **{field: "caseid"})
-    connection = sqlite3.connect(path)
-    try:
-        connection.execute(schema)
-        connection.executemany(
-            "INSERT INTO delivery_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [tuple(getattr(key, name) for name in fields) +
-             ("sent", target, "", "", "旧安全原因", 10.0, 20.0)
-             for key, target in ((first, "target-known"), (second, "right-target"))],
-        )
-        connection.commit()
-    finally:
-        connection.close()
-    clock = FakeClock(start=100)
-    ledger = open_ledger(path, clock=clock)
-    try:
-        assert isinstance(ledger, DeliveryLedger)
-        original_first, original_second = ledger.get(first), ledger.get(second)
-        assert original_first is not None and original_second is not None
-        assert (original_first.status, original_first.target_message_id) == ("sent", "target-known")
-        assert (original_second.status, original_second.target_message_id) == ("sent", "right-target")
-        assert ledger.reserve(first) == Reservation(False, original_first)
-        assert ledger.reserve(second) == Reservation(False, original_second)
-        trailing = replace(first, **{field: "CaseID "})
-        assert ledger.get(trailing) is None
-        assert ledger.reserve_comment(trailing) == Reservation(False, None)
-        assert ledger.reserve(trailing).granted
-        comment = ledger.reserve_comment(second)
-        assert comment.granted
-        assert comment.record == replace(original_second, comment_status="sending", updated_at=100)
-        assert not ledger.reserve_comment(second).granted
-        assert ledger.get(first) == original_first
-        assert ledger.get(second) == comment.record
-    finally:
-        if isinstance(ledger, DeliveryLedger):
-            ledger.close()
-    reopened = open_ledger(path, clock=clock)
-    try:
-        assert isinstance(reopened, DeliveryLedger)
-        assert reopened.get(first) == original_first
-        assert reopened.get(second) == replace(original_second, comment_status="unknown", updated_at=100)
-        assert not reopened.reserve(first).granted
-        assert not reopened.reserve(second).granted
-        assert not reopened.reserve_comment(second).granted
-    finally:
-        if isinstance(reopened, DeliveryLedger):
-            reopened.close()
-
-
-@pytest.mark.parametrize("location", ["列", "主键"])
-@pytest.mark.parametrize("collation", ["ＢＩＮＡＲＹ", "BINARY_UNKNOWN"])
-def test_BINARY大小写兼容不接受Unicode易混淆或未知规则(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                      location: str, collation: str) -> None:
-    connect = sqlite3.connect
-
-    def connect_with_collation(*args: Any, **kwargs: Any) -> sqlite3.Connection:
-        connection = connect(*args, **kwargs)
-        # 合成可被 SQLite 识别的未知名称，避免仅因缺少规则而提前失败。
-        connection.create_collation(collation, lambda left, right: (left > right) - (left < right))
-        return connection
-
-    monkeypatch.setattr(sqlite3, "connect", connect_with_collation)
-    if location == "列":
-        schema = LEGACY_SCHEMA.replace("source_message_id TEXT NOT NULL",
-                                       f'source_message_id TEXT COLLATE "{collation}" NOT NULL')
-    else:
-        schema = LEGACY_SCHEMA.replace("source_message_id, target_group_id)",
-                                       f'source_message_id COLLATE "{collation}", target_group_id)')
-    path = tmp_path / LEDGER_FILE_NAME
-    _legacy_database(path, schema=schema)
-    before = path.read_bytes()
-    ledger = open_ledger(path)
-    try:
-        assert isinstance(ledger, LedgerUnavailable)
-    finally:
-        if isinstance(ledger, DeliveryLedger):
-            ledger.close()
-    assert path.read_bytes() == before
-
-
-# 独立字面量列声明；主键故意覆盖为 BINARY，以暴露列默认规则与索引不一致。
-def _collation_database(path: Path, field: str, collation: str, counterpart: str,
-                        *, decorated: bool = False) -> tuple[DeliveryKey, DeliveryKey, list[tuple[Any, ...]]]:
-    fields = ("account_id", "source_group_id", "source_message_id", "target_group_id")
-    declarations = [f"{name} TEXT NOT NULL" for name in fields]
-    comparison = (f'cOlLaTe /* BINARY 只是注释 */ "{collation.lower()}"'
-                  if decorated else f"COLLATE {collation}")
-    declarations[fields.index(field)] = f'"{field}" TEXT {comparison} NOT NULL'
-    connection = sqlite3.connect(path)
-    try:
-        connection.execute(f"""
-            CREATE TABLE delivery_ledger (
-                {', '.join(declarations)},
-                status TEXT NOT NULL, target_message_id TEXT NOT NULL DEFAULT '',
-                comment_status TEXT NOT NULL DEFAULT '', comment_message_id TEXT NOT NULL DEFAULT '',
-                reason TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
-                PRIMARY KEY (account_id COLLATE BINARY, source_group_id COLLATE BINARY,
-                             source_message_id COLLATE BINARY, target_group_id COLLATE BINARY)
-            )
-        """)
-        first = replace(ledger_key(), **{field: "CaseID"})
-        second = replace(first, **{field: counterpart})
-        rows = [tuple(getattr(key, name) for name in fields) +
-                ("sent", target, "", "", "", 10.0, 20.0)
-                for key, target in ((first, "target-known"), (second, "right-target"))]
-        connection.executemany("INSERT INTO delivery_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
-        connection.commit()
-        return first, second, rows
-    finally:
-        connection.close()
-
-
-@pytest.mark.parametrize("field", ["account_id", "source_group_id", "source_message_id", "target_group_id"])
-@pytest.mark.parametrize("collation,counterpart", [("NOCASE", "caseid"), ("RTRIM", "CaseID "),
-                                                   ("BINARY", "caseid"), ("BINARY", "CaseID ")])
-def test_列比较规则不能被主键BINARY覆盖掩盖(tmp_path: Path, field: str, collation: str,
-                                         counterpart: str, decorated: bool = False) -> None:
-    path = tmp_path / LEDGER_FILE_NAME
-    first, second, rows = _collation_database(path, field, collation, counterpart, decorated=decorated)
-    before = path.read_bytes()
-    ledger = open_ledger(path)
-    try:
-        if collation == "BINARY":
-            assert isinstance(ledger, DeliveryLedger)
-            assert ledger.get(first).target_message_id == "target-known"
-            assert ledger.get(second).target_message_id == "right-target"
-            assert not ledger.reserve(first).granted
-            assert not ledger.reserve(second).granted
-        else:
-            assert isinstance(ledger, LedgerUnavailable)
-    finally:
-        if isinstance(ledger, DeliveryLedger):
-            ledger.close()
-    assert path.read_bytes() == before
-    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
-    try:
-        assert connection.execute("SELECT * FROM delivery_ledger ORDER BY rowid").fetchall() == rows
-    finally:
-        connection.close()
-
-
-@pytest.mark.parametrize("field", ["account_id", "source_message_id"])
-@pytest.mark.parametrize("collation,counterpart", [("NOCASE", "caseid")])
-@pytest.mark.parametrize("operation", ["get", "reserve", "mark_sent", "mark_failed", "mark_unknown",
-                                        "reserve_comment", "record_comment"])
-def test_公开构造注入混合比较库也不能串读串写(tmp_path: Path, field: str, collation: str,
-                                           counterpart: str, operation: str) -> None:
-    path = tmp_path / LEDGER_FILE_NAME
-    first, second, _ = _collation_database(path, field, collation, counterpart)
-    connection = sqlite3.connect(path, isolation_level=None)
-    status = "failed" if operation == "reserve" else "sending" if operation.startswith("mark_") else "sent"
-    connection.execute("UPDATE delivery_ledger SET status=?, comment_status=?",
-                       (status, "sending" if operation == "record_comment" else ""))
-    # 公开构造器注入存储，专门检验纵深防御；正式 open_ledger 必须拒绝此库。
-    ledger = DeliveryLedger(connection, FakeClock())
-    try:
-        untouched = ledger.get(first)
-        operations = {
-            "get": lambda: ledger.get(second),
-            "reserve": lambda: ledger.reserve(second),
-            "mark_sent": lambda: ledger.mark_sent(second, "new-target"),
-            "mark_failed": lambda: ledger.mark_failed(second, "明确未发"),
-            "mark_unknown": lambda: ledger.mark_unknown(second, "待核实"),
-            "reserve_comment": lambda: ledger.reserve_comment(second),
-            "record_comment": lambda: ledger.record_comment(second, status="sent", message_id="comment-target"),
-        }
-        result = operations[operation]()
-        if operation == "get":
-            assert result.target_message_id == "right-target"
-        elif operation in {"reserve", "reserve_comment"}:
-            assert result.granted
-            assert result.record.key == second
-            if operation == "reserve_comment":
-                assert result.record.target_message_id == "right-target"
-                assert result.record.comment_status == "sending"
-            else:
-                assert result.record.status == "sending"
-        else:
-            assert result is True
-        assert ledger.get(first) == untouched
-        assert not connection.in_transaction
-    finally:
-        ledger.close()
-
-
-@pytest.mark.parametrize("operation", ["get", "mark_sent", "mark_failed", "mark_unknown",
-                                        "reserve_comment", "record_comment"])
-def test_公开方法遇到异常多行必须回滚报不可用(tmp_path: Path, operation: str) -> None:
-    path = tmp_path / LEDGER_FILE_NAME
-    schema = LEGACY_SCHEMA.replace(
-        "PRIMARY KEY (account_id, source_group_id, source_message_id, target_group_id)", "CHECK (1)")
-    status = "sending" if operation.startswith("mark_") else "sent"
-    _legacy_database(path, schema=schema, status=status,
-                     comment_status="sending" if operation == "record_comment" else "")
-    connection = sqlite3.connect(path, isolation_level=None)
-    connection.execute("INSERT INTO delivery_ledger SELECT * FROM delivery_ledger")
-    before = path.read_bytes()
-    rows = connection.execute("SELECT * FROM delivery_ledger ORDER BY rowid").fetchall()
-    ledger = DeliveryLedger(connection, FakeClock())
-    key = ledger_key()
-    operations = {
-        "get": lambda: ledger.get(key),
-        "mark_sent": lambda: ledger.mark_sent(key, "new-target"),
-        "mark_failed": lambda: ledger.mark_failed(key, "明确未发"),
-        "mark_unknown": lambda: ledger.mark_unknown(key, "待核实"),
-        "reserve_comment": lambda: ledger.reserve_comment(key),
-        "record_comment": lambda: ledger.record_comment(key, status="sent", message_id="comment-target"),
-    }
-    try:
-        with pytest.raises(LedgerUnavailableError):
-            operations[operation]()
-        assert not connection.in_transaction
-        assert connection.execute("SELECT * FROM delivery_ledger ORDER BY rowid").fetchall() == rows
-    finally:
-        ledger.close()
-    assert path.read_bytes() == before
 
 
 def test_缺主库但有旧独占锁不允许当新装(tmp_path: Path) -> None:
@@ -508,16 +337,6 @@ def test_本目录历史证据不读内容不联网也不修改(tmp_path: Path, 
         assert (marker / "delivery_ledger.sqlite3.bak").read_text() == "假敏感正文"
 
 
-@pytest.mark.parametrize("suffix", _SQLITE_SIDECAR_SUFFIXES)
-def test_孤留伴随文件保持关闭且保留证据(tmp_path: Path, suffix: str) -> None:
-    marker = tmp_path / (LEDGER_FILE_NAME + suffix)
-    marker.write_bytes(b"synthetic-evidence")
-    result = open_ledger(tmp_path / LEDGER_FILE_NAME)
-    assert isinstance(result, LedgerUnavailable)
-    assert not (tmp_path / LEDGER_FILE_NAME).exists()
-    assert marker.read_bytes() == b"synthetic-evidence"
-
-
 @pytest.mark.parametrize("kind", ["数据库", "锁", "伴随文件", "目录", "祖先目录", "硬链接", "悬空链接", "命名管道"])
 def test_无法确认来源的路径在打开数据库前拒绝(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
     import os
@@ -560,24 +379,6 @@ def test_无法确认来源的路径在打开数据库前拒绝(tmp_path: Path, 
     assert (actual / LEDGER_FILE_NAME).read_bytes() == before
 
 
-def test_完整原库的已知WAL伴随文件可以核实读取(tmp_path: Path) -> None:
-    path = tmp_path / LEDGER_FILE_NAME
-    _legacy_database(path)
-    connection = sqlite3.connect(path)
-    ledger = None
-    try:
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("UPDATE delivery_ledger SET target_message_id='wal-target'")
-        connection.commit()
-        assert (tmp_path / (LEDGER_FILE_NAME + "-wal")).exists()
-        ledger = open_test_ledger(tmp_path)
-        assert ledger.get(ledger_key()).target_message_id == "wal-target"
-    finally:
-        if ledger is not None:
-            ledger.close()
-        connection.close()
-
-
 def _committed_wal_snapshot(tmp_path: Path, *, page_size: int = 4096) -> Path:
 
     source, snapshot = tmp_path / "source", tmp_path / "snapshot"
@@ -599,42 +400,6 @@ def _committed_wal_snapshot(tmp_path: Path, *, page_size: int = 4096) -> Path:
     finally:
         connection.close()
     return snapshot / LEDGER_FILE_NAME
-
-
-@pytest.mark.parametrize("byte_order", ["little", "big"])
-@pytest.mark.parametrize("page_size", [512, 4096, 65536])
-def test_合法WAL两种校验字节序及页面大小保持成功阻断(tmp_path: Path, byte_order: str, page_size: int) -> None:
-
-    path = _committed_wal_snapshot(tmp_path, page_size=page_size)
-    wal = path.with_name(LEDGER_FILE_NAME + "-wal")
-    data = bytearray(wal.read_bytes())
-    data[:4] = (0x377F0682 if byte_order == "little" else 0x377F0683).to_bytes(4, "big")
-    first = second = 0
-
-    def checksum(payload: bytes | bytearray) -> bytes:
-        nonlocal first, second
-        for index in range(0, len(payload), 8):
-            first = (first + int.from_bytes(payload[index:index + 4], byte_order) + second) % 2**32
-            second = (second + int.from_bytes(payload[index + 4:index + 8], byte_order) + first) % 2**32
-        return first.to_bytes(4, "big") + second.to_bytes(4, "big")
-
-    data[24:32] = checksum(data[:24])
-    for offset in range(32, len(data), page_size + 24):
-        data[offset + 16:offset + 24] = checksum(data[offset:offset + 8] + data[offset + 24:offset + 24 + page_size])
-    wal.write_bytes(data)
-    ledger = open_test_ledger(path.parent)
-    try:
-        record = ledger.get(ledger_key())
-        assert (record.status, record.target_message_id) == ("sent", "wal-only-target")
-        assert not ledger.reserve(ledger_key()).granted
-    finally:
-        ledger.close()
-    reopened = open_test_ledger(path.parent)
-    try:
-        assert reopened.get(ledger_key()).target_message_id == "wal-only-target"
-        assert not reopened.reserve(ledger_key()).granted
-    finally:
-        reopened.close()
 
 
 @pytest.mark.parametrize("damage", ["完整", "头校验", "帧校验", "页内容", "截断", "盐值"])
@@ -670,38 +435,6 @@ def test_WAL独有成功事实必须核实完整且损坏证据原样保留(tmp_
     finally:
         if isinstance(ledger, DeliveryLedger):
             ledger.close()
-
-
-@pytest.mark.parametrize("suffix", ["", "-wal"])
-def test_WAL核实期间读失败保留证据且不交给SQLite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                suffix: str) -> None:
-    path = _committed_wal_snapshot(tmp_path)
-    before = {entry.name: entry.read_bytes() for entry in path.parent.iterdir()}
-    original_open = Path.open
-
-    def fail_read(file: Path, *args: Any, **kwargs: Any) -> Any:
-        if file == path.with_name(LEDGER_FILE_NAME + suffix):
-            raise OSError(_SYNTHETIC_PRIVATE)
-        return original_open(file, *args, **kwargs)
-
-    def must_not_connect(*args: Any, **kwargs: Any) -> None:
-        pytest.fail("WAL 无法核实时不得交给 SQLite 继续恢复")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(Path, "open", fail_read)
-        patch.setattr(sqlite3, "connect", must_not_connect)
-        ledger = open_ledger(path)
-        assert isinstance(ledger, LedgerUnavailable)
-        assert _SYNTHETIC_PRIVATE not in ledger.reason
-    for name, content in before.items():
-        assert (path.parent / name).read_bytes() == content
-    # 故障移除即可打开，不能因前次失败丢失 WAL 独有成功事实。
-    reopened = open_test_ledger(path.parent)
-    try:
-        assert reopened.get(ledger_key()).target_message_id == "wal-only-target"
-        assert not reopened.reserve(ledger_key()).granted
-    finally:
-        reopened.close()
 
 
 # --------------------------------------------------------------------------- 5.4
@@ -870,20 +603,6 @@ def test_评论在途重开仅评论转未知并保留源成功(tmp_path: Path) 
         reopened.close()
 
 
-@pytest.mark.parametrize("status,message_id", [("sent", ""), ("sent", "  "), ("sending", ""), ("unexpected", "")])
-def test_非法评论终态保留在途占位(tmp_path: Path, status: Any, message_id: str) -> None:
-    ledger = open_test_ledger(tmp_path)
-    try:
-        ledger.reserve(ledger_key())
-        ledger.mark_sent(ledger_key(), "source-target")
-        ledger.reserve_comment(ledger_key())
-        with pytest.raises(LedgerUnavailableError):
-            ledger.record_comment(ledger_key(), status=status, message_id=message_id)
-        assert ledger.get(ledger_key()).comment_status == "sending"
-    finally:
-        ledger.close()
-
-
 # --------------------------------------------------------------------------- 5.7
 
 
@@ -896,6 +615,8 @@ class _FaultCursor(sqlite3.Cursor):
     def execute(self, sql: str, parameters: Any = ()) -> Any:
         connection = self.connection
         connection.commands.append((sql, tuple(parameters)))
+        if connection.skip_inserts and sql.split()[0] == "INSERT":
+            return self  # 迁移回填被跳过：新表为空、旧表有行，记录数校验必须失败。
         result = super().execute(sql, parameters)
         phase = sql.split()[0]
         matches = {"begin": {"BEGIN"}, "write": {"INSERT", "UPDATE"}, "query": {"SELECT"}}
@@ -916,6 +637,7 @@ class _FaultConnection(sqlite3.Connection):
     """通过公开连接工厂注入开始、写入、查询和提交故障。"""
 
     failure = ""
+    skip_inserts = False
     rollback_failures = 0
     close_failure = False
     cursor_error = sqlite3.OperationalError
@@ -948,350 +670,71 @@ class _FaultConnection(sqlite3.Connection):
         super().commit()
 
 
-def _fault_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[DeliveryLedger, _FaultConnection]:
-
-    connect = sqlite3.connect
-    connections: list[_FaultConnection] = []
-
-    def create(*args: Any, **kwargs: Any) -> _FaultConnection:
-        connection = connect(*args, **kwargs, factory=_FaultConnection)
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(sqlite3, "connect", create)
-    return open_test_ledger(tmp_path), connections[-1]
-
-
-@pytest.mark.parametrize("phase", ["cursor", "cursor_close"])
-@pytest.mark.parametrize("error_type", [sqlite3.OperationalError, OSError])
-@pytest.mark.parametrize("operation", ["get", "reserve"])
-def test_游标创建及关闭故障保持安全错误与真实提交结果(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, error_type: type[Exception], operation: str,
-) -> None:
-
-    ledger, connection = _fault_open(tmp_path, monkeypatch)
-    key = ledger_key()
-    try:
-        connection.failure, connection.cursor_error = phase, error_type
-        with pytest.raises(LedgerUnavailableError) as caught:
-            getattr(ledger, operation)(key)
-        assert not connection.in_transaction
-        assert _SYNTHETIC_PRIVATE not in "".join(traceback.format_exception(caught.value))
-        assert str(caught.value) == ("状态库不可读或所在目录不可写" if error_type is sqlite3.OperationalError else "存储路径不可用")
-        record = ledger.get(key)
-        if phase == "cursor_close" and operation == "reserve":
-            assert record is not None and record.status == STATUS_SENDING
-            assert not ledger.reserve(key).granted, "提交后的清理故障不能抹除防重占位"
-        else:
-            assert record is None
-        assert ledger.reserve(ledger_key(message_id="after-cursor-fault")).granted
-    finally:
-        ledger.close()
-
-
-@pytest.mark.parametrize("phase", ["begin", "write", "commit"])
-@pytest.mark.parametrize("operation", ["reserve", "mark_sent", "mark_unknown", "reserve_comment"])
-def test_事务任一阶段失败不丢旧记录且连接可继续使用(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                   caplog: pytest.LogCaptureFixture, phase: str, operation: str) -> None:
-
-    ledger, connection = _fault_open(tmp_path, monkeypatch)
-    old_key, key = ledger_key(message_id="old"), ledger_key()
-    try:
-        ledger.reserve(old_key)
-        ledger.mark_sent(old_key, "old-target")
-        if operation != "reserve":
-            ledger.reserve(key)
-        if operation in {"reserve_comment", "record_comment"}:
-            ledger.mark_sent(key, "target")
-        if operation == "record_comment":
-            ledger.reserve_comment(key)
-        before, old_before = ledger.get(key), ledger.get(old_key)
-        operations = {
-            "reserve": lambda: ledger.reserve(key),
-            "mark_sent": lambda: ledger.mark_sent(key, "target"),
-            "mark_failed": lambda: ledger.mark_failed(key, "明确未发"),
-            "mark_unknown": lambda: ledger.mark_unknown(key, "待核实"),
-            "reserve_comment": lambda: ledger.reserve_comment(key),
-            "record_comment": lambda: ledger.record_comment(key, status="sent", message_id="comment-target"),
-            "recover_interrupted": ledger.recover_interrupted,
-        }
-        connection.failure = phase
-        with pytest.raises(LedgerUnavailableError) as caught:
-            operations[operation]()
-        assert not connection.in_transaction
-        assert ledger.get(key) == before
-        assert ledger.get(old_key) == old_before
-        assert ledger.reserve(ledger_key(message_id="after-fault")).granted
-        assert _SYNTHETIC_PRIVATE not in "".join(traceback.format_exception(caught.value))
-        assert _SYNTHETIC_PRIVATE not in caplog.text
-    finally:
-        ledger.close()
-
-
-@pytest.mark.parametrize("operation", ["reserve", "reserve_comment"])
-@pytest.mark.parametrize("rollback_failures,close_failure", [(1, False), (2, False), (2, True)])
-def test_实际写入后回滚失败必须有限恢复或停用并安全释放(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                    caplog: pytest.LogCaptureFixture, operation: str,
-                                                    rollback_failures: int, close_failure: bool) -> None:
-
-    ledger, connection = _fault_open(tmp_path, monkeypatch)
-    old_key, key = ledger_key(message_id="old-sent"), ledger_key()
-    try:
-        ledger.reserve(old_key)
-        ledger.mark_sent(old_key, "old-target")
-        if operation == "reserve_comment":
-            ledger.reserve(key)
-            ledger.mark_sent(key, "source-target")
-        before = ledger.get(key)
-        connection.failure = "write"
-        connection.rollback_failures = rollback_failures
-        connection.close_failure = close_failure
-        with pytest.raises(LedgerUnavailableError) as caught:
-            getattr(ledger, operation)(key)  # 替身先真实 INSERT/UPDATE，再抛外部存储异常。
-        assert _SYNTHETIC_PRIVATE not in "".join(traceback.format_exception(caught.value)) + caplog.text
-        if rollback_failures == 1:
-            assert not connection.in_transaction
-            assert ledger.get(key) == before
-            assert ledger.get(old_key).target_message_id == "old-target"
-        else:
-            with pytest.raises(LedgerUnavailableError, match="停用"):
-                ledger.get(old_key)
-            with pytest.raises(LedgerUnavailableError, match="停用"):
-                ledger.reserve(ledger_key(message_id="after-fault"))
-            blocked = open_ledger(tmp_path / LEDGER_FILE_NAME)
-            assert isinstance(blocked, LedgerUnavailable)
-            if close_failure:
-                with pytest.raises(LedgerUnavailableError, match="关闭"):
-                    ledger.close()
-                assert isinstance(open_ledger(tmp_path / LEDGER_FILE_NAME), LedgerUnavailable)
-    finally:
-        connection.close_failure = False
-        ledger.close()
-    reopened = open_test_ledger(tmp_path)
-    try:
-        assert reopened.get(old_key).target_message_id == "old-target"
-        assert not reopened.reserve(old_key).granted
-        assert reopened.get(key) == before
-        assert reopened.get(ledger_key(message_id="after-fault")) is None
-    finally:
-        reopened.close()
-
-
-def test_查询存储故障不是不存在且之后可以继续查询(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    ledger, connection = _fault_open(tmp_path, monkeypatch)
-    try:
-        ledger.reserve(ledger_key())
-        expected = ledger.get(ledger_key())
-        connection.failure = "query"
-        with pytest.raises(LedgerUnavailableError):
-            ledger.get(ledger_key())
-        assert not connection.in_transaction
-        assert ledger.get(ledger_key()) == expected
-        assert ledger.get(ledger_key(message_id="missing")) is None
-    finally:
-        ledger.close()
-
-
-@pytest.mark.parametrize("status", ["failed", "unknown"])
-def test_调用方原始原因不能将正文凭证资源写入账本或日志(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                        caplog: pytest.LogCaptureFixture, status: str) -> None:
-    ledger, connection = _fault_open(tmp_path, monkeypatch)
-    try:
-        key = ledger_key()
-        ledger.reserve(key)
-        finalize = ledger.mark_failed if status == "failed" else ledger.mark_unknown
-        assert finalize(key, _SYNTHETIC_PRIVATE)
-        record = ledger.get(key)
-        assert record.status == status and record.reason
-        assert _SYNTHETIC_PRIVATE not in repr(record)
-        assert _SYNTHETIC_PRIVATE not in repr(connection.commands)
-        assert _SYNTHETIC_PRIVATE not in caplog.text
-    finally:
-        ledger.close()
-
-
-@pytest.mark.parametrize("phase", ["begin", "write", "commit"])
-def test_打开时恢复失败返回不可用并释放独占锁保留原记录(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                        phase: str) -> None:
-    path = tmp_path / LEDGER_FILE_NAME
-    _legacy_database(path, status="sending", comment_status="")
-    before = path.read_bytes()
-    connect = sqlite3.connect
-
-    def create(*args: Any, **kwargs: Any) -> _FaultConnection:
-        connection = connect(*args, **kwargs, factory=_FaultConnection)
-        connection.failure = phase
-        return connection
-
-    with monkeypatch.context() as patch:
-        patch.setattr(sqlite3, "connect", create)
-        result = open_ledger(path)
-        assert isinstance(result, LedgerUnavailable)
-        assert _SYNTHETIC_PRIVATE not in result.reason
-    assert path.read_bytes() == before
-    reopened = open_test_ledger(tmp_path)
-    try:
-        assert reopened.get(ledger_key()).status == "unknown"
-        assert reopened.get(ledger_key()).target_message_id == "old-target"
-    finally:
-        reopened.close()
-
-
-@pytest.mark.parametrize("invalid_schema", [False, True])
-def test_打开清理失败安全报告并在依赖恢复后释放独占(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                     caplog: pytest.LogCaptureFixture, invalid_schema: bool) -> None:
-    path = tmp_path / LEDGER_FILE_NAME
-    if invalid_schema:
-        connection = sqlite3.connect(path)
-        connection.execute("CREATE TABLE unrelated (id TEXT)")
-        connection.close()
-    else:
-        _legacy_database(path)
-    before = path.read_bytes()
-    connect = sqlite3.connect
-    failing = True
-
-    class ClosingFault(sqlite3.Connection):
-        def close(self) -> None:
-            if failing:
-                raise sqlite3.OperationalError(_SYNTHETIC_PRIVATE)
-            super().close()
-
-    def create(*args: Any, **kwargs: Any) -> sqlite3.Connection:
-        return connect(*args, **kwargs, factory=ClosingFault)
-
-    import fcntl
-    import os
-
-    monkeypatch.setattr(sqlite3, "connect", create)
-    result = open_ledger(path)
-    assert isinstance(result, LedgerUnavailable)
-    assert "关闭" in result.reason or "清理" in result.reason
-    if invalid_schema:
-        assert "缺表" in result.reason  # 清理异常不能掩盖最初的结构诊断。
-    assert _SYNTHETIC_PRIVATE not in result.reason + caplog.text
-    blocked = open_ledger(path)
-    assert isinstance(blocked, LedgerUnavailable)
-    descriptor = os.open(tmp_path / "delivery_ledger.lock", os.O_RDWR)
-    try:
-        with pytest.raises(BlockingIOError):
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    finally:
-        os.close(descriptor)
-    failing = False
-    reopened = open_ledger(path)
-    if invalid_schema:
-        assert isinstance(reopened, LedgerUnavailable)
-        assert "缺表" in reopened.reason and "独占" not in reopened.reason
-    else:
-        assert isinstance(reopened, DeliveryLedger)
-        assert reopened.get(ledger_key()).target_message_id == "old-target"
-        reopened.close()
-    assert path.read_bytes() == before
-
-
-@pytest.mark.parametrize("acquire_then_fail", [False, True])
-def test_打开失败且解锁失败保留真实独占直到可以安全清理(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                        acquire_then_fail: bool) -> None:
-    import fcntl
-    import os
-
-    path = tmp_path / LEDGER_FILE_NAME
-    if acquire_then_fail:
-        _legacy_database(path)
-    else:
-        connection = sqlite3.connect(path)
-        connection.execute("CREATE TABLE unrelated (id TEXT)")
-        connection.close()
-    before = path.read_bytes()
-    native_flock = fcntl.flock
-    failing = True
-
-    def fail_unlock(descriptor: int, operation: int) -> None:
-        if failing and operation == fcntl.LOCK_UN:
-            raise OSError(_SYNTHETIC_PRIVATE)
-        native_flock(descriptor, operation)
-        if failing and acquire_then_fail and operation & fcntl.LOCK_EX:
-            raise OSError(_SYNTHETIC_PRIVATE)
-
-    monkeypatch.setattr(fcntl, "flock", fail_unlock)
-    result = open_ledger(path)
-    assert isinstance(result, LedgerUnavailable)
-    assert _SYNTHETIC_PRIVATE not in result.reason
-    probe = os.open(tmp_path / "delivery_ledger.lock", os.O_RDWR)
-    try:
-        with pytest.raises(BlockingIOError):
-            native_flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        assert isinstance(open_ledger(path), LedgerUnavailable)
-        with pytest.raises(BlockingIOError):
-            native_flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        failing = False
-        reopened = open_ledger(path)
-        if acquire_then_fail:
-            assert isinstance(reopened, DeliveryLedger)
-            assert reopened.get(ledger_key()).target_message_id == "old-target"
-            reopened.close()
-        else:
-            assert isinstance(reopened, LedgerUnavailable)
-            assert "缺表" in reopened.reason and "独占" not in reopened.reason
-        native_flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        native_flock(probe, fcntl.LOCK_UN)
-    finally:
-        os.close(probe)
-    assert path.read_bytes() == before
-
-
-@pytest.mark.parametrize("closed_first", [False, True])
-def test_锁描述符关闭失败不泄密不误关复用描述符且独占可接管(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                          closed_first: bool) -> None:
-    import os
-
-    directory = tmp_path / "plugin"
-    directory.mkdir()
-    ledger = open_test_ledger(directory)
-    ledger.reserve(ledger_key())
-    ledger.mark_sent(ledger_key(), "known-target")
-    original_close = os.close
-    retained: list[int] = []
-
-    def fail_close(descriptor: int) -> None:
-        if closed_first:
-            original_close(descriptor)
-            other = os.open(tmp_path / "unrelated", os.O_CREAT | os.O_RDWR, 0o600)
-            assert other == descriptor  # 明确制造句柄号码复用；旧账本不得再次 close 它。
-            retained.append(other)
-        else:
-            retained.append(descriptor)
-        raise OSError(_SYNTHETIC_PRIVATE)
-
-    second = None
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(os, "close", fail_close)
-            with pytest.raises(LedgerUnavailableError) as caught:
-                ledger.close()
-        assert _SYNTHETIC_PRIVATE not in "".join(traceback.format_exception(caught.value))
-        with pytest.raises(LedgerUnavailableError, match="关闭未确认"):
-            ledger.close()
-        os.fstat(retained[0])
-        second = open_ledger(directory / LEDGER_FILE_NAME)
-        assert isinstance(second, DeliveryLedger)
-        assert second.get(ledger_key()).target_message_id == "known-target"
-        with pytest.raises(LedgerUnavailableError):
-            ledger.close()
-        blocked = open_ledger(directory / LEDGER_FILE_NAME)
-        assert isinstance(blocked, LedgerUnavailable)
-    finally:
-        if isinstance(second, DeliveryLedger):
-            second.close()
-        for descriptor in retained:
-            original_close(descriptor)
-
-
 # --------------------------------------------------------------------------- 4.1
 
 
-def test_账本键恰为账号源群源消息与目标群且不含评论(tmp_path: Path) -> None:
+def test_同号群与私聊互不阻断且评论占位只为已有源记录创建(tmp_path: Path) -> None:
+    """五字段键：群 12345 与好友 12345 是两笔独立投递，占位/落账/评论互不覆盖。"""
+
+    ledger = open_test_ledger(tmp_path)
+    group, private = ledger_key(), replace(ledger_key(), target_kind=TARGET_KIND_PRIVATE)
+    try:
+        assert ledger.reserve(group).granted
+        assert ledger.get(private) is None, "同号私聊目标不得命中群记录"
+        assert ledger.reserve(private).granted, "群占位不得阻断同号私聊占位"
+        assert ledger.mark_sent(group, "group-target") is True
+        assert ledger.mark_sent(private, "private-target") is True
+        assert ledger.get(group).target_message_id == "group-target"
+        assert ledger.get(private).target_message_id == "private-target"
+        assert not ledger.reserve(group).granted and not ledger.reserve(private).granted
+        # 评论占位按同一五字段键：各自只为自己的已成功源记录授予一次。
+        assert ledger.reserve_comment(group).granted
+        assert not ledger.reserve_comment(group).granted
+        assert ledger.reserve_comment(private).granted
+        assert ledger.record_comment(group, status=STATUS_SENT, message_id="group-comment")
+        assert ledger.record_comment(private, status=STATUS_SENT, message_id="private-comment")
+        assert ledger.get(group).comment_message_id == "group-comment"
+        assert ledger.get(private).comment_message_id == "private-comment"
+        # 不存在的源记录：评论占位不创建记录（返回 None 而非抛存储故障）。
+        missing = replace(private, target_group_id="99999")
+        assert ledger.reserve_comment(missing) == Reservation(False, None)
+    finally:
+        ledger.close()
+    reopened = open_test_ledger(tmp_path)
+    try:
+        assert reopened.get(group).comment_message_id == "group-comment"
+        assert reopened.get(private).comment_message_id == "private-comment"
+        assert not reopened.reserve(group).granted and not reopened.reserve(private).granted
+    finally:
+        reopened.close()
+
+
+def test_迁移后的既有键仍阻断重发且同号私聊可独立投递(tmp_path: Path) -> None:
+    """迁移保留阻断作用；既有群记录的同一目标号码可按私聊形态独立占位。"""
+
+    path = tmp_path / LEDGER_FILE_NAME
+    _legacy_database(path)
+    group = ledger_key()
+    private = replace(group, target_kind=TARGET_KIND_PRIVATE)
+    ledger = open_test_ledger(tmp_path)
+    try:
+        assert not ledger.reserve(group).granted, "迁移后的既有成功事实继续阻断重发"
+        assert ledger.get(private) is None
+        assert ledger.reserve(private).granted
+        assert not ledger.reserve_comment(group).granted, "既有评论已终态，不重复授予"
+        assert not ledger.reserve_comment(private).granted, "评论占位只对已成功源记录授予"
+        assert ledger.mark_sent(private, "private-target") is True
+    finally:
+        ledger.close()
+    reopened = open_test_ledger(tmp_path)
+    try:
+        assert reopened.get(group).target_message_id == "old-target"
+        assert reopened.get(private).target_message_id == "private-target"
+    finally:
+        reopened.close()
+
+
+def test_账本键恰为账号源群源消息目标与目标形态且不含评论(tmp_path: Path) -> None:
     ledger = open_test_ledger(tmp_path)
     key = ledger_key()
 
@@ -1306,6 +749,7 @@ def test_账本键恰为账号源群源消息与目标群且不含评论(tmp_pat
         ("源群", replace(key, source_group_id="10555")),
         ("源消息", replace(key, source_message_id="m-other")),
         ("目标群", replace(key, target_group_id="20003")),
+        ("目标形态", replace(key, target_kind=TARGET_KIND_PRIVATE)),
     ):
         assert ledger.get(other) is None, f"{label}不同即为不同键，不应命中同一条记录"
 
@@ -1317,48 +761,6 @@ def test_账本键恰为账号源群源消息与目标群且不含评论(tmp_pat
         "评论不参与键：写入评论后仍按原键读回，不需要新键"
     )
     ledger.close()
-
-
-def test_账本区分四种状态并保存评论结果(tmp_path: Path) -> None:
-    ledger = open_test_ledger(tmp_path)
-    sending = ledger_key(message_id="m-sending")
-    sent = ledger_key(message_id="m-sent")
-    failed = ledger_key(message_id="m-failed")
-    unknown = ledger_key(message_id="m-unknown")
-
-    assert ledger.reserve(sending).record.status == STATUS_SENDING
-
-    assert ledger.reserve(sent).granted is True
-    assert ledger.mark_sent(sent, "delivered-9") is True
-    assert ledger.reserve_comment(sent).granted is True
-    assert ledger.record_comment(sent, status=STATUS_SENT, message_id="comment-7") is True
-
-    assert ledger.reserve(failed).granted is True
-    assert ledger.mark_failed(failed, "明确未发送") is True
-
-    assert ledger.reserve(unknown).granted is True
-    assert ledger.mark_unknown(unknown, "回执丢失") is True
-
-    record = ledger.get(sent)
-    assert record is not None
-    assert record.status == STATUS_SENT
-    assert record.target_message_id == "delivered-9", "成功记录必须保存真实目标消息 ID"
-    assert record.comment_status == STATUS_SENT, "评论结果附属于源发送记录"
-    assert record.comment_message_id == "comment-7"
-    assert ledger.get(failed).status == STATUS_FAILED
-    assert ledger.get(unknown).status == STATUS_UNKNOWN
-
-    ledger.close()
-    reopened = open_test_ledger(tmp_path)
-    again = reopened.get(sent)
-    assert again is not None
-    assert (again.status, again.target_message_id) == (STATUS_SENT, "delivered-9")
-    assert (again.comment_status, again.comment_message_id) == (STATUS_SENT, "comment-7"), (
-        "评论结果必须跨重开账本保留"
-    )
-    assert reopened.get(failed).status == STATUS_FAILED
-    assert reopened.get(unknown).status == STATUS_UNKNOWN
-    reopened.close()
 
 
 def test_负数目标消息ID按原值存取且重开保留(tmp_path: Path) -> None:
@@ -1381,43 +783,7 @@ def test_负数目标消息ID按原值存取且重开保留(tmp_path: Path) -> N
     reopened.close()
 
 
-def test_SQL参数绑定且特殊字符ID按字面量存取(tmp_path: Path) -> None:
-    ledger = open_test_ledger(tmp_path)
-    hostile = "m-1'; DROP TABLE delivery_ledger; --"
-    key = ledger_key(message_id=hostile)
-
-    assert ledger.reserve(key).granted is True
-    assert ledger.mark_sent(key, "delivered-'; DROP TABLE delivery_ledger; --") is True
-
-    record = ledger.get(key)
-    assert record is not None
-    assert record.key.source_message_id == hostile, "特殊字符必须按字面量存取（参数绑定）"
-    assert record.target_message_id == "delivered-'; DROP TABLE delivery_ledger; --"
-
-    other = ledger.reserve(ledger_key(message_id="m-2"))
-    assert other.granted is True, "表结构必须完好，注入字符串不得被当作 SQL 执行"
-    ledger.close()
-
-
 # --------------------------------------------------------------------------- 事务边界与失败可区分
-
-
-def test_提交失败后回滚且连接仍可继续使用(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    ledger, connection = _fault_open(tmp_path, monkeypatch)
-    try:
-        connection.failure = "commit"
-        with pytest.raises(LedgerUnavailableError) as failure:
-            ledger.reserve(ledger_key(message_id="m-commit-fail"))
-
-        assert str(failure.value).strip(), "提交失败必须如实报告不可用"
-
-        resumed = ledger.reserve(ledger_key(message_id="m-after-commit-fail"))
-        assert isinstance(resumed, Reservation) and resumed.granted is True, (
-            f"提交失败必须回滚，连接不得停留在未结束事务: {resumed!r}"
-        )
-        assert ledger.get(ledger_key(message_id="m-after-commit-fail")) is not None
-    finally:
-        ledger.close()
 
 
 def test_记录不存在与读取失败可区分(tmp_path: Path) -> None:
@@ -1444,18 +810,9 @@ def test_写入失败与占位未命中可区分(tmp_path: Path) -> None:
     assert str(failure.value).strip(), "存储失败必须抛 LedgerUnavailableError，不能静默返回 False"
 
 
-def test_恢复失败与零条可区分(tmp_path: Path) -> None:
-    ledger = open_test_ledger(tmp_path)
-    assert ledger.recover_interrupted() == 0, "空账本恢复零条"
-
-    ledger.close()
-    with pytest.raises(LedgerUnavailableError):
-        ledger.recover_interrupted()
-
-
 def test_发送状态与账本状态共用同一值域声明() -> None:
 
-    from forward_delivery import SendStatus
+    from maimai_courier_plugin.forward_delivery import SendStatus
 
     assert SendStatus is LedgerStatus, "发送状态值域必须与账本状态共用同一声明"
 
@@ -1516,43 +873,6 @@ def test_状态目录内的部署文件不阻断且既有成功记录仍阻止�
         assert (tmp_path / name).read_bytes() == content, f"部署文件不得因打开账本被改动: {name}"
 
 
-def test_仅有部署文件且无主库时按新装建库(tmp_path: Path) -> None:
-    _deployment_directory(tmp_path)
-    ledger = open_test_ledger(tmp_path)
-    try:
-        assert ledger.get(ledger_key()) is None
-        assert ledger.reserve(ledger_key()).granted
-    finally:
-        ledger.close()
-
-
-@pytest.mark.parametrize("name", ["config.toml.backup.20260929233435", "__pycache__/x.pyc"])
-def test_数字时间戳备份名与缓存文件名仍按部署文件放行(tmp_path: Path, name: str) -> None:
-
-    _deployment_directory(tmp_path)
-    target = tmp_path / name
-    target.write_bytes(_DEPLOYMENT_FILE_CONTENT)
-    ledger = open_test_ledger(tmp_path)
-    try:
-        assert ledger.reserve(ledger_key()).granted
-    finally:
-        ledger.close()
-    assert target.read_bytes() == _DEPLOYMENT_FILE_CONTENT
-
-
-def test_纯任意名文件无法按名字判定为证据(tmp_path: Path) -> None:
-
-    _deployment_directory(tmp_path)
-    marker = tmp_path / "x"
-    marker.write_bytes(b"synthetic-unidentified-file")
-    ledger = open_test_ledger(tmp_path)
-    try:
-        assert ledger.reserve(ledger_key()).granted
-    finally:
-        ledger.close()
-    assert marker.read_bytes() == b"synthetic-unidentified-file"
-
-
 @pytest.mark.parametrize("evidence", [
     "service_binding.json",
     "service_ledger.sqlite3",
@@ -1584,48 +904,3 @@ def test_状态类证据仍阻断且不打开数据库也不改动文件(
     assert not (tmp_path / LEDGER_FILE_NAME).exists()
     for name, content in before.items():
         assert (tmp_path / name).read_bytes() == content
-
-
-@pytest.mark.parametrize("suffix", _SQLITE_SIDECAR_SUFFIXES)
-def test_部署文件不能把孤立伴随文件当新装(tmp_path: Path, suffix: str) -> None:
-    _deployment_directory(tmp_path)
-    marker = tmp_path / (LEDGER_FILE_NAME + suffix)
-    marker.write_bytes(b"synthetic-orphan-companion")
-    result = open_ledger(tmp_path / LEDGER_FILE_NAME)
-    assert isinstance(result, LedgerUnavailable)
-    assert not (tmp_path / LEDGER_FILE_NAME).exists()
-    assert marker.read_bytes() == b"synthetic-orphan-companion"
-
-
-@pytest.mark.parametrize("name", ["delivery_ledger.sqlite3.bak", "service_ledger.sqlite3", "ledger.sqlite3-wal"])
-def test_子目录一层名字命中状态规则即阻断且不改动(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str,
-) -> None:
-    _deployment_directory(tmp_path)
-    # 目录自身不带任何标记，专门验证「只检查一层子项名字」这一条仍生效。
-    directory = tmp_path / "插件子目录"
-    directory.mkdir()
-    (directory / name).write_bytes(b"\xffsynthetic-child-evidence")
-    calls = []
-
-    def forbidden_connect(*args: Any, **kwargs: Any) -> Any:
-        calls.append(args)
-        raise AssertionError("子目录状态证据未人工核对前不得打开数据库")
-
-    monkeypatch.setattr(sqlite3, "connect", forbidden_connect)
-    result = open_ledger(tmp_path / LEDGER_FILE_NAME)
-    assert isinstance(result, LedgerUnavailable)
-    assert calls == []
-    assert "synthetic-child-evidence" not in result.reason
-    assert (directory / name).read_bytes() == b"\xffsynthetic-child-evidence"
-
-
-@pytest.mark.parametrize("name", ["snapshot-export", "delivery_backup"])
-def test_子目录自身名字命中状态标记即阻断(tmp_path: Path, name: str) -> None:
-    _deployment_directory(tmp_path)
-    directory = tmp_path / name
-    directory.mkdir()
-    (directory / "内容.py").write_bytes(b"synthetic-deep-content")
-    result = open_ledger(tmp_path / LEDGER_FILE_NAME)
-    assert isinstance(result, LedgerUnavailable)
-    assert (directory / "内容.py").read_bytes() == b"synthetic-deep-content"

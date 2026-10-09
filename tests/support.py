@@ -17,7 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from maimai_courier_plugin.shared.delivery import DeliveryKey
+from maimai_courier_plugin.shared.delivery import TARGET_KIND_GROUP, DeliveryKey
 from maimai_courier_plugin.delivery_ledger import (
     LEDGER_FILE_NAME,
     DeliveryLedger,
@@ -41,6 +41,19 @@ TARGET_GROUP_ID = "222"
 
 OTHER_TARGET_GROUP_ID = "30003"
 """默认分组内的第二个目标群（多目标与并存隔离用例用）。"""
+
+PRIVATE_USER_ID = "30001"
+"""私聊目标的对端 QQ 号（合成样本）：与群号是重叠的数字空间，账本五字段键按目标形态区分（ADR 0012）。
+
+好友名册样本与该号一致，私聊准备阶段的好友核验才能通过并走到提交前复验；名册缺此
+应答时私聊路径会在准备阶段以查询失败被拒，掩盖提交前复验的私聊分治判定。
+"""
+
+PRIVATE_FRIENDS: list[dict[str, Any]] = [
+    {"user_id": int(PRIVATE_USER_ID), "nickname": "好友甲", "remark": "备注甲"},
+]
+"""合成好友名册：实测 `get_friend_list` 的 `data` 是裸数组、条目字段 `user_id`（整数）
+`nickname`/`remark`（API 目录 6.10）。备注与昵称只作名册展示，不进结果与日志。"""
 
 DEFAULT_GROUP_NAME = "默认分组"
 """测试夹具默认转发分组名（只作用户标识与日志前缀，不参与判定）。"""
@@ -144,14 +157,20 @@ def ledger_key(
     target_group_id: str = TARGET_GROUP_ID,
     account_id: str = SOURCE_ACCOUNT_ID,
     source_group_id: str = SOURCE_GROUP_ID,
+    target_kind: str = TARGET_KIND_GROUP,
 ) -> DeliveryKey:
-    """默认账本键（账号 + 源群 + 源消息 ID + 目标群）；用例只改需要区分的字段。"""
+    """默认账本键（账号 + 源群 + 源消息 ID + 目标 + 目标形态）；用例只改需要区分的字段。
+
+    `target_kind` 必须显式取值（`DeliveryKey` 不设默认值）；群路径用例沿用 `group`，
+    私聊用例传 `private` 并把 `target_group_id` 换成对端 QQ 号。
+    """
 
     return DeliveryKey(
         account_id=account_id,
         source_group_id=source_group_id,
         source_message_id=message_id,
         target_group_id=target_group_id,
+        target_kind=target_kind,
     )
 
 

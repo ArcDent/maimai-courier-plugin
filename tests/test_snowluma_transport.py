@@ -1,4 +1,5 @@
-"""固定动作 HTTP 传输：安全闸门、错误分类与关闭语义。
+"""固定动作 HTTP 传输核心路径：受控配置解析、令牌仅经认证头、固定八动作与私聊路由
+调用、安全闸门（禁重定向、请求体上限、明文建连前解析判定）、错误分类与关闭幂等。
 
 断言面只经公开导出（`OneBotTransport` / `OneBotUnresolved` / `OneBotUnavailable` /
 `AiohttpOneBotTransport`）与注入点（`session_factory` / `resolver` / `clock` /
@@ -22,7 +23,7 @@ from aiohttp import web
 
 from maimai_courier_plugin import snowluma_transport as transport
 from tests.snowluma_transport_support import (
-    HangingSession, MemoryResponse, MemorySession, RecordingFactory, http_endpoint,
+    MemoryResponse, MemorySession, RecordingFactory, http_endpoint,
 )
 from tests.support import FakeClock, envelope, spin_until
 
@@ -45,6 +46,17 @@ def memory_transport(
         session_factory=factory, resolver=resolver,
     )
     return client, factory
+
+
+READ_ONLY_CALLS: list[tuple[str, Any]] = [
+    ("get_login_info", lambda client: client.get_login_info()),
+    ("get_group_list", lambda client: client.get_group_list()),
+    ("get_msg", lambda client: client.get_msg("source-1")),
+    ("get_forward_msg", lambda client: client.get_forward_msg("synthetic-card-res-id")),
+    ("get_friend_list", lambda client: client.get_friend_list()),
+]
+"""只读动作调用表：新增只读动作与既有动作共用同一套安全边界（禁重定向、超时与
+认证分类、envelope 校验），不为任何动作开例外（design D11）。"""
 
 
 def test_解析只读受控配置() -> None:
@@ -143,7 +155,39 @@ def test_提交前许可复验失败则明确未发送(gate) -> None:
     asyncio.run(scenario())
 
 
-def test_固定七动作逐动作经HTTP调用且信封与令牌仅经认证头() -> None:
+def test_私聊发送复用既有动作且只按路由参数提交() -> None:
+    """私聊复用 `send_msg` / `send_forward_msg`：目标形态只影响 `message_type`/`user_id`
+    路由参数（实测 6.10），不引入具名私聊发送动作、不更换动作。"""
+
+    async def scenario() -> None:
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(
+            200, body=envelope({"message_id": -532364287})))
+        client, _ = memory_transport(session)
+        node = {"type": "node", "data": {"uin": "10000", "name": "synthetic-sender",
+                                         "content": [{"type": "text", "data": {"text": "synthetic-body"}}]}}
+        assert (await client.send_msg(
+            target_user_id="30001",
+            message=[{"type": "text", "data": {"text": "synthetic-body"}}],
+            before_submit=lambda: True,
+        ))["status"] == "ok"
+        assert (await client.send_forward_msg(
+            target_user_id="30001", messages=[node], before_submit=lambda: True,
+        ))["status"] == "ok"
+        # 私聊路由参数逐字段比对：动作名仍限于固定集合，无 send_private_* 具名动作
+        assert [json.loads(post["data"]) for post in session.posts] == [
+            {"action": "send_msg", "params": {"message_type": "private", "user_id": "30001",
+                                              "message": [{"type": "text", "data": {"text": "synthetic-body"}}]}},
+            {"action": "send_forward_msg", "params": {"message_type": "private", "user_id": "30001",
+                                                      "messages": [node]}},
+        ]
+        assert [post["url"].rsplit("/", 1)[-1] for post in session.posts] == ["send_msg", "send_forward_msg"]
+        public = {name for name in dir(transport.AiohttpOneBotTransport) if not name.startswith("_")}
+        assert not {"send_private_msg", "send_private_forward_msg"} & public
+
+    asyncio.run(scenario())
+
+
+def test_固定八动作逐动作经HTTP调用且信封与令牌仅经认证头() -> None:
 
     async def scenario() -> None:
         seen: list[dict[str, Any]] = []
@@ -172,6 +216,7 @@ def test_固定七动作逐动作经HTTP调用且信封与令牌仅经认证头(
                 assert (await client.get_group_list())["data"] == {"action": "get_group_list"}
                 assert (await client.get_msg("source-123"))["data"] == {"action": "get_msg"}
                 assert (await client.get_forward_msg("forward-res-123"))["data"] == {"action": "get_forward_msg"}
+                assert (await client.get_friend_list())["data"] == {"action": "get_friend_list"}
                 assert (await client.send_msg(
                     target_group_id="20002",
                     message=[{"type": "text", "data": {"text": "synthetic-body"}}],
@@ -191,7 +236,7 @@ def test_固定七动作逐动作经HTTP调用且信封与令牌仅经认证头(
 
         assert [item["path"] for item in seen] == [
             "/get_login_info", "/get_group_list", "/get_msg", "/get_forward_msg",
-            "/send_msg", "/send_group_forward_msg", "/send_forward_msg",
+            "/get_friend_list", "/send_msg", "/send_group_forward_msg", "/send_forward_msg",
         ]
         assert all(item["method"] == "POST" for item in seen)
         assert [item["body"] for item in seen] == [
@@ -199,6 +244,7 @@ def test_固定七动作逐动作经HTTP调用且信封与令牌仅经认证头(
             {"action": "get_group_list", "params": {}},
             {"action": "get_msg", "params": {"message_id": "source-123"}},
             {"action": "get_forward_msg", "params": {"id": "forward-res-123"}},
+            {"action": "get_friend_list", "params": {}},
             {"action": "send_msg", "params": {"message_type": "group", "group_id": "20002",
                                               "message": [{"type": "text", "data": {"text": "synthetic-body"}}]}},
             {"action": "send_group_forward_msg", "params": {"group_id": "20002", "messages": [card_node]}},
@@ -209,6 +255,26 @@ def test_固定七动作逐动作经HTTP调用且信封与令牌仅经认证头(
         assert all(item["authorization"] == f"Bearer {CONNECTION_TOKEN}" for item in seen)
         assert all(item["query"] == "" for item in seen)
         assert all(CONNECTION_TOKEN not in item["path"] + item["query"] for item in seen)
+
+    asyncio.run(scenario())
+
+
+def test_好友名册读取返回裸数组且条目字段原样上交() -> None:
+    """`get_friend_list` 只读：请求体只带 action，应答 `data` 为裸数组（实测 6.10）。"""
+
+    async def scenario() -> None:
+        roster = [{"user_id": 10001, "nickname": "synthetic-friend", "remark": "synthetic-remark"},
+                  {"user_id": 10002, "nickname": "synthetic-friend-2", "remark": ""}]
+        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(
+            200, body=envelope(roster)))
+        client, _ = memory_transport(session)
+        response = await client.get_friend_list()
+        assert response["data"] == roster, "名册裸数组原样上交，客户端不做匹配或收敛"
+        post = session.posts[0]
+        assert post["url"].endswith("/get_friend_list")
+        assert json.loads(post["data"]) == {"action": "get_friend_list", "params": {}}
+        assert post["headers"]["Authorization"] == f"Bearer {CONNECTION_TOKEN}"
+        assert post["kwargs"]["allow_redirects"] is False
 
     asyncio.run(scenario())
 
@@ -277,15 +343,16 @@ def test_会话惰性创建且禁代理禁重定向旗标随请求发出() -> No
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("action, invoke", READ_ONLY_CALLS)
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
-def test_3xx重定向显式拒绝且不向下一跳发出请求或凭证(status) -> None:
+def test_3xx重定向显式拒绝且不向下一跳发出请求或凭证(action: str, invoke: Any, status: int) -> None:
 
     async def scenario() -> None:
         seen: list[dict[str, Any]] = []
 
         async def handler(request: web.Request) -> web.Response:
             seen.append({"path": request.path, "authorization": request.headers.get("Authorization")})
-            if request.path == "/get_login_info":
+            if request.path == f"/{action}":
                 return web.Response(status=status, headers={"Location": "/redirect-leak"})
             return web.json_response(envelope({"leaked": True}))
 
@@ -295,40 +362,44 @@ def test_3xx重定向显式拒绝且不向下一跳发出请求或凭证(status)
             )
             try:
                 with pytest.raises(transport.OneBotUnavailable) as caught:
-                    await client.get_login_info()
+                    await invoke(client)
                 assert caught.value.category == "insecure_endpoint" and not caught.value.submitted
             finally:
                 await client.close()
-        assert [item["path"] for item in seen] == ["/get_login_info"], "不得向重定向下一跳发出请求"
+        assert [item["path"] for item in seen] == [f"/{action}"], "不得向重定向下一跳发出请求"
         assert CONNECTION_TOKEN not in "/redirect-leak"
 
     asyncio.run(scenario())
 
 
-def test_请求体超过自设上限在发出前拒绝() -> None:
+@pytest.mark.parametrize("route", ["group", "private"])
+def test_请求体超过自设上限在发出前拒绝(route: str) -> None:
 
     async def scenario() -> None:
         session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200))
         client, factory = memory_transport(session)
+        private = route == "private"
+        # 私聊路由与群路由共用同一请求体上限：两种目标形态都不为此开例外（design D11）
+        route_params = ({"message_type": "private", "user_id": "30001"} if private
+                        else {"message_type": "group", "group_id": "20002"})
         overhead = len(json.dumps(
-            {"action": "send_msg", "params": {"message_type": "group", "group_id": "20002",
-                                              "message": [{"type": "text", "data": {"text": ""}}]}},
+            {"action": "send_msg", "params": {**route_params, "message": [{"type": "text", "data": {"text": ""}}]}},
             ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8"))
         pad = transport.ONEBOT_MAX_REQUEST_BYTES - overhead
         message = [{"type": "text", "data": {"text": "x" * pad}}]
-        assert (await client.send_msg(
-            target_group_id="20002", message=message, before_submit=lambda: True,
-        ))["status"] == "ok"
+
+        async def send(candidate: list[dict[str, Any]]) -> Any:
+            if private:
+                return await client.send_msg(target_user_id="30001", message=candidate, before_submit=lambda: True)
+            return await client.send_msg(target_group_id="20002", message=candidate, before_submit=lambda: True)
+
+        assert (await send(message))["status"] == "ok"
         assert len(session.posts) == 1
         assert len(session.posts[0]["data"]) == transport.ONEBOT_MAX_REQUEST_BYTES
 
         with pytest.raises(transport.OneBotUnavailable) as caught:
-            await client.send_msg(
-                target_group_id="20002",
-                message=[{"type": "text", "data": {"text": "x" * (pad + 1)}}],
-                before_submit=lambda: True,
-            )
+            await send([{"type": "text", "data": {"text": "x" * (pad + 1)}}])
         assert caught.value.category == "request_too_large" and not caught.value.submitted
         assert len(session.posts) == 1, "超限请求体不得发出"
         assert factory.calls == [{"trust_env": False}], "超限拒绝不得为此新建会话"
@@ -377,20 +448,6 @@ def test_明文http目标建连前解析判定(host, outcome, expect, resolver_c
     asyncio.run(scenario())
 
 
-def test_加密端点不执行明文解析判定() -> None:
-    async def scenario() -> None:
-        async def resolver(name: str, port: int) -> list[str]:
-            raise AssertionError("https 目标不做明文网络判定")
-
-        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200))
-        client, _ = memory_transport(
-            session,
-            connection=transport.OneBotConnection("https://snowluma.example:3000", "TEST_ONEBOT_TOKEN", CONNECTION_TOKEN),
-            resolver=resolver,
-        )
-        assert (await client.get_login_info())["status"] == "ok"
-
-    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("status, failure, category, submitted", [
@@ -446,26 +503,28 @@ def test_业务失败信封原样交上层结构化处理(retcode) -> None:
     ({"status": "partial", "retcode": 0, "data": {}}, None),
     (None, ValueError("synthetic-not-json")),
 ])
-def test_非信封响应不构成动作结果(body, raises) -> None:
+@pytest.mark.parametrize("action, invoke", READ_ONLY_CALLS)
+def test_非信封响应不构成动作结果(action: str, invoke: Any, body, raises) -> None:
 
     async def scenario() -> None:
         session = MemorySession(lambda url, url_body, headers, kwargs: MemoryResponse(200, body=body, raises=raises))
         client, _ = memory_transport(session)
         with pytest.raises(transport.OneBotUnavailable) as caught:
-            await client.get_msg("source-1")
+            await invoke(client)
         assert caught.value.category == "unexpected_response"
         assert caught.value.submitted is True, "请求已写入，结果只能保守对待"
 
     asyncio.run(scenario())
 
 
-def test_动作期限到期归类超时且不重发() -> None:
+@pytest.mark.parametrize("action, invoke", READ_ONLY_CALLS)
+def test_动作期限到期归类超时且不重发(action: str, invoke: Any) -> None:
 
     async def scenario() -> None:
         session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200, hang=True))
         clock = FakeClock()
         client, _ = memory_transport(session, clock=clock)
-        call = asyncio.create_task(client.get_login_info())
+        call = asyncio.create_task(invoke(client))
         await spin_until(lambda: len(session.posts) == 1)
         assert clock.sleeps, "期限必须走注入时钟登记"
         clock.advance(transport.ONEBOT_ACTION_TIMEOUT_SECONDS + 0.5)
@@ -475,6 +534,8 @@ def test_动作期限到期归类超时且不重发() -> None:
         assert len(session.posts) == 1, "超时不重发同一动作"
 
     asyncio.run(scenario())
+
+
 
 
 def test_关闭幂等且重复调用不重复关闭会话() -> None:
@@ -490,51 +551,20 @@ def test_关闭幂等且重复调用不重复关闭会话() -> None:
     asyncio.run(scenario())
 
 
-def test_关闭预算内未完成如实报告且第二次立即返回() -> None:
-
-    async def scenario() -> None:
-        session = HangingSession(lambda url, body, headers, kwargs: MemoryResponse(200))
-        clock = FakeClock()
-        client, _ = memory_transport(session, clock=clock)
-        await client.get_login_info()
-        closer = asyncio.create_task(client.close())
-        await spin_until(lambda: session.close_calls == 1)
-        clock.advance(transport.ONEBOT_CLOSE_TIMEOUT_SECONDS + 1.0)
-        with pytest.raises(transport.OneBotUnavailable) as caught:
-            await closer
-        assert caught.value.category == "close_incomplete"
-        assert await asyncio.wait_for(client.close(), timeout=1.0) is None, "第二次关闭必须立即返回"
-
-    asyncio.run(scenario())
 
 
-def test_关闭取消在途请求且之后不再提交() -> None:
-    async def scenario() -> None:
-        session = MemorySession(lambda url, body, headers, kwargs: MemoryResponse(200, hang=True))
-        client, _ = memory_transport(session)
-        call = asyncio.create_task(client.get_login_info())
-        await spin_until(lambda: len(session.posts) == 1)
-        await client.close()
-        with pytest.raises(transport.OneBotUnavailable) as caught:
-            await call
-        assert caught.value.category == "cancelled" and caught.value.submitted
-        with pytest.raises(transport.OneBotUnavailable) as after:
-            await client.get_login_info()
-        assert after.value.category == "closed" and not after.value.submitted
-        assert len(session.posts) == 1, "关闭后不得发出新请求"
-
-    asyncio.run(scenario())
 
 
-def test_公开动作面只有固定七动作与关闭() -> None:
+def test_公开动作面只有固定八动作与关闭() -> None:
 
     public = {name for name in dir(transport.AiohttpOneBotTransport) if not name.startswith("_")}
-    assert {"get_login_info", "get_group_list", "get_msg", "get_forward_msg", "send_msg",
-            "send_group_forward_msg", "send_forward_msg", "close"} <= public
+    assert {"get_login_info", "get_group_list", "get_msg", "get_forward_msg", "get_friend_list",
+            "send_msg", "send_group_forward_msg", "send_forward_msg", "close"} == public
     assert "forward_group_single_msg" not in public, "旧卡片按标识重建动作已移除，不得残留"
     assert not any(name in public for name in (
-        "delete_msg", "send_group_msg", "send_private_msg", "upload_forward_msg", "get_status", "set_group_ban",
-    ))
+        "delete_msg", "send_group_msg", "send_private_msg", "send_private_forward_msg",
+        "upload_forward_msg", "get_status", "set_group_ban",
+    )), "不得引入具名私聊发送动作或任意动作代理"
 
 
 def test_隔离子进程无SDK与网络库导入且构造不联网() -> None:

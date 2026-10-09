@@ -2,7 +2,45 @@
 
 本文件记录当前会话的交接信息；静态结论以 `AGENTS.md` 为准，术语以 `CONTEXT.md` 为准。
 
-## 最近操作（2026-10-05 ~ 10-06）
+## 最近操作（2026-10-05 ~ 10-09）
+
+6. **部署双形态目标 + 收敛版本到 arclinux（2026-10-09 09:20，用户授权）**：
+   负载 49 项（11 根模块 + shared/ + _manifest.json + 文档；**不含** config.toml、
+   账本、锁、tests、openspec、history、CLAUDE.md 软链），tar+scp 到
+   `/home/arc/maimai/MaiBot/data/MaiMBot/plugins/arcdent.maimai-courier-plugin/`。
+   部署前整目录备份 `~/maimai/backups/courier-pre-deploy-20261009-0920.tar.gz`
+   （315K，含 67 条记录的四字段账本与全部 config_back 历史）。19 个生产文件 md5
+   与本地逐一一致；容器内 compileall 通过；宿主 09:21:09–10 热重载新代码
+   （pyc 重编译、已加载=7 失败=0）；09:21:24 自动入口在真实群 1104104631 成功
+   唤起（「搬运回来」分组源群），证明分组判定与预搜索在真实配置下工作。
+   **账本迁移尚未触发**：远端库仍为四字段 schema、67 条记录（10-08 22:55 最后
+   写入），首次真实发送时才做五字段一次性迁移（既有行按 group 回填）；若迁移
+   失败按 `ledger_unavailable` 关闭发送且原文件保留，备份可回退。远端
+   `config.toml` 为三分组结构（test / 正式转发 / 搬运回来）、**均无 `private`
+   键**：群转发保持可用，私聊默认关闭。容器日志中的 `gemini-3.7-flash-high
+   unknown provider` 是宿主 LLM provider 配置问题，与插件无关。
+
+4. **代码与测试收敛（2026-10-09，未提交）**：只做减法，不动行为契约。测试
+   从 788 项收敛到 532 项（14664→11739 行，−20%）：按「只留核心逻辑」删除重复
+   覆盖、极端注入故障、历史兼容与参数化变体（账本 −36 例、自动入口 −28 例、
+   生命周期 −9 例、编排 −5 例、客户端 −11 例、传输 −4 例、验收 −5 例、组合根
+   −4 例、配置 −6 例、预检 −1 例、材料 −1 例、共享类型 −3 例）；保留用例代码
+   一字未改。删除 conftest.py 的两套顶层别名（生产模块与 `shared.*` 的
+   `sys.modules` 登记，68→32 行）：全部测试 import 统一为 `maimai_courier_plugin.*`
+   包路径，少一条「两处 import 指向不同模块对象」的分叉。生产注释收敛
+   （6088→5799 行）：删除复述代码的长篇设计背景，保留安全契约、单点定义声明、
+   ADR 编号引用与实测依据（如 `uin` 非 `sender`、6.10 私聊路由）。验证：默认
+   530 passed+2 skipped / aiohttp 649 passed / pyright 0 errors。
+
+5. **双形态目标与分组私聊开关变更完成（2026-10-09，未提交、未归档）**：
+   `private-forward-target`（openspec 活跃变更，tasks 50 条全完，`--strict`
+   校验 valid，待 sync/archive）。转发分组新增 `private` 开关（默认 false）；
+   工具目标参数改二选一（`target_group_id`/`target_user_id`）；新增只读名册
+   工具 `list_forward_friends`（`get_friend_list` 成为固定第八动作）；账本键
+   四字段扩五字段（目标形态进键，ADR 0012，旧库一次性迁移）；回执与提交前
+   复验按目标形态分治；结果面新增 `target_kind` 与目标标识。实测依据
+   `docs/snowluma-http-api-catalog.md` 6.10（私聊路由、回执四项、名册裸数组）。
+   验证：默认 786+2 skip / aiohttp 941 / pyright 0（收敛后复跑 530/649/0）。
 
 0. **转发分组变更四阶段完成并归档（2026-10-06，未提交）**：`[scope]` 从平铺
    `source_groups`/`target_groups` 改为具名 `groups` 结构数组（`name`+源群+目标群），
@@ -92,43 +130,50 @@
   `send_material` / `forward_precheck` / `forward_delivery` / `delivery_ledger` /
   `auto_entry` / `snowluma_client` / `snowluma_transport`）＋ `shared/` 8 个子
   模块；pyright include 18 项。`CLAUDE.md` 是指向 `AGENTS.md` 的相对软链接。
-- `[scope]` 为具名转发分组结构（`groups: list[ForwardGroupSection]`），平铺键已
-  移除；配置期校验走 `ScopeSection.__init__`（真实 SDK 与测试替身都经过该路径，
-  pydantic validator 会被替身跳过，勿改回 validator）。
-- 真实发送只经 `snowluma_client.py` / `snowluma_transport.py` 的固定七动作 HTTP
-  直连（`get_forward_msg` + `send_group_forward_msg` 为卡片新增对）；
+- 测试经 `conftest.py` 注册合成包 `maimai_courier_plugin` 后一律走包路径导入；
+  conftest 不再登记任何顶层别名（0 兼容层）。默认档 530+2 skip（aiohttp 档 649）。
+- 两个群聊工具（`forward_message` 二选一目标 + `list_forward_friends` 只读名册）
+  与两个 Hook；`[scope]` 为具名转发分组（新增 `private` 私聊开关），配置期校验走
+  `ScopeSection.__init__`（dict 与实例两条路径都覆盖，勿改回 validator）。
+- 真实发送只经 `snowluma_client.py` / `snowluma_transport.py` 的固定八动作 HTTP
+  直连（`get_friend_list` 为私聊名册新增对）；账本五字段键（ADR 0012）。
   旧服务与环境完整隔离在 `history/snowluma-forward-service/`（MANIFEST 109 项
   不得覆盖），复活入口由 `tests/test_repo_isolation.py` 守卫。
-- openspec 活跃变更区为空；全部 7 个变更已归档，两份主规格已同步为新口径
-  （cross-group-forward 12 需求，含「具名转发分组与同组投递判定」）。
+- openspec 活跃变更区有 1 个：`private-forward-target`（tasks 全完、校验 valid，
+  未 sync/archive）；其余 7 个变更已归档，两份主规格已同步（cross-group-forward
+  12 需求 + snowluma-direct-client 私聊/名册需求待随该变更归档同步）。
 
 ## 进行中
 
-- 转发分组变更 + 收敛 + 本轮之前的修订，全部改动在工作区未提交（用户自行 commit）。
-- arclinux 部署件已同步转发分组变更（11:03 备份 + 11:12 重载），但**远端
-  `config.toml` 仍是旧平铺 `[scope]` 配置**：新代码不认平铺键、按空分组 fail-closed
-  （不发送也不报错）。恢复发送需操作者在远端把 `[scope]` 改写为 `[[scope.groups]]`
-  结构（源群单归属、目标同组、name 非空且唯一），改写前显式与自动入口均被拒。
-- 收敛债剩余 1 条 judgement call：`snowluma_client._prepare` 文字路径对同一源消息
-  调用两次 `build_source_material`（先默认口径判 kind，再 `verbatim_mentions=True`
-  取 at 原样段）；已清偿：client 死导入、卡片判据重叠、sender helper 与
-  `SENDER_NAME_MAX_LENGTH` 双定义、design 引用锚点。
+- 双形态目标变更 + 本轮收敛 + 更早的分组/嵌套修订，全部改动在工作区未提交
+  （用户自行 commit）。
+- openspec 活跃变更 `private-forward-target`：tasks 50 条全完、`openspec validate
+  --strict` 通过，尚未 sync 主规格、未 archive；归档前主规格仍是旧口径。
+- arclinux 部署件已同步到本次收敛后的 10-09 版本（09:20 部署，见「最近操作」
+  第 6 条）：八动作、名册工具、五字段账本键均已就位；**账本四字段→五字段迁移
+  尚未触发**（首次真实发送时进行，备份在
+  `~/maimai/backups/courier-pre-deploy-20261009-0920.tar.gz`）；远端三分组均无
+  `private` 键，私聊默认关闭、群转发可用。
 
 ## 下一步
 
-1. **远端 `config.toml` 手工改写为 `[[scope.groups]]`**（恢复发送的前置；负载不含
-   `config.toml`，由操作者在远端改）。
-2. 用户检查后提交；提交前重跑三约验证命令（620+2 skip / aiohttp 715 / pyright 0，
-   18 文件）。
-3. 部署 arclinux 的固定红线：tar+scp（rsync 协议不兼容）、**负载不得含符号链接**
+1. 用户检查后提交；提交前重跑三条验证命令（当前实跑：默认 530 passed+2 skipped /
+   aiohttp 649 passed / pyright 0 errors）。
+2. `private-forward-target` 走 sync-specs + archive（主规格同步双形态目标与
+   私聊/名册需求）。
+3. 远端观察首次真实发送的五字段迁移结果：成功则 67 条既有记录按 group 回填、
+   防重语义保持；若 `ledger_unavailable` 且原因指向迁移，用上述备份回退并人工
+   核对。如需私聊功能，由操作者在远端 `config.toml` 的目标分组里显式加
+   `private = true`（默认关闭是安全形态，不主动代改）。
+4. 部署 arclinux 的固定红线：tar+scp（rsync 协议不兼容）、**负载不得含符号链接**
    （`CLAUDE.md` 软链入负载会触发 `ledger_unavailable`，见 01:32 部署教训）、不带
    `config.toml`/账本/锁、部署前备份 `~/maimai/backups/`。
-4. 真实 QQ 联验未授权、未执行（见 `docs/real-qq-validation.md`）：U3-U8、内层
-   卡片展示、卡片内 at 客户端提醒、图片 URL 时效、body 精确阈值；V14 转发分组同组
-   判定联验需在远端配置改成分组结构后执行。
-5. `.local/sync-specs.py` 是上一轮归档用的一次性合并脚本（含旧 Purpose 文案），
+5. 真实 QQ 联验未授权、未执行（见 `docs/real-qq-validation.md`）：U3-U8、内层
+   卡片展示、卡片内 at 客户端提醒、图片 URL 时效、body 精确阈值；新增私聊路径
+   联验条目 P1/P2（对端展示目视确认）。
+6. `.local/sync-specs.py` 是上一轮归档用的一次性合并脚本（含旧 Purpose 文案），
    已完成使命，待用户处置；`.local/` 为仓库外私有区。
-6. 测试令牌曾出现在对话记录中，建议轮换。
+7. 测试令牌曾出现在对话记录中，建议轮换。
 
 ## 关键发现
 

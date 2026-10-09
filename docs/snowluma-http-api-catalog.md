@@ -606,3 +606,43 @@ video + text 两节点），投递目标为授权测试群（780963243）。
 - 本节为单一实例（1.14.17-node）、单账号、一个授权测试群、一次授权时段内的快照，
   样本量有限，不替代 `docs/real-qq-validation.md` 的逐项联验，也不外推为全部客户端
   或版本的行为。
+
+### 6.10 私聊（private）转发通道预研实测（2026-10-08）
+
+动机：规划「转发目标支持私聊」前，先把该路径所需的全部端点行为在真实实例上确认，
+避免规格写错再返工。同一实测实例（SnowLuma 1.14.17-node 容器，账号与授权测试群同
+6.5–6.9），私聊对象为操作者受权账号（已确认在账号好友名册内）；凭证只从容器内受控
+插件配置读，不回显、不进 argv。探针见 `.local/probes/private-route-probe.py`（默认
+只读，`--apply` 才发送），原始记录 `.local/report/private-route-probe-20261008-*.json`；
+本文不记录真实账号、群号、令牌、好友昵称备注与媒体地址。
+
+| 用例 | 动作与参数 | 结果 |
+| --- | --- | --- |
+| 名册读取 | `get_friend_list` | `ok`；`data` 为**裸数组**（非对象、无 `friends` 包装）；条目字段 `user_id`（整数）、`nickname`、`remark`；56 人 |
+| 好友核验 | 指定 QQ 号与名册 `user_id` 逐字比对 | 在名册即命中；`remark`/`nickname` 均可能存在（用于名册展示，不用于匹配） |
+| 私聊文字 | `send_msg` `{message_type:"private", user_id, message:[text]}` | `ok`；目标 ID 正数；`get_msg` 四项核验全过 |
+| 私聊单节点卡片 | `send_forward_msg` `{message_type:"private", user_id, messages:[node]}` | `ok`；目标 ID **负数**；四项核验全过 |
+| 私聊多节点卡片 | `send_forward_msg` 同上 + 多 `messages` | `ok`；目标 ID 负数；四项核验全过 |
+| 私聊图片（本地 file 引用） | `send_msg` `message:[text, image{file:<本地文件名>}]` | 拒绝：`retcode=100` `ENOENT …`（与 6.9 的 `hash`/`file` 形态一致） |
+| 私聊图片（https url 段） | `send_msg` `message:[text, image{url:<https 签名地址>}]`（= 插件 `send_material` 的真实提交形态） | `ok`；四项核验全过；回读段 `['text','image']` |
+| 非好友/不存在目标 | `send_msg` `message_type:"private"` 指向名册外 QQ 号 | 拒绝：`retcode=100` 「请先添加对方为好友」——**平台本身也拒** |
+| 备用动作对照 | `send_private_msg` / `send_private_forward_msg` | 均 `ok`、四项核验过（存在但不选，固定动作集不新增发送动作） |
+
+**私聊回执的字段语义**（`get_msg` 对私聊消息的返回）：`message_type="private"`；
+`user_id` 等于**机器人自身账号**，`target_id` 等于**对端 QQ**，`sender.user_id`
+同为机器人自身；`message_seq` 为**正整数**；其余字段与群消息同构
+（`message_id` 可为负值，按原值逐字比对命中）。
+
+**结论与边界**：
+
+1. **四项回执核验可整组复用到私聊**，只把「目标群」一项换成「`message_type=private`
+   且 `target_id` 等于请求的私聊目标」；无需为私聊放宽「正整数平台消息序列」的成功
+   判据（这是规划前最不确定的一项，实测判定为不需要特例）。
+2. **私聊卡片/文字用 `send_forward_msg`（`message_type:"private"`）、图片与评论用
+   `send_msg`**：固定动作集只需新增 `get_friend_list` 一个只读动作，`send_private_msg`
+   / `send_private_forward_msg` 虽可用但不引入。
+3. **好友核验是插件侧必需**：平台也会拒非好友，但先核验名册可给出可定位拒绝、不把
+   请求发到平台。
+4. 本节同 6.9 的边界：单实例、单账号、一个授权测试群、一次授权时段内的快照；私聊
+   对象的客户端侧展示（含头像）未做目视联验，不替代
+   `docs/real-qq-validation.md` 的逐项确认。
