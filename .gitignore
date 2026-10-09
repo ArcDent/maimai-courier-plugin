@@ -5,3 +5,4 @@ __pycache__/
 
 # 本地私有手册与运维笔记（含本机信息），不进公开仓库
 .local/
+/docs/research/
