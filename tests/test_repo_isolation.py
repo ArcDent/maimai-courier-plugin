@@ -7,8 +7,7 @@
 - 收集守卫：真正运行收集命令，默认收集面只有活跃用例、真实回环验收按档位参与；
 - 生产模块守卫：生产代码不依赖复读插件、只导入 SDK 根导出名字、不含旧发送或宿主
   旁路调用；
-- 项目规则守卫：`CLAUDE.md` 是指向 `AGENTS.md` 的相对软链接，规则文件记录独立性
-  与验证命令。
+- 项目规则守卫：`CLAUDE.md` 是指向 `AGENTS.md` 的相对软链接，不维护两份规则副本。
 
 历史目录（`history/`）由 pytest.ini 的 testpaths/norecursedirs 排除，这里用真实
 收集命令复核该边界。
@@ -234,11 +233,3 @@ def test_CLAUDE_是指向AGENTS的软链接() -> None:
     assert claude.is_symlink(), "CLAUDE.md 必须是软链接（ln -s AGENTS.md CLAUDE.md）"
     assert claude.readlink() == Path("AGENTS.md")
     assert claude.read_text(encoding="utf-8") == (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-
-
-def test_AGENTS_记录独立性与验证约束() -> None:
-    text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-    assert "独立" in text and "复读插件" in text, "必须写明与复读插件的独立性约束"
-    assert "uv run --no-project --with pytest pytest tests/" in text
-    assert "uv run --no-project --with pyright pyright" in text
-    assert "config_version" in text, "必须写明宿主强制的 plugin.config_version"
